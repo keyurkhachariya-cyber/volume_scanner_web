@@ -447,8 +447,8 @@ def extract_ticker_df(batch_df: pd.DataFrame, symbol: str) -> pd.DataFrame:
             elif len(batch_df.columns.levels) > 1 and symbol in batch_df.columns.levels[1]:
                 sub = batch_df.xs(symbol, axis=1, level=1).dropna(how="all")
                 return _standardize_index_tz(sub)
-        elif symbol in batch_df.columns:
-            sub = batch_df[[symbol]].dropna(how="all")
+        elif any(col in batch_df.columns for col in ("Open", "High", "Low", "Close", "Volume")):
+            sub = batch_df.dropna(how="all").copy()
             return _standardize_index_tz(sub)
     except Exception:
         pass

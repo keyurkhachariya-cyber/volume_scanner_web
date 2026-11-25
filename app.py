@@ -124,6 +124,8 @@ if "_last_scan_empty_by_interval" not in st.session_state:
     st.session_state._last_scan_empty_by_interval = {}
 if "_cached_prev_day" not in st.session_state:
     st.session_state._cached_prev_day = None
+if "_last_interval" not in st.session_state:
+    st.session_state._last_interval = None
 
 # Sidebar controls
 with st.sidebar:
@@ -167,7 +169,10 @@ with st.sidebar:
         "Bar Interval",
         options=["1m", "5m"],
         index=0,
-        help="1-minute is more precise but slower and more prone to gaps. 5-minute is more reliable.",
+        help=(
+            "1-minute is more precise for live comparisons. 5-minute has fewer Yahoo gaps, "
+            "though a forming 5m bar compares against the full previous-day 5m bar until that 5-minute window completes."
+        ),
     )
     max_workers = st.slider("Parallel download threads", 4, 16, 8)
 
@@ -212,7 +217,14 @@ if (
     and st.session_state._last_filter_state != current_filter_state
 ):
     st.session_state._skip_auto_scan_once = True
+elif (
+    st.session_state._last_interval is not None
+    and st.session_state._last_interval != interval
+    and interval in st.session_state.scan_times_by_interval
+):
+    st.session_state._skip_auto_scan_once = True
 st.session_state._last_filter_state = current_filter_state
+st.session_state._last_interval = interval
 
 
 def _mark_ui_interaction() -> None:
@@ -389,10 +401,11 @@ def render_scanner(
             if "Gap_Pct" not in working_df.columns:
                 gap_missing = True
             else:
+                gap_vals = pd.to_numeric(working_df["Gap_Pct"], errors="coerce")
                 if exclude_gap_up:
-                    mask &= working_df["Gap_Pct"].isna() | (working_df["Gap_Pct"] <= gap_threshold)
+                    mask &= gap_vals.isna() | (gap_vals <= gap_threshold)
                 if exclude_gap_down:
-                    mask &= working_df["Gap_Pct"].isna() | (working_df["Gap_Pct"] >= -gap_threshold)
+                    mask &= gap_vals.isna() | (gap_vals >= -gap_threshold)
                 gap_excluded_count = int(base_mask.sum() - mask.sum())
 
         df = working_df[mask].reset_index(drop=True)
@@ -457,11 +470,13 @@ def render_scanner(
                 )
 
                 csv = display_df.to_csv(index=False).encode("utf-8")
+                csv_ts = (last_scan_dt or now).strftime("%Y%m%d_%H%M")
                 st.download_button(
                     "⬇️ Download CSV",
                     data=csv,
-                    file_name=f"relative_volume_{interval}_{now.strftime('%Y%m%d_%H%M')}.csv",
+                    file_name=f"relative_volume_{interval}_{csv_ts}.csv",
                     mime="text/csv",
+                    key=f"download_csv_{interval}",
                     on_click="ignore",
                 )
 
