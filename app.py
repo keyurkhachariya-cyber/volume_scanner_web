@@ -3,6 +3,7 @@ Relative Volume Scanner (F&O Stocks) - Streamlit Web App
 Today's cumulative volume till now vs Previous day's volume till same time.
 """
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, time
 import streamlit as st
 import pandas as pd
@@ -192,8 +193,11 @@ with st.sidebar:
     st.markdown("---")
     if st.button("🔄 Sync NSE F&O List", width="stretch"):
         with st.spinner("Fetching latest F&O list and trading calendar from NSE..."):
-            syms, src = get_fno_universe(force_refresh=True)
-            get_holidays(force_refresh=True)
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                fut_universe = pool.submit(get_fno_universe, True)
+                fut_holidays = pool.submit(get_holidays, True)
+                syms, src = fut_universe.result()
+                fut_holidays.result()
             st.session_state.universe_symbols = syms
             st.session_state.universe_source = src
             st.session_state._cached_prev_day = None
@@ -356,6 +360,7 @@ def render_scanner(
                     min_volume=0,
                     interval=interval,
                     max_workers=max_workers,
+                    prev_day=prev_day,
                 )
                 if not raw_df.empty:
                     st.session_state.results_by_interval[interval] = raw_df

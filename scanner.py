@@ -7,6 +7,7 @@ Optimized relative-volume scanner logic using direct async Yahoo Chart API + yfi
 """
 
 import asyncio
+import atexit
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
@@ -25,6 +26,11 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 from yfinance.data import YfData
+
+try:
+    import orjson as _orjson
+except ImportError:  # pragma: no cover - optional faster JSON decoder
+    _orjson = None
 
 try:
     from yfinance.multi import new_session as _yf_new_session
@@ -58,6 +64,13 @@ _EXECUTOR_LOCK = threading.Lock()
 _EXECUTORS: "OrderedDict[int, Dict[str, Any]]" = OrderedDict()
 _MAX_POOLS = 4
 _CHART_HOSTS = ("query1.finance.yahoo.com", "query2.finance.yahoo.com")
+
+_ASYNC_LOOP_LOCK = threading.Lock()
+_ASYNC_LOOP: Optional[asyncio.AbstractEventLoop] = None
+_ASYNC_THREAD: Optional[threading.Thread] = None
+_ASYNC_SESSION: Any = None
+_ASYNC_CRUMB: Optional[str] = None
+_ASYNC_CRUMB_LOCK: Optional[asyncio.Lock] = None
 
 
 def _time_to_sec(t: time) -> int:
@@ -763,10 +776,13 @@ def _parse_yahoo_chart_payload(payload: Any) -> Tuple[Optional[Dict[str, Optiona
     if n == 0:
         return None, True
 
-    ts_sec = np.array(
-        [_NAT_INT64 if t is None else int(t) for t in timestamps],
-        dtype=np.int64,
-    )
+    try:
+        ts_sec = np.asarray(timestamps, dtype=np.int64)
+    except (TypeError, ValueError):
+        ts_sec = np.array(
+            [_NAT_INT64 if t is None else int(t) for t in timestamps],
+            dtype=np.int64,
+        )
 
     def _to_float_arr(key: str) -> Optional[np.ndarray]:
         raw = q0.get(key)
@@ -784,28 +800,88 @@ def _parse_yahoo_chart_payload(payload: Any) -> Tuple[Optional[Dict[str, Optiona
     }, True
 
 
-def _run_coro_sync(coro_fn):
-    """Run an async coroutine factory safely on any thread (using SelectorEventLoop on Windows)."""
-    def _exec():
-        loop = asyncio.SelectorEventLoop() if sys.platform == "win32" else asyncio.new_event_loop()
-        try:
-            asyncio.set_event_loop(loop)
-            return loop.run_until_complete(coro_fn())
-        finally:
-            try:
-                loop.run_until_complete(loop.shutdown_asyncgens())
-            except Exception:
-                pass
-            asyncio.set_event_loop(None)
-            loop.close()
+def _decode_json_response(resp: Any) -> Any:
+    raw_content = getattr(resp, "content", None)
+    if _orjson is not None and raw_content is not None:
+        return _orjson.loads(raw_content)
+    return resp.json()
 
+
+def _shutdown_async_runtime() -> None:
+    """Best-effort cleanup of persistent AsyncSession and event loop on interpreter exit."""
+    global _ASYNC_SESSION, _ASYNC_LOOP, _ASYNC_THREAD
+    with _ASYNC_LOOP_LOCK:
+        loop = _ASYNC_LOOP
+        session = _ASYNC_SESSION
+        thread = _ASYNC_THREAD
+        _ASYNC_LOOP = None
+        _ASYNC_SESSION = None
+        _ASYNC_THREAD = None
+    if loop is None or loop.is_closed():
+        return
     try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return _exec()
+        if session is not None:
+            fut = asyncio.run_coroutine_threadsafe(session.close(), loop)
+            fut.result(timeout=2.0)
+    except Exception:
+        pass
+    try:
+        loop.call_soon_threadsafe(loop.stop)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+    except Exception:
+        pass
 
-    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="yf_async_runner") as pool:
-        return pool.submit(_exec).result()
+
+atexit.register(_shutdown_async_runtime)
+
+
+def _ensure_async_loop() -> asyncio.AbstractEventLoop:
+    """Return a single long-lived background event-loop thread (SelectorEventLoop on Windows)."""
+    global _ASYNC_LOOP, _ASYNC_THREAD
+    with _ASYNC_LOOP_LOCK:
+        if (
+            _ASYNC_LOOP is not None
+            and not _ASYNC_LOOP.is_closed()
+            and _ASYNC_THREAD is not None
+            and _ASYNC_THREAD.is_alive()
+        ):
+            return _ASYNC_LOOP
+
+        ready = threading.Event()
+        holder: Dict[str, Any] = {}
+
+        def _loop_main() -> None:
+            loop = asyncio.SelectorEventLoop() if sys.platform == "win32" else asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            holder["loop"] = loop
+            loop.call_soon(ready.set)
+            try:
+                loop.run_forever()
+            finally:
+                try:
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                except Exception:
+                    pass
+                asyncio.set_event_loop(None)
+                loop.close()
+
+        t = threading.Thread(target=_loop_main, name="yf_async_loop", daemon=True)
+        t.start()
+        ready.wait(timeout=5.0)
+        loop = holder.get("loop")
+        if loop is None:
+            raise RuntimeError("Failed to start persistent async event loop")
+        _ASYNC_LOOP = loop
+        _ASYNC_THREAD = t
+        return loop
+
+
+def _run_coro_sync(coro_fn):
+    """Run an async coroutine factory on the persistent background event loop thread."""
+    loop = _ensure_async_loop()
+    fut = asyncio.run_coroutine_threadsafe(coro_fn(), loop)
+    return fut.result()
 
 
 async def _fetch_charts_async(
@@ -818,17 +894,34 @@ async def _fetch_charts_async(
     timeout: int = 10,
 ) -> Tuple[Dict[str, Dict[str, Optional[np.ndarray]]], Set[str]]:
     """
-    Concurrently fetch Yahoo Chart API JSON responses over a single multiplexed
-    curl_cffi.requests.AsyncSession, handling cookie/crumb auth and 429/5xx backoff.
+    Concurrently fetch Yahoo Chart API JSON responses over a persistent multiplexed
+    curl_cffi.requests.AsyncSession, load-balancing query1/query2 and caching cookie/crumb.
     """
+    global _ASYNC_SESSION, _ASYNC_CRUMB, _ASYNC_CRUMB_LOCK
     from curl_cffi.requests import AsyncSession
+
+    # Hoist date parsing / IST epoch conversion once per distinct (start, end) pair
+    range_epoch_cache: Dict[Tuple[str, str], Tuple[int, int]] = {}
+
+    def _epoch_bounds(s_str: str, e_str: str) -> Tuple[int, int]:
+        key = (s_str, e_str)
+        cached = range_epoch_cache.get(key)
+        if cached is not None:
+            return cached
+        bounds = (
+            _ist_epoch_sec(date.fromisoformat(s_str), time(0, 0)),
+            _ist_epoch_sec(date.fromisoformat(e_str), time(0, 0)),
+        )
+        range_epoch_cache[key] = bounds
+        return bounds
 
     def _build_params(sym: str, period: Optional[str], crumb: Optional[str]) -> Dict[str, Any]:
         s_str, e_str = symbol_ranges.get(sym, (start, end)) if symbol_ranges else (start, end)
         params: Dict[str, Any] = {"interval": interval, "includePrePost": "false"}
         if s_str and e_str:
-            params["period1"] = _ist_epoch_sec(date.fromisoformat(s_str), time(0, 0))
-            params["period2"] = _ist_epoch_sec(date.fromisoformat(e_str), time(0, 0))
+            p1, p2 = _epoch_bounds(s_str, e_str)
+            params["period1"] = p1
+            params["period2"] = p2
         else:
             params["range"] = period or "1d"
         if crumb:
@@ -838,69 +931,98 @@ async def _fetch_charts_async(
     results: Dict[str, Dict[str, Optional[np.ndarray]]] = {}
     failed: Set[str] = set()
     period_by_sym = dict(tasks)
-    crumb_state: Dict[str, Optional[str]] = {"value": None}
-    crumb_lock = asyncio.Lock()
+    sym_host_idx = {sym: idx for idx, (sym, _) in enumerate(tasks)}
 
-    async with AsyncSession(impersonate="chrome") as session:
-        async def _ensure_crumb() -> Optional[str]:
-            async with crumb_lock:
-                if crumb_state["value"]:
-                    return crumb_state["value"]
-                try:
-                    await session.get("https://fc.yahoo.com", timeout=timeout)
-                    resp = await session.get(
-                        f"https://{_CHART_HOSTS[0]}/v1/test/getcrumb",
-                        timeout=timeout,
-                    )
-                    if resp.status_code == 200:
-                        text = (resp.text or "").strip()
-                        if text and "<html" not in text.lower():
-                            crumb_state["value"] = text
-                except Exception:
-                    pass
-                return crumb_state["value"]
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        running_loop = None
 
-        async def _fetch_one(
-            sym: str,
-            period: Optional[str],
-            sem: asyncio.Semaphore,
-            host_idx: int = 0,
-            allow_auth_retry: bool = True,
-        ) -> Tuple[str, Optional[Dict[str, Optional[np.ndarray]]], bool]:
-            host = _CHART_HOSTS[host_idx % len(_CHART_HOSTS)]
-            url = f"https://{host}/v8/finance/chart/{_url_quote(sym, safe='')}"
-            async with sem:
-                try:
-                    resp = await session.get(
-                        url,
-                        params=_build_params(sym, period, crumb_state["value"]),
-                        timeout=timeout,
-                    )
-                    if resp.status_code in (401, 403) and allow_auth_retry:
-                        crumb = await _ensure_crumb()
-                        if crumb:
-                            resp = await session.get(
-                                url,
-                                params=_build_params(sym, period, crumb),
-                                timeout=timeout,
-                            )
-                    if resp.status_code == 404:
-                        try:
-                            _, ok = _parse_yahoo_chart_payload(resp.json())
-                        except Exception:
-                            ok = False
-                        return sym, None, ok
-                    if resp.status_code != 200:
-                        return sym, None, False
-                    payload = resp.json()
-                    bundle, ok = _parse_yahoo_chart_payload(payload)
-                    return sym, bundle, ok
-                except Exception:
+    persistent = _ASYNC_LOOP is not None and running_loop is _ASYNC_LOOP
+    local_session = None
+    local_crumb_state: Dict[str, Optional[str]] = {"value": None}
+
+    if persistent:
+        if _ASYNC_SESSION is None:
+            _ASYNC_SESSION = AsyncSession(impersonate="chrome")
+        if _ASYNC_CRUMB_LOCK is None:
+            _ASYNC_CRUMB_LOCK = asyncio.Lock()
+        session = _ASYNC_SESSION
+        crumb_lock = _ASYNC_CRUMB_LOCK
+    else:
+        local_session = AsyncSession(impersonate="chrome")
+        session = local_session
+        crumb_lock = asyncio.Lock()
+
+    async def _ensure_crumb(failed_crumb: Optional[str] = None) -> Optional[str]:
+        global _ASYNC_CRUMB
+        async with crumb_lock:
+            cur = _ASYNC_CRUMB if persistent else local_crumb_state["value"]
+            if cur and cur != failed_crumb:
+                return cur
+            try:
+                await session.get("https://fc.yahoo.com", timeout=timeout)
+                resp = await session.get(
+                    f"https://{_CHART_HOSTS[0]}/v1/test/getcrumb",
+                    timeout=timeout,
+                )
+                if resp.status_code == 200:
+                    text = (resp.text or "").strip()
+                    if text and "<html" not in text.lower():
+                        if persistent:
+                            _ASYNC_CRUMB = text
+                        else:
+                            local_crumb_state["value"] = text
+                        return text
+            except Exception:
+                pass
+            return _ASYNC_CRUMB if persistent else local_crumb_state["value"]
+
+    async def _fetch_one(
+        sym: str,
+        period: Optional[str],
+        sem: asyncio.Semaphore,
+        host_idx: int = 0,
+        allow_auth_retry: bool = True,
+    ) -> Tuple[str, Optional[Dict[str, Optional[np.ndarray]]], bool]:
+        host = _CHART_HOSTS[host_idx % len(_CHART_HOSTS)]
+        url = f"https://{host}/v8/finance/chart/{_url_quote(sym, safe='')}"
+        async with sem:
+            try:
+                used_crumb = _ASYNC_CRUMB if persistent else local_crumb_state["value"]
+                resp = await session.get(
+                    url,
+                    params=_build_params(sym, period, used_crumb),
+                    timeout=timeout,
+                )
+                if resp.status_code in (401, 403) and allow_auth_retry:
+                    crumb = await _ensure_crumb(failed_crumb=used_crumb)
+                    if crumb:
+                        resp = await session.get(
+                            url,
+                            params=_build_params(sym, period, crumb),
+                            timeout=timeout,
+                        )
+                if resp.status_code == 404:
+                    try:
+                        _, ok = _parse_yahoo_chart_payload(_decode_json_response(resp))
+                    except Exception:
+                        ok = False
+                    return sym, None, ok
+                if resp.status_code != 200:
                     return sym, None, False
+                bundle, ok = _parse_yahoo_chart_payload(_decode_json_response(resp))
+                return sym, bundle, ok
+            except Exception:
+                return sym, None, False
+
+    try:
+        if local_session is not None:
+            await local_session.__aenter__()
 
         sem = asyncio.Semaphore(max(1, int(max_concurrency)))
         wave1 = await asyncio.gather(
-            *(_fetch_one(sym, period, sem, host_idx=0) for sym, period in tasks)
+            *(_fetch_one(sym, period, sem, host_idx=idx) for idx, (sym, period) in enumerate(tasks))
         )
         for sym, bundle, ok in wave1:
             if bundle is not None:
@@ -914,7 +1036,12 @@ async def _fetch_charts_async(
             retry_sem = asyncio.Semaphore(min(4, max(1, int(max_concurrency) // 4)))
             wave2 = await asyncio.gather(
                 *(
-                    _fetch_one(sym, period_by_sym.get(sym), retry_sem, host_idx=1)
+                    _fetch_one(
+                        sym,
+                        period_by_sym.get(sym),
+                        retry_sem,
+                        host_idx=sym_host_idx.get(sym, 0) + 1,
+                    )
                     for sym in retry_syms
                 )
             )
@@ -924,6 +1051,9 @@ async def _fetch_charts_async(
                     failed.discard(sym)
                 elif ok:
                     failed.discard(sym)
+    finally:
+        if local_session is not None:
+            await local_session.__aexit__(None, None, None)
 
     return results, failed
 
@@ -938,7 +1068,7 @@ def _fetch_market_data(
     symbol_ranges: Optional[Dict[str, Tuple[Optional[str], Optional[str]]]] = None,
 ) -> Tuple[Dict[str, Dict[str, Optional[np.ndarray]]], Set[str]]:
     """
-    Fast path: fetch Yahoo Chart API directly via curl_cffi.requests.AsyncSession into NumPy arrays.
+    Fast path: fetch Yahoo Chart API directly via persistent curl_cffi AsyncSession into NumPy arrays.
     Fallback path: transparently falls back to yfinance for any remaining failed symbols
     (or if curl_cffi AsyncSession is unavailable/unsupported).
     """
@@ -949,19 +1079,28 @@ def _fetch_market_data(
     arrays_by_sym: Dict[str, Dict[str, Optional[np.ndarray]]] = {}
     fallback_syms: Set[str] = set()
 
-    async_concurrency = min(24, max(8, int(max_workers) * 2))
     try:
-        arrays_by_sym, fallback_syms = _run_coro_sync(
-            lambda: _fetch_charts_async(
-                tasks=tasks,
-                interval=interval,
-                max_concurrency=async_concurrency,
-                symbol_ranges=symbol_ranges,
-                start=start,
-                end=end,
+        from curl_cffi.requests import AsyncSession as _unused  # noqa: F401
+        has_async = True
+    except ImportError:
+        has_async = False
+
+    if has_async:
+        async_concurrency = min(24, max(8, int(max_workers) * 2))
+        try:
+            arrays_by_sym, fallback_syms = _run_coro_sync(
+                lambda: _fetch_charts_async(
+                    tasks=tasks,
+                    interval=interval,
+                    max_concurrency=async_concurrency,
+                    symbol_ranges=symbol_ranges,
+                    start=start,
+                    end=end,
+                )
             )
-        )
-    except Exception:
+        except Exception:
+            fallback_syms = {sym for sym, _ in tasks}
+    else:
         fallback_syms = {sym for sym, _ in tasks}
 
     if fallback_syms:
@@ -1122,13 +1261,14 @@ def run_scan(
     interval: str = "1m",
     max_workers: int = 8,
     chunk_size: Optional[int] = None,
+    prev_day: Optional[date] = None,
 ) -> pd.DataFrame:
     """
     Run relative volume scan across symbols using:
     - Compact NumPy baseline cache (O(1) vectorized lookup)
-    - Single-pass concurrent fetching (coalesces cold baseline + today into 1 HTTP wave via period='5d')
+    - Persistent curl_cffi AsyncSession HTTP/2 Chart API fetching directly to NumPy arrays (with yfinance fallback)
+    - Single-pass coalesced cold baseline + today fetching via exact date bounds
     - Per-ticker bar-aligned comparison (eliminates look-ahead bias on lagging Yahoo feeds)
-    - Persistent curl_cffi HTTP/2 session & reusable worker pool
     Pass min_ratio=0.0 and min_volume=0 to retrieve all valid symbols for client-side filtering.
     """
     if not symbols:
@@ -1138,7 +1278,8 @@ def run_scan(
     cutoff = now.time()
     cutoff_sec = _time_to_sec(cutoff)
     today = now.date()
-    prev_day = get_previous_trading_day(today)
+    if prev_day is None:
+        prev_day = get_previous_trading_day(today)
     cache_key = (prev_day, interval)
 
     # 1. Load existing baseline store (memory LRU -> disk) under lock
@@ -1240,8 +1381,6 @@ def run_scan(
                     neg_syms.append(sym)
 
         store = _commit_baseline_updates(cache_key, prev_day, interval, new_entries, neg_syms)
-    else:
-        store = _commit_baseline_updates(cache_key, prev_day, interval, {}, [])
 
     # 4. Per-ticker bar-aligned baseline lookup (prevents look-ahead bias on lagging feeds)
     times_sec = store["times_sec"]
