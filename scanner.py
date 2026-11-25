@@ -1,19 +1,22 @@
 """
-Optimized relative-volume scanner logic using yfinance with:
+Optimized relative-volume scanner logic using direct async Yahoo Chart API + yfinance fallback:
 1. Compact NumPy-matrix disk & bounded in-memory baseline cache (O(1) vectorized lookup).
-2. Persistent curl_cffi HTTP/2 session & reusable bounded ThreadPoolExecutor.
-3. Single-pass period-based history fetching (avoids per-ticker TZ lookups & coalesces cold baseline + today fetches).
-4. Fast NumPy-based OHLCV extraction without wide MultiIndex pd.concat overhead.
+2. Multiplexed curl_cffi AsyncSession HTTP/2 fetching directly to NumPy arrays (zero DataFrame overhead on warm scans), with automatic yfinance fallback.
+3. Single-pass coalesced cold baseline + today fetching via exact date bounds.
+4. Thread-local persistent curl_cffi HTTP/2 sessions & ref-counted reusable worker pools for yfinance fallback.
 """
 
+import asyncio
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from datetime import datetime, time, timedelta, date
 import os
 from pathlib import Path
+import sys
 import tempfile
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from urllib.parse import quote as _url_quote
 import pickle
 import threading
 import time as pytime
@@ -54,6 +57,7 @@ _THREAD_LOCAL = threading.local()
 _EXECUTOR_LOCK = threading.Lock()
 _EXECUTORS: "OrderedDict[int, Dict[str, Any]]" = OrderedDict()
 _MAX_POOLS = 4
+_CHART_HOSTS = ("query1.finance.yahoo.com", "query2.finance.yahoo.com")
 
 
 def _time_to_sec(t: time) -> int:
@@ -170,17 +174,19 @@ def _standardize_index_tz(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _build_prev_day_baseline(
-    df_prev: pd.DataFrame, target_date: Optional[date] = None
+def _build_prev_day_baseline_from_arrays(
+    ts_sec: np.ndarray,
+    close_col: Optional[np.ndarray],
+    vol_col: Optional[np.ndarray],
+    target_date: Optional[date] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Pre-compute cumulative regular-hours volume arrays (sorted seconds-of-day)
-    and previous close scalar for fast matrix packing.
+    and previous close scalar directly from aligned NumPy arrays.
     """
-    if df_prev is None or df_prev.empty or "Volume" not in df_prev.columns:
+    if vol_col is None or len(ts_sec) == 0:
         return None
 
-    ts_sec = _index_epoch_seconds(df_prev.index)
     if target_date is not None:
         resolved_date = target_date
     else:
@@ -201,15 +207,8 @@ def _build_prev_day_baseline(
     if not mask_reg.any():
         return None
 
-    vol_col = df_prev["Volume"].to_numpy(dtype=float, copy=False)
     vol_arr = vol_col[mask_reg]
     has_vol = not np.isnan(vol_arr).all()
-
-    close_col = (
-        df_prev["Close"].to_numpy(dtype=float, copy=False)
-        if "Close" in df_prev.columns
-        else None
-    )
     has_close = close_col is not None and bool((~np.isnan(close_col[mask_reg])).any())
     if not has_vol and not has_close:
         return None
@@ -249,6 +248,19 @@ def _build_prev_day_baseline(
         "cumvol": cumvol,
         "prev_close": prev_close,
     }
+
+
+def _build_prev_day_baseline(
+    df_prev: pd.DataFrame, target_date: Optional[date] = None
+) -> Optional[Dict[str, Any]]:
+    """Pre-compute previous-day baseline from a pandas OHLCV DataFrame."""
+    if df_prev is None or df_prev.empty or "Volume" not in df_prev.columns:
+        return None
+
+    ts_sec = _index_epoch_seconds(df_prev.index)
+    vol_col = df_prev["Volume"].to_numpy(dtype=float, copy=False)
+    close_col = df_prev["Close"].to_numpy(dtype=float, copy=False) if "Close" in df_prev.columns else None
+    return _build_prev_day_baseline_from_arrays(ts_sec, close_col, vol_col, target_date=target_date)
 
 
 def _empty_baseline_store(prev_day: date, interval: str) -> Dict[str, Any]:
@@ -643,7 +655,7 @@ def get_previous_day_data(
         start_str = prev_day.strftime("%Y-%m-%d")
         end_str = (prev_day + timedelta(days=1)).strftime("%Y-%m-%d")
 
-        fetched, failed = _fetch_histories_concurrent(
+        fetched, failed = _fetch_market_data(
             ((sym, None) for sym in missing),
             interval=interval,
             max_workers=max_workers,
@@ -657,8 +669,14 @@ def get_previous_day_data(
         for sym in missing:
             if sym in failed:
                 continue
-            df_prev = fetched.get(sym)
-            baseline = _build_prev_day_baseline(df_prev, target_date=prev_day) if df_prev is not None else None
+            bundle = fetched.get(sym)
+            baseline = (
+                _build_prev_day_baseline_from_arrays(
+                    bundle["ts_sec"], bundle["close"], bundle["volume"], target_date=prev_day
+                )
+                if bundle is not None
+                else None
+            )
             if baseline is not None:
                 new_entries[sym] = baseline
             else:
@@ -692,15 +710,304 @@ def get_today_data(
     return today_data
 
 
-def _summarize_today_df(
-    df: pd.DataFrame,
+def _df_to_array_bundle(df: pd.DataFrame) -> Optional[Dict[str, Optional[np.ndarray]]]:
+    """Convert an OHLCV DataFrame into a zero-copy NumPy array bundle."""
+    if df is None or df.empty:
+        return None
+    cols = df.columns
+    return {
+        "ts_sec": _index_epoch_seconds(df.index),
+        "open": df["Open"].to_numpy(dtype=float, copy=False) if "Open" in cols else None,
+        "high": df["High"].to_numpy(dtype=float, copy=False) if "High" in cols else None,
+        "low": df["Low"].to_numpy(dtype=float, copy=False) if "Low" in cols else None,
+        "close": df["Close"].to_numpy(dtype=float, copy=False) if "Close" in cols else None,
+        "volume": df["Volume"].to_numpy(dtype=float, copy=False) if "Volume" in cols else None,
+    }
+
+
+def _parse_yahoo_chart_payload(payload: Any) -> Tuple[Optional[Dict[str, Optional[np.ndarray]]], bool]:
+    """
+    Parse a Yahoo v8/finance/chart JSON payload into NumPy arrays without a DataFrame.
+    Returns (array_bundle_or_none, succeeded_without_transient_error).
+    """
+    if not isinstance(payload, dict):
+        return None, False
+    chart = payload.get("chart")
+    if not isinstance(chart, dict):
+        return None, False
+
+    err = chart.get("error")
+    if err:
+        code = err.get("code") if isinstance(err, dict) else None
+        return None, code == "Not Found"
+
+    results = chart.get("result")
+    if not results or not isinstance(results, list):
+        return None, True
+    res0 = results[0]
+    if not isinstance(res0, dict):
+        return None, False
+
+    timestamps = res0.get("timestamp")
+    indicators = res0.get("indicators")
+    if not timestamps or not isinstance(indicators, dict):
+        # Empty day / pre-market response with no chart error
+        return None, True
+
+    quotes = indicators.get("quote")
+    if not quotes or not isinstance(quotes, list) or not isinstance(quotes[0], dict):
+        return None, True
+    q0 = quotes[0]
+
+    n = len(timestamps)
+    if n == 0:
+        return None, True
+
+    ts_sec = np.array(
+        [_NAT_INT64 if t is None else int(t) for t in timestamps],
+        dtype=np.int64,
+    )
+
+    def _to_float_arr(key: str) -> Optional[np.ndarray]:
+        raw = q0.get(key)
+        if not raw or len(raw) != n:
+            return None
+        return np.asarray(raw, dtype=np.float64)
+
+    return {
+        "ts_sec": ts_sec,
+        "open": _to_float_arr("open"),
+        "high": _to_float_arr("high"),
+        "low": _to_float_arr("low"),
+        "close": _to_float_arr("close"),
+        "volume": _to_float_arr("volume"),
+    }, True
+
+
+def _run_coro_sync(coro_fn):
+    """Run an async coroutine factory safely on any thread (using SelectorEventLoop on Windows)."""
+    def _exec():
+        loop = asyncio.SelectorEventLoop() if sys.platform == "win32" else asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            return loop.run_until_complete(coro_fn())
+        finally:
+            try:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            except Exception:
+                pass
+            asyncio.set_event_loop(None)
+            loop.close()
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return _exec()
+
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="yf_async_runner") as pool:
+        return pool.submit(_exec).result()
+
+
+async def _fetch_charts_async(
+    tasks: List[Tuple[str, Optional[str]]],
+    interval: str,
+    max_concurrency: int,
+    symbol_ranges: Optional[Dict[str, Tuple[Optional[str], Optional[str]]]] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    timeout: int = 10,
+) -> Tuple[Dict[str, Dict[str, Optional[np.ndarray]]], Set[str]]:
+    """
+    Concurrently fetch Yahoo Chart API JSON responses over a single multiplexed
+    curl_cffi.requests.AsyncSession, handling cookie/crumb auth and 429/5xx backoff.
+    """
+    from curl_cffi.requests import AsyncSession
+
+    def _build_params(sym: str, period: Optional[str], crumb: Optional[str]) -> Dict[str, Any]:
+        s_str, e_str = symbol_ranges.get(sym, (start, end)) if symbol_ranges else (start, end)
+        params: Dict[str, Any] = {"interval": interval, "includePrePost": "false"}
+        if s_str and e_str:
+            params["period1"] = _ist_epoch_sec(date.fromisoformat(s_str), time(0, 0))
+            params["period2"] = _ist_epoch_sec(date.fromisoformat(e_str), time(0, 0))
+        else:
+            params["range"] = period or "1d"
+        if crumb:
+            params["crumb"] = crumb
+        return params
+
+    results: Dict[str, Dict[str, Optional[np.ndarray]]] = {}
+    failed: Set[str] = set()
+    period_by_sym = dict(tasks)
+    crumb_state: Dict[str, Optional[str]] = {"value": None}
+    crumb_lock = asyncio.Lock()
+
+    async with AsyncSession(impersonate="chrome") as session:
+        async def _ensure_crumb() -> Optional[str]:
+            async with crumb_lock:
+                if crumb_state["value"]:
+                    return crumb_state["value"]
+                try:
+                    await session.get("https://fc.yahoo.com", timeout=timeout)
+                    resp = await session.get(
+                        f"https://{_CHART_HOSTS[0]}/v1/test/getcrumb",
+                        timeout=timeout,
+                    )
+                    if resp.status_code == 200:
+                        text = (resp.text or "").strip()
+                        if text and "<html" not in text.lower():
+                            crumb_state["value"] = text
+                except Exception:
+                    pass
+                return crumb_state["value"]
+
+        async def _fetch_one(
+            sym: str,
+            period: Optional[str],
+            sem: asyncio.Semaphore,
+            host_idx: int = 0,
+            allow_auth_retry: bool = True,
+        ) -> Tuple[str, Optional[Dict[str, Optional[np.ndarray]]], bool]:
+            host = _CHART_HOSTS[host_idx % len(_CHART_HOSTS)]
+            url = f"https://{host}/v8/finance/chart/{_url_quote(sym, safe='')}"
+            async with sem:
+                try:
+                    resp = await session.get(
+                        url,
+                        params=_build_params(sym, period, crumb_state["value"]),
+                        timeout=timeout,
+                    )
+                    if resp.status_code in (401, 403) and allow_auth_retry:
+                        crumb = await _ensure_crumb()
+                        if crumb:
+                            resp = await session.get(
+                                url,
+                                params=_build_params(sym, period, crumb),
+                                timeout=timeout,
+                            )
+                    if resp.status_code == 404:
+                        try:
+                            _, ok = _parse_yahoo_chart_payload(resp.json())
+                        except Exception:
+                            ok = False
+                        return sym, None, ok
+                    if resp.status_code != 200:
+                        return sym, None, False
+                    payload = resp.json()
+                    bundle, ok = _parse_yahoo_chart_payload(payload)
+                    return sym, bundle, ok
+                except Exception:
+                    return sym, None, False
+
+        sem = asyncio.Semaphore(max(1, int(max_concurrency)))
+        wave1 = await asyncio.gather(
+            *(_fetch_one(sym, period, sem, host_idx=0) for sym, period in tasks)
+        )
+        for sym, bundle, ok in wave1:
+            if bundle is not None:
+                results[sym] = bundle
+            elif not ok:
+                failed.add(sym)
+
+        if failed:
+            retry_syms = sorted(failed)
+            await asyncio.sleep(0.5)
+            retry_sem = asyncio.Semaphore(min(4, max(1, int(max_concurrency) // 4)))
+            wave2 = await asyncio.gather(
+                *(
+                    _fetch_one(sym, period_by_sym.get(sym), retry_sem, host_idx=1)
+                    for sym in retry_syms
+                )
+            )
+            for sym, bundle, ok in wave2:
+                if bundle is not None:
+                    results[sym] = bundle
+                    failed.discard(sym)
+                elif ok:
+                    failed.discard(sym)
+
+    return results, failed
+
+
+def _fetch_market_data(
+    symbol_periods: Iterable[Tuple[str, Optional[str]]],
+    interval: str,
+    max_workers: int = 8,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    chunk_size: Optional[int] = None,
+    symbol_ranges: Optional[Dict[str, Tuple[Optional[str], Optional[str]]]] = None,
+) -> Tuple[Dict[str, Dict[str, Optional[np.ndarray]]], Set[str]]:
+    """
+    Fast path: fetch Yahoo Chart API directly via curl_cffi.requests.AsyncSession into NumPy arrays.
+    Fallback path: transparently falls back to yfinance for any remaining failed symbols
+    (or if curl_cffi AsyncSession is unavailable/unsupported).
+    """
+    tasks = list(symbol_periods)
+    if not tasks:
+        return {}, set()
+
+    arrays_by_sym: Dict[str, Dict[str, Optional[np.ndarray]]] = {}
+    fallback_syms: Set[str] = set()
+
+    async_concurrency = min(24, max(8, int(max_workers) * 2))
+    try:
+        arrays_by_sym, fallback_syms = _run_coro_sync(
+            lambda: _fetch_charts_async(
+                tasks=tasks,
+                interval=interval,
+                max_concurrency=async_concurrency,
+                symbol_ranges=symbol_ranges,
+                start=start,
+                end=end,
+            )
+        )
+    except Exception:
+        fallback_syms = {sym for sym, _ in tasks}
+
+    if fallback_syms:
+        period_by_sym = dict(tasks)
+        fb_tasks = [(sym, period_by_sym.get(sym)) for sym in _tasks_order(tasks, fallback_syms)]
+        fb_ranges = (
+            {sym: symbol_ranges[sym] for sym in fallback_syms if sym in symbol_ranges}
+            if symbol_ranges
+            else None
+        )
+        fb_dfs, fb_failed = _fetch_histories_concurrent(
+            fb_tasks,
+            interval=interval,
+            max_workers=max_workers,
+            start=start,
+            end=end,
+            chunk_size=chunk_size,
+            symbol_ranges=fb_ranges,
+        )
+        for sym, df in fb_dfs.items():
+            bundle = _df_to_array_bundle(df)
+            if bundle is not None:
+                arrays_by_sym[sym] = bundle
+        return arrays_by_sym, fb_failed
+
+    return arrays_by_sym, set()
+
+
+def _tasks_order(tasks: List[Tuple[str, Optional[str]]], subset: Set[str]) -> List[str]:
+    return [sym for sym, _ in tasks if sym in subset]
+
+
+def _summarize_today_arrays(
+    ts_sec: np.ndarray,
+    open_col: Optional[np.ndarray],
+    high_col: Optional[np.ndarray],
+    low_col: Optional[np.ndarray],
+    close_col: Optional[np.ndarray],
+    vol_col: Optional[np.ndarray],
     today: date,
     cutoff: time,
     day_start_sec: Optional[int] = None,
     cutoff_bound_sec: Optional[int] = None,
 ) -> Optional[Tuple[float, Optional[float], Optional[float], Optional[float], Optional[float], Optional[time]]]:
     """Fast NumPy summary of today's regular-hours (vol_today, ltp, open, high, low, last_bar_time)."""
-    if df is None or df.empty:
+    if len(ts_sec) == 0:
         return None
 
     if day_start_sec is None:
@@ -709,18 +1016,16 @@ def _summarize_today_df(
     if cutoff_bound_sec is None:
         cutoff_bound_sec = day_start_sec + _time_to_sec(cutoff)
 
-    ts_sec = _index_epoch_seconds(df.index)
     mask_reg = (ts_sec >= open_sec) & (ts_sec <= cutoff_bound_sec)
     if not mask_reg.any():
         return None
 
     t_reg = ts_sec[mask_reg]
-    cols = df.columns
-    open_arr = df["Open"].to_numpy(dtype=float, copy=False)[mask_reg] if "Open" in cols else None
-    high_arr = df["High"].to_numpy(dtype=float, copy=False)[mask_reg] if "High" in cols else None
-    low_arr = df["Low"].to_numpy(dtype=float, copy=False)[mask_reg] if "Low" in cols else None
-    close_arr = df["Close"].to_numpy(dtype=float, copy=False)[mask_reg] if "Close" in cols else None
-    vol_arr = df["Volume"].to_numpy(dtype=float, copy=False)[mask_reg] if "Volume" in cols else None
+    open_arr = open_col[mask_reg] if open_col is not None else None
+    high_arr = high_col[mask_reg] if high_col is not None else None
+    low_arr = low_col[mask_reg] if low_col is not None else None
+    close_arr = close_col[mask_reg] if close_col is not None else None
+    vol_arr = vol_col[mask_reg] if vol_col is not None else None
 
     # Drop placeholder rows with neither valid OHLC price nor positive volume
     valid_row = np.zeros(len(t_reg), dtype=bool)
@@ -785,6 +1090,31 @@ def _summarize_today_df(
     return vol_today, last_price, day_open, day_high, day_low, last_bar_time
 
 
+def _summarize_today_df(
+    df: pd.DataFrame,
+    today: date,
+    cutoff: time,
+    day_start_sec: Optional[int] = None,
+    cutoff_bound_sec: Optional[int] = None,
+) -> Optional[Tuple[float, Optional[float], Optional[float], Optional[float], Optional[float], Optional[time]]]:
+    """Summarize today's regular-hours metrics from a pandas OHLCV DataFrame."""
+    bundle = _df_to_array_bundle(df)
+    if bundle is None:
+        return None
+    return _summarize_today_arrays(
+        bundle["ts_sec"],
+        bundle["open"],
+        bundle["high"],
+        bundle["low"],
+        bundle["close"],
+        bundle["volume"],
+        today,
+        cutoff,
+        day_start_sec=day_start_sec,
+        cutoff_bound_sec=cutoff_bound_sec,
+    )
+
+
 def run_scan(
     symbols: List[str],
     min_ratio: float = 1.5,
@@ -846,7 +1176,7 @@ def run_scan(
         else:
             symbol_periods.append((sym, "1d"))
 
-    fetched_dfs, failed_syms = _fetch_histories_concurrent(
+    fetched_arrays, failed_syms = _fetch_market_data(
         symbol_periods,
         interval=interval,
         max_workers=max_workers,
@@ -865,15 +1195,17 @@ def run_scan(
         for sym in missing:
             if sym in failed_syms:
                 continue
-            df_sym = fetched_dfs.get(sym)
-            if df_sym is None or df_sym.empty:
+            bundle = fetched_arrays.get(sym)
+            if bundle is None or len(bundle["ts_sec"]) == 0:
                 neg_syms.append(sym)
                 continue
-            baseline = _build_prev_day_baseline(df_sym, target_date=prev_day)
+            baseline = _build_prev_day_baseline_from_arrays(
+                bundle["ts_sec"], bundle["close"], bundle["volume"], target_date=prev_day
+            )
             if baseline is not None:
                 new_entries[sym] = baseline
             else:
-                ts_sym = _index_epoch_seconds(df_sym.index)
+                ts_sym = bundle["ts_sec"]
                 valid_ts = ts_sym[ts_sym != _NAT_INT64]
                 if len(valid_ts) > 0 and (valid_ts < prev_day_start_sec).any():
                     neg_syms.append(sym)
@@ -883,7 +1215,7 @@ def run_scan(
         if fallback_missing:
             start_str = prev_day.strftime("%Y-%m-%d")
             end_str = (prev_day + timedelta(days=1)).strftime("%Y-%m-%d")
-            fb_dfs, fb_failed = _fetch_histories_concurrent(
+            fb_arrays, fb_failed = _fetch_market_data(
                 ((sym, None) for sym in fallback_missing),
                 interval=interval,
                 max_workers=max_workers,
@@ -894,8 +1226,14 @@ def run_scan(
             for sym in fallback_missing:
                 if sym in fb_failed:
                     continue
-                df_fb = fb_dfs.get(sym)
-                baseline = _build_prev_day_baseline(df_fb, target_date=prev_day) if df_fb is not None else None
+                fb_bundle = fb_arrays.get(sym)
+                baseline = (
+                    _build_prev_day_baseline_from_arrays(
+                        fb_bundle["ts_sec"], fb_bundle["close"], fb_bundle["volume"], target_date=prev_day
+                    )
+                    if fb_bundle is not None
+                    else None
+                )
                 if baseline is not None:
                     new_entries[sym] = baseline
                 else:
@@ -924,10 +1262,21 @@ def run_scan(
         if col_idx is None:
             continue
 
-        df_sym = fetched_dfs.get(sym)
+        bundle = fetched_arrays.get(sym)
         summary = (
-            _summarize_today_df(df_sym, today, cutoff, today_day_start_sec, today_cutoff_bound_sec)
-            if df_sym is not None
+            _summarize_today_arrays(
+                bundle["ts_sec"],
+                bundle["open"],
+                bundle["high"],
+                bundle["low"],
+                bundle["close"],
+                bundle["volume"],
+                today,
+                cutoff,
+                today_day_start_sec,
+                today_cutoff_bound_sec,
+            )
+            if bundle is not None
             else None
         )
         if summary is None:
