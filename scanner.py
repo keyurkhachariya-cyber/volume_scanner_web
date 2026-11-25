@@ -31,6 +31,8 @@ except ImportError:  # pragma: no cover - fallback for older yfinance versions
 from holidays import get_previous_trading_day, IST
 
 MARKET_OPEN = time(9, 15)
+_MARKET_OPEN_SEC = 9 * 3600 + 15 * 60
+_NAT_INT64 = np.iinfo(np.int64).min
 CACHE_DIR = Path(__file__).parent / ".cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_RETENTION_DAYS = 7
@@ -56,6 +58,23 @@ _MAX_POOLS = 4
 
 def _time_to_sec(t: time) -> int:
     return t.hour * 3600 + t.minute * 60 + t.second
+
+
+def _ist_epoch_sec(d: date, t: time) -> int:
+    """Convert an IST wall-clock (date, time) pair to UTC integer epoch seconds."""
+    dt_naive = datetime.combine(d, t)
+    localize = getattr(IST, "localize", None)
+    dt_ist = localize(dt_naive) if localize is not None else dt_naive.replace(tzinfo=IST)
+    return int(dt_ist.timestamp())
+
+
+def _index_epoch_seconds(index: pd.DatetimeIndex) -> np.ndarray:
+    """Convert DatetimeIndex to int64 UTC epoch seconds regardless of ns/us/ms/s resolution."""
+    idx = index if index.tz is not None else index.tz_localize("UTC")
+    as_unit = getattr(idx, "as_unit", None)
+    if as_unit is not None:
+        return as_unit("s").asi8
+    return (idx.asi8 // 1_000_000_000).astype(np.int64, copy=False)
 
 
 def _create_http_session() -> Any:
@@ -161,28 +180,41 @@ def _build_prev_day_baseline(
     if df_prev is None or df_prev.empty or "Volume" not in df_prev.columns:
         return None
 
-    df_prev = _standardize_index_tz(df_prev)
-    resolved_date = target_date if target_date is not None else df_prev.index.date.max()
-    mask_date = df_prev.index.date == resolved_date
+    ts_sec = _index_epoch_seconds(df_prev.index)
+    if target_date is not None:
+        resolved_date = target_date
+    else:
+        valid_ts = ts_sec[ts_sec != _NAT_INT64]
+        if len(valid_ts) == 0:
+            return None
+        resolved_date = datetime.fromtimestamp(int(valid_ts.max()), tz=IST).date()
+
+    day_start_sec = _ist_epoch_sec(resolved_date, time(0, 0))
+    day_end_sec = day_start_sec + 86400
+    open_sec = day_start_sec + _MARKET_OPEN_SEC
+
+    mask_date = (ts_sec >= day_start_sec) & (ts_sec < day_end_sec)
     if not mask_date.any():
         return None
-    df_prev = df_prev.loc[mask_date]
 
-    times = df_prev.index.time
-    mask_open = times >= MARKET_OPEN
-    if not mask_open.any():
+    mask_reg = (ts_sec >= open_sec) & (ts_sec < day_end_sec)
+    if not mask_reg.any():
         return None
 
-    reg_df = df_prev.loc[mask_open]
-    vol_arr = reg_df["Volume"].to_numpy(dtype=float, copy=False)
-    # Require at least one non-NaN price or volume value in regular hours
+    vol_col = df_prev["Volume"].to_numpy(dtype=float, copy=False)
+    vol_arr = vol_col[mask_reg]
     has_vol = not np.isnan(vol_arr).all()
-    has_close = "Close" in reg_df.columns and reg_df["Close"].notna().any()
+
+    close_col = (
+        df_prev["Close"].to_numpy(dtype=float, copy=False)
+        if "Close" in df_prev.columns
+        else None
+    )
+    has_close = close_col is not None and bool((~np.isnan(close_col[mask_reg])).any())
     if not has_vol and not has_close:
         return None
 
-    reg_times = reg_df.index.time
-    secs = np.fromiter((_time_to_sec(t) for t in reg_times), dtype=np.int32, count=len(reg_times))
+    secs = (ts_sec[mask_reg] - day_start_sec).astype(np.int32, copy=False)
     clean_vol = np.nan_to_num(vol_arr, nan=0.0)
 
     # Sort and aggregate duplicate timestamps if present
@@ -199,12 +231,18 @@ def _build_prev_day_baseline(
         cumvol = np.cumsum(vol_sorted, dtype=np.float64)
 
     prev_close: Optional[float] = None
-    if "Close" in df_prev.columns:
-        df_close = df_prev if df_prev.index.is_monotonic_increasing else df_prev.sort_index(kind="mergesort")
-        close_arr = df_close["Close"].to_numpy(dtype=float, copy=False)
-        valid_close = close_arr[~np.isnan(close_arr)]
-        if len(valid_close) > 0:
-            prev_close = float(valid_close[-1])
+    if close_col is not None:
+        close_date = close_col[mask_date]
+        ts_date = ts_sec[mask_date]
+        valid_mask = ~np.isnan(close_date)
+        if valid_mask.any():
+            valid_closes = close_date[valid_mask]
+            valid_ts_date = ts_date[valid_mask]
+            if len(valid_ts_date) > 1 and np.any(valid_ts_date[1:] < valid_ts_date[:-1]):
+                c_order = np.argsort(valid_ts_date, kind="mergesort")
+                prev_close = float(valid_closes[c_order[-1]])
+            else:
+                prev_close = float(valid_closes[-1])
 
     return {
         "times_sec": secs_sorted,
@@ -517,6 +555,7 @@ def _fetch_histories_concurrent(
     start: Optional[str] = None,
     end: Optional[str] = None,
     chunk_size: Optional[int] = None,
+    symbol_ranges: Optional[Dict[str, Tuple[Optional[str], Optional[str]]]] = None,
 ) -> Tuple[Dict[str, pd.DataFrame], Set[str]]:
     """
     Concurrently fetch ticker histories over a single reusable worker pool without chunk barriers.
@@ -537,10 +576,15 @@ def _fetch_histories_concurrent(
     results: Dict[str, pd.DataFrame] = {}
     failed: Set[str] = set()
 
+    def _range_for(sym: str) -> Tuple[Optional[str], Optional[str]]:
+        if symbol_ranges and sym in symbol_ranges:
+            return symbol_ranges[sym]
+        return start, end
+
     with _borrow_executor(max_workers) as executor:
         for batch in batches:
             futures = [
-                executor.submit(_fetch_one_history, sym, interval, period, start, end)
+                executor.submit(_fetch_one_history, sym, interval, period, *_range_for(sym))
                 for sym, period in batch
             ]
             for fut in as_completed(futures):
@@ -557,7 +601,13 @@ def _fetch_histories_concurrent(
         pytime.sleep(0.5)
         with _borrow_executor(min(2, max(1, int(max_workers)))) as retry_executor:
             retry_futures = [
-                retry_executor.submit(_fetch_one_history, sym, interval, period_by_sym.get(sym), start, end)
+                retry_executor.submit(
+                    _fetch_one_history,
+                    sym,
+                    interval,
+                    period_by_sym.get(sym),
+                    *_range_for(sym),
+                )
                 for sym in retry_syms
             ]
             for fut in as_completed(retry_futures):
@@ -643,89 +693,94 @@ def get_today_data(
 
 
 def _summarize_today_df(
-    df: pd.DataFrame, today: date, cutoff: time
+    df: pd.DataFrame,
+    today: date,
+    cutoff: time,
+    day_start_sec: Optional[int] = None,
+    cutoff_bound_sec: Optional[int] = None,
 ) -> Optional[Tuple[float, Optional[float], Optional[float], Optional[float], Optional[float], Optional[time]]]:
     """Fast NumPy summary of today's regular-hours (vol_today, ltp, open, high, low, last_bar_time)."""
     if df is None or df.empty:
         return None
 
-    df = _standardize_index_tz(df)
-    dates = df.index.date
-    mask_today = dates == today
-    if not mask_today.any():
-        return None
+    if day_start_sec is None:
+        day_start_sec = _ist_epoch_sec(today, time(0, 0))
+    open_sec = day_start_sec + _MARKET_OPEN_SEC
+    if cutoff_bound_sec is None:
+        cutoff_bound_sec = day_start_sec + _time_to_sec(cutoff)
 
-    df_today = df if mask_today.all() else df.loc[mask_today]
-    times = df_today.index.time
-    mask_reg = (times >= MARKET_OPEN) & (times <= cutoff)
+    ts_sec = _index_epoch_seconds(df.index)
+    mask_reg = (ts_sec >= open_sec) & (ts_sec <= cutoff_bound_sec)
     if not mask_reg.any():
         return None
 
-    df_reg = df_today.loc[mask_reg]
-    price_cols = [c for c in ("Open", "High", "Low", "Close") if c in df_reg.columns]
-    has_price = df_reg[price_cols].notna().any(axis=1) if price_cols else pd.Series(False, index=df_reg.index)
-    has_pos_vol = (
-        df_reg["Volume"].fillna(0.0) > 0.0
-        if "Volume" in df_reg.columns
-        else pd.Series(False, index=df_reg.index)
-    )
-    df_reg = df_reg.loc[has_price | has_pos_vol]
-    if df_reg.empty:
+    t_reg = ts_sec[mask_reg]
+    cols = df.columns
+    open_arr = df["Open"].to_numpy(dtype=float, copy=False)[mask_reg] if "Open" in cols else None
+    high_arr = df["High"].to_numpy(dtype=float, copy=False)[mask_reg] if "High" in cols else None
+    low_arr = df["Low"].to_numpy(dtype=float, copy=False)[mask_reg] if "Low" in cols else None
+    close_arr = df["Close"].to_numpy(dtype=float, copy=False)[mask_reg] if "Close" in cols else None
+    vol_arr = df["Volume"].to_numpy(dtype=float, copy=False)[mask_reg] if "Volume" in cols else None
+
+    # Drop placeholder rows with neither valid OHLC price nor positive volume
+    valid_row = np.zeros(len(t_reg), dtype=bool)
+    for arr in (open_arr, high_arr, low_arr, close_arr):
+        if arr is not None:
+            valid_row |= ~np.isnan(arr)
+    if vol_arr is not None:
+        valid_row |= np.nan_to_num(vol_arr, nan=0.0) > 0.0
+    if not valid_row.any():
         return None
 
-    if not df_reg.index.is_monotonic_increasing:
-        df_reg = df_reg.sort_index(kind="mergesort")
+    if not valid_row.all():
+        t_reg = t_reg[valid_row]
+        open_arr = open_arr[valid_row] if open_arr is not None else None
+        high_arr = high_arr[valid_row] if high_arr is not None else None
+        low_arr = low_arr[valid_row] if low_arr is not None else None
+        close_arr = close_arr[valid_row] if close_arr is not None else None
+        vol_arr = vol_arr[valid_row] if vol_arr is not None else None
 
-    if df_reg.index.has_duplicates:
-        agg_map = {
-            col: fn
-            for col, fn in (
-                ("Open", "first"),
-                ("High", "max"),
-                ("Low", "min"),
-                ("Close", "last"),
-                ("Volume", "max"),
-            )
-            if col in df_reg.columns
-        }
-        if agg_map:
-            df_reg = df_reg.groupby(level=0, sort=True).agg(agg_map)
+    if len(t_reg) > 1 and np.any(t_reg[1:] < t_reg[:-1]):
+        order = np.argsort(t_reg, kind="mergesort")
+        t_reg = t_reg[order]
+        open_arr = open_arr[order] if open_arr is not None else None
+        high_arr = high_arr[order] if high_arr is not None else None
+        low_arr = low_arr[order] if low_arr is not None else None
+        close_arr = close_arr[order] if close_arr is not None else None
+        vol_arr = vol_arr[order] if vol_arr is not None else None
+
+    last_bar_sec = int(t_reg[-1] - day_start_sec)
+    last_bar_time = time(last_bar_sec // 3600, (last_bar_sec % 3600) // 60, last_bar_sec % 60)
+
+    if vol_arr is not None and len(vol_arr):
+        if len(t_reg) > 1 and np.any(t_reg[1:] == t_reg[:-1]):
+            _, idx_start = np.unique(t_reg, return_index=True)
+            vol_dedup = np.maximum.reduceat(np.nan_to_num(vol_arr, nan=0.0), idx_start)
+            vol_today = float(np.sum(vol_dedup, dtype=np.float64))
         else:
-            df_reg = df_reg[~df_reg.index.duplicated(keep="last")]
-
-    last_bar_time = df_reg.index[-1].time()
-
-    if "Volume" in df_reg.columns:
-        vol_arr = df_reg["Volume"].to_numpy(dtype=float, copy=False)
-        vol_today = float(np.nansum(vol_arr)) if len(vol_arr) else 0.0
+            vol_today = float(np.nansum(vol_arr))
     else:
         vol_today = 0.0
 
     last_price: Optional[float] = None
-    if "Close" in df_reg.columns:
-        close_arr = df_reg["Close"].to_numpy(dtype=float, copy=False)
+    if close_arr is not None:
         valid = close_arr[~np.isnan(close_arr)]
         if len(valid):
             last_price = float(valid[-1])
 
     day_open: Optional[float] = None
-    if "Open" in df_reg.columns:
-        open_arr = df_reg["Open"].to_numpy(dtype=float, copy=False)
+    if open_arr is not None:
         valid = open_arr[~np.isnan(open_arr)]
         if len(valid):
             day_open = float(valid[0])
 
     day_high: Optional[float] = None
-    if "High" in df_reg.columns:
-        high_arr = df_reg["High"].to_numpy(dtype=float, copy=False)
-        if not np.isnan(high_arr).all():
-            day_high = float(np.nanmax(high_arr))
+    if high_arr is not None and not np.isnan(high_arr).all():
+        day_high = float(np.nanmax(high_arr))
 
     day_low: Optional[float] = None
-    if "Low" in df_reg.columns:
-        low_arr = df_reg["Low"].to_numpy(dtype=float, copy=False)
-        if not np.isnan(low_arr).all():
-            day_low = float(np.nanmin(low_arr))
+    if low_arr is not None and not np.isnan(low_arr).all():
+        day_low = float(np.nanmin(low_arr))
 
     return vol_today, last_price, day_open, day_high, day_low, last_bar_time
 
@@ -759,37 +814,53 @@ def run_scan(
     # 1. Load existing baseline store (memory LRU -> disk) under lock
     store = _get_or_load_store(cache_key, prev_day, interval)
 
-    known_set = set(store["symbols"]) | _get_neg_cached(cache_key)
+    neg_set = _get_neg_cached(cache_key)
+    known_set = set(store["symbols"]) | neg_set
     missing = [sym for sym in symbols if sym not in known_set]
     missing_set = set(missing)
 
-    can_coalesce_5d = interval != "1m" or (today - prev_day).days <= 6
+    gap_days = (today - prev_day).days
+    can_coalesce_range = 0 < gap_days <= (6 if interval == "1m" else 55)
 
-    # 2. Fetch histories in one concurrent wave (coalescing cold prev_day + today via period='5d')
-    if missing and not can_coalesce_5d:
-        # Rare >6-day holiday gap on 1m bars: fetch prev_day explicitly first
+    # 2. Fetch histories in one concurrent wave (coalescing cold prev_day..today via exact start/end)
+    if missing and not can_coalesce_range:
+        # Rare >6-day holiday gap on 1m bars (or >55d on 5m): fetch prev_day explicitly first
         store = get_previous_day_data(
             symbols, prev_day, interval=interval, chunk_size=chunk_size, max_workers=max_workers
         )
         missing_set = set()
+        neg_set = _get_neg_cached(cache_key)
 
-    symbol_periods = (
-        (sym, "5d" if (sym in missing_set and can_coalesce_5d) else "1d")
-        for sym in symbols
-    )
+    # Skip network fetches for symbols sitting in negative cache without any baseline entry
+    skip_today_set = neg_set - set(store["symbol_to_idx"].keys())
+    prev_day_str = prev_day.strftime("%Y-%m-%d")
+    tomorrow_str = (today + timedelta(days=1)).strftime("%Y-%m-%d")
+    symbol_ranges: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
+    symbol_periods: List[Tuple[str, Optional[str]]] = []
+    for sym in symbols:
+        if sym in skip_today_set:
+            continue
+        if sym in missing_set and can_coalesce_range:
+            symbol_periods.append((sym, None))
+            symbol_ranges[sym] = (prev_day_str, tomorrow_str)
+        else:
+            symbol_periods.append((sym, "1d"))
+
     fetched_dfs, failed_syms = _fetch_histories_concurrent(
         symbol_periods,
         interval=interval,
         max_workers=max_workers,
         chunk_size=chunk_size,
+        symbol_ranges=symbol_ranges if symbol_ranges else None,
     )
 
-    # 3. Extract & persist any newly fetched previous-day baselines from the 5d responses
+    # 3. Extract & persist any newly fetched previous-day baselines from coalesced responses
     if missing_set:
         _prune_old_cache()
         new_entries: Dict[str, Optional[Dict[str, Any]]] = {}
         neg_syms: List[str] = []
         fallback_missing: List[str] = []
+        prev_day_start_sec = _ist_epoch_sec(prev_day, time(0, 0))
 
         for sym in missing:
             if sym in failed_syms:
@@ -802,8 +873,9 @@ def run_scan(
             if baseline is not None:
                 new_entries[sym] = baseline
             else:
-                # 5d might not reach prev_day if there were >5 trading sessions or missing bars
-                if (df_sym.index.date < prev_day).any():
+                ts_sym = _index_epoch_seconds(df_sym.index)
+                valid_ts = ts_sym[ts_sym != _NAT_INT64]
+                if len(valid_ts) > 0 and (valid_ts < prev_day_start_sec).any():
                     neg_syms.append(sym)
                 else:
                     fallback_missing.append(sym)
@@ -838,6 +910,8 @@ def run_scan(
     if len(times_sec) == 0 or cutoff_sec < int(times_sec[0]):
         return pd.DataFrame()
 
+    today_day_start_sec = _ist_epoch_sec(today, time(0, 0))
+    today_cutoff_bound_sec = today_day_start_sec + cutoff_sec
     cumvol_mat = store["cumvol"]
     prev_close_arr = store["prev_close"]
     prev_full_arr = store["prev_full_vol"]
@@ -851,7 +925,11 @@ def run_scan(
             continue
 
         df_sym = fetched_dfs.get(sym)
-        summary = _summarize_today_df(df_sym, today, cutoff) if df_sym is not None else None
+        summary = (
+            _summarize_today_df(df_sym, today, cutoff, today_day_start_sec, today_cutoff_bound_sec)
+            if df_sym is not None
+            else None
+        )
         if summary is None:
             continue
 
