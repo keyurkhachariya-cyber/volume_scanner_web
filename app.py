@@ -126,6 +126,8 @@ if "_cached_prev_day" not in st.session_state:
     st.session_state._cached_prev_day = None
 if "_last_interval" not in st.session_state:
     st.session_state._last_interval = None
+if "_scan_started_by_interval" not in st.session_state:
+    st.session_state._scan_started_by_interval = {}
 
 # Sidebar controls
 with st.sidebar:
@@ -245,6 +247,7 @@ def _should_auto_scan(
     skip_auto_scan: bool,
     post_close_attempts: int = 0,
     max_post_close_attempts: int = 2,
+    last_scan_started_dt: datetime | None = None,
 ) -> bool:
     """
     Decide whether a scheduled auto-refresh scan should execute:
@@ -257,9 +260,10 @@ def _should_auto_scan(
         return False
 
     if market_open:
-        if last_scan_dt is None or last_scan_dt.date() != now.date():
+        cadence_ref = last_scan_started_dt or last_scan_dt
+        if cadence_ref is None or cadence_ref.date() != now.date():
             return True
-        elapsed = (now - last_scan_dt).total_seconds()
+        elapsed = (now - cadence_ref).total_seconds()
         return elapsed >= max(refresh_seconds - 1, 1)
 
     is_trading_day = now.weekday() < 5 and now.date() not in holidays_set
@@ -290,6 +294,7 @@ def render_scanner(
     market_open = is_market_open(now)
 
     last_scan_dt = st.session_state.scan_times_by_interval.get(interval)
+    last_scan_started_dt = st.session_state._scan_started_by_interval.get(interval)
     skip_once = bool(st.session_state._skip_auto_scan_once)
     st.session_state._skip_auto_scan_once = False
 
@@ -307,6 +312,7 @@ def render_scanner(
             holidays_set=holidays_set,
             skip_auto_scan=skip_once,
             post_close_attempts=post_close_attempts,
+            last_scan_started_dt=last_scan_started_dt,
         )
 
     col1, col2, col3 = st.columns(3)
@@ -342,6 +348,7 @@ def render_scanner(
     if should_scan:
         with status_slot:
             with st.spinner(f"Scanning {len(symbols)} F&O stocks ({interval} bars)..."):
+                scan_started_dt = datetime.now(IST)
                 # Fetch unfiltered snapshot so sidebar filter changes apply instantly in memory
                 raw_df = run_scan(
                     symbols=symbols,
@@ -354,6 +361,7 @@ def render_scanner(
                     st.session_state.results_by_interval[interval] = raw_df
                     last_scan_dt = datetime.now(IST)
                     st.session_state.scan_times_by_interval[interval] = last_scan_dt
+                    st.session_state._scan_started_by_interval[interval] = scan_started_dt
                     st.session_state._last_scan_empty_by_interval.pop(interval, None)
                     if not market_open:
                         st.session_state._post_close_attempts_by_interval.pop(interval, None)
@@ -377,7 +385,8 @@ def render_scanner(
 
     # Client-side filtering on the cached scan snapshot for the active interval
     raw_df = st.session_state.results_by_interval.get(interval, pd.DataFrame())
-    empty_scan_dt = st.session_state._last_scan_empty_by_interval.get(interval)
+    raw_empty_dt = st.session_state._last_scan_empty_by_interval.get(interval)
+    empty_scan_dt = raw_empty_dt if (raw_empty_dt is not None and raw_empty_dt.date() == now.date()) else None
     gap_missing = False
     gap_excluded_count = 0
 

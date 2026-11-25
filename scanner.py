@@ -325,21 +325,28 @@ def _get_neg_cached(cache_key: Tuple[date, str]) -> Set[str]:
         return set(bucket.keys())
 
 
-def _get_cached_store(cache_key: Tuple[date, str]) -> Optional[Dict[str, Any]]:
+def _put_memory_cache_locked(cache_key: Tuple[date, str], store: Dict[str, Any]) -> None:
+    _PREV_DAY_MEMORY_CACHE[cache_key] = store
+    _PREV_DAY_MEMORY_CACHE.move_to_end(cache_key)
+    while len(_PREV_DAY_MEMORY_CACHE) > MEMORY_CACHE_MAX_ENTRIES:
+        evicted_key, _ = _PREV_DAY_MEMORY_CACHE.popitem(last=False)
+        _NEG_CACHE.pop(evicted_key, None)
+
+
+def _get_or_load_store(
+    cache_key: Tuple[date, str], prev_day: date, interval: str
+) -> Dict[str, Any]:
+    """Load baseline store from LRU memory cache or disk under _CACHE_LOCK."""
     with _CACHE_LOCK:
         store = _PREV_DAY_MEMORY_CACHE.get(cache_key)
         if store is not None:
             _PREV_DAY_MEMORY_CACHE.move_to_end(cache_key)
+            return store
+        store = _load_disk_baseline(prev_day, interval)
+        if store is None:
+            store = _empty_baseline_store(prev_day, interval)
+        _put_memory_cache_locked(cache_key, store)
         return store
-
-
-def _put_cached_store(cache_key: Tuple[date, str], store: Dict[str, Any]) -> None:
-    with _CACHE_LOCK:
-        _PREV_DAY_MEMORY_CACHE[cache_key] = store
-        _PREV_DAY_MEMORY_CACHE.move_to_end(cache_key)
-        while len(_PREV_DAY_MEMORY_CACHE) > MEMORY_CACHE_MAX_ENTRIES:
-            evicted_key, _ = _PREV_DAY_MEMORY_CACHE.popitem(last=False)
-            _NEG_CACHE.pop(evicted_key, None)
 
 
 def _load_disk_baseline(prev_day: date, interval: str) -> Optional[Dict[str, Any]]:
@@ -426,11 +433,7 @@ def _commit_baseline_updates(
         else:
             store = _empty_baseline_store(prev_day, interval)
 
-        _PREV_DAY_MEMORY_CACHE[cache_key] = store
-        _PREV_DAY_MEMORY_CACHE.move_to_end(cache_key)
-        while len(_PREV_DAY_MEMORY_CACHE) > MEMORY_CACHE_MAX_ENTRIES:
-            evicted_key, _ = _PREV_DAY_MEMORY_CACHE.popitem(last=False)
-            _NEG_CACHE.pop(evicted_key, None)
+        _put_memory_cache_locked(cache_key, store)
         return store
 
 
@@ -580,12 +583,7 @@ def get_previous_day_data(
     with bounded in-memory LRU cache, disk cache, and short-TTL memory negative cache.
     """
     cache_key = (prev_day, interval)
-    store = _get_cached_store(cache_key)
-    if store is None:
-        store = _load_disk_baseline(prev_day, interval)
-
-    if store is None:
-        store = _empty_baseline_store(prev_day, interval)
+    store = _get_or_load_store(cache_key, prev_day, interval)
 
     known_set = set(store["symbols"]) | _get_neg_cached(cache_key)
     missing = [sym for sym in symbols if sym not in known_set]
@@ -619,8 +617,7 @@ def get_previous_day_data(
         store = _commit_baseline_updates(cache_key, prev_day, interval, new_entries, neg_syms)
         return store
 
-    _put_cached_store(cache_key, store)
-    return store
+    return _commit_baseline_updates(cache_key, prev_day, interval, {}, [])
 
 
 def get_today_data(
@@ -759,12 +756,8 @@ def run_scan(
     prev_day = get_previous_trading_day(today)
     cache_key = (prev_day, interval)
 
-    # 1. Load existing baseline store (memory LRU -> disk)
-    store = _get_cached_store(cache_key)
-    if store is None:
-        store = _load_disk_baseline(prev_day, interval)
-    if store is None:
-        store = _empty_baseline_store(prev_day, interval)
+    # 1. Load existing baseline store (memory LRU -> disk) under lock
+    store = _get_or_load_store(cache_key, prev_day, interval)
 
     known_set = set(store["symbols"]) | _get_neg_cached(cache_key)
     missing = [sym for sym in symbols if sym not in known_set]
@@ -838,7 +831,7 @@ def run_scan(
 
         store = _commit_baseline_updates(cache_key, prev_day, interval, new_entries, neg_syms)
     else:
-        _put_cached_store(cache_key, store)
+        store = _commit_baseline_updates(cache_key, prev_day, interval, {}, [])
 
     # 4. Per-ticker bar-aligned baseline lookup (prevents look-ahead bias on lagging feeds)
     times_sec = store["times_sec"]
