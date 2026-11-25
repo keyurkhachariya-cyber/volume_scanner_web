@@ -3,13 +3,15 @@ Relative Volume Scanner (F&O Stocks) - Streamlit Web App
 Today's cumulative volume till now vs Previous day's volume till same time.
 """
 
-from datetime import datetime
+from datetime import datetime, time
 import streamlit as st
 import pandas as pd
 
 from universe import get_fno_universe
-from scanner import run_scan
-from holidays import is_market_open, get_previous_trading_day, IST
+from scanner import prune_cache, run_scan
+from holidays import get_holidays, is_market_open, get_previous_trading_day, IST
+
+MARKET_CLOSE_TIME = time(15, 30)
 
 st.set_page_config(
     page_title="F&O Relative Volume Scanner",
@@ -27,6 +29,7 @@ DEFAULT_COLUMNS = [
     "Vol_Prev_Same_Time",
     "Ratio",
     "Pct_Change",
+    "Last_Bar_Time",
 ]
 
 ALL_COLUMNS = [
@@ -36,6 +39,7 @@ ALL_COLUMNS = [
     "Vol_Prev_Same_Time",
     "Ratio",
     "Pct_Change",
+    "Last_Bar_Time",
     "Gap_Pct",
     "Prev_Close",
     "Day_Open",
@@ -54,6 +58,7 @@ COLUMN_LABELS = {
     "Vol_Prev_Same_Time": "Vol Prev (same time)",
     "Ratio": "Ratio",
     "Pct_Change": "% Chg",
+    "Last_Bar_Time": "Last Bar (IST)",
     "Gap_Pct": "Gap %",
     "Prev_Close": "Prev Close",
     "Day_Open": "Day Open",
@@ -72,6 +77,10 @@ COLUMN_CONFIG = {
     "Vol_Prev_Same_Time": st.column_config.NumberColumn("Vol Prev (same time)", format="localized"),
     "Ratio": st.column_config.NumberColumn("Ratio", format="%.2f×"),
     "Pct_Change": st.column_config.NumberColumn("% Chg", format="%+.2f%%"),
+    "Last_Bar_Time": st.column_config.TextColumn(
+        "Last Bar (IST)",
+        help="Latest regular-hours bar timestamp (IST) used for bar-aligned baseline lookup.",
+    ),
     "Gap_Pct": st.column_config.NumberColumn("Gap %", format="%+.2f%%"),
     "Prev_Close": st.column_config.NumberColumn("Prev Close", format="%.2f"),
     "Day_Open": st.column_config.NumberColumn("Day Open", format="%.2f"),
@@ -83,10 +92,32 @@ COLUMN_CONFIG = {
     "Turnover_Cr": st.column_config.NumberColumn("Turnover (₹ Cr)", format="%.2f"),
 }
 
+
+@st.cache_resource
+def _run_startup_housekeeping() -> bool:
+    """Prune stale/legacy cache files once per Streamlit server lifecycle."""
+    prune_cache()
+    return True
+
+
+_run_startup_housekeeping()
+
 if "universe_symbols" not in st.session_state:
     syms, src = get_fno_universe(force_refresh=False)
     st.session_state.universe_symbols = syms
     st.session_state.universe_source = src
+
+# Session state initialization (keyed per bar interval so switching 1m/5m preserves snapshots)
+if "results_by_interval" not in st.session_state:
+    st.session_state.results_by_interval = {}
+if "scan_times_by_interval" not in st.session_state:
+    st.session_state.scan_times_by_interval = {}
+if "selected_columns" not in st.session_state:
+    st.session_state.selected_columns = DEFAULT_COLUMNS.copy()
+if "_skip_auto_scan_once" not in st.session_state:
+    st.session_state._skip_auto_scan_once = False
+if "_last_filter_state" not in st.session_state:
+    st.session_state._last_filter_state = None
 
 # Sidebar controls
 with st.sidebar:
@@ -143,14 +174,16 @@ with st.sidebar:
             options=[30, 60, 120, 300],
             index=1,
             format_func=lambda s: f"{s} seconds" if s < 60 else f"{s // 60} minute{'s' if s > 60 else ''}",
-            help="Interval between automated background scans.",
+            help="Interval between automated background scans while NSE is open.",
         )
     st.markdown("---")
-    if st.button("🔄 Sync NSE F&O List", use_container_width=True):
-        with st.spinner("Fetching latest F&O list from NSE..."):
+    if st.button("🔄 Sync NSE F&O List", width="stretch"):
+        with st.spinner("Fetching latest F&O list and trading calendar from NSE..."):
             syms, src = get_fno_universe(force_refresh=True)
+            get_holidays(force_refresh=True)
             st.session_state.universe_symbols = syms
             st.session_state.universe_source = src
+            st.session_state._skip_auto_scan_once = True
 
     active_universe = st.session_state.universe_symbols
     st.info(
@@ -158,19 +191,63 @@ with st.sidebar:
         f"Source: {st.session_state.universe_source}"
     )
 
-# Session state initialization
-if "raw_results_df" not in st.session_state:
-    st.session_state.raw_results_df = pd.DataFrame()
-if "last_scan_time" not in st.session_state:
-    st.session_state.last_scan_time = None
-if "last_scan_interval" not in st.session_state:
-    st.session_state.last_scan_interval = None
-if "selected_columns" not in st.session_state:
-    st.session_state.selected_columns = DEFAULT_COLUMNS.copy()
+# Detect sidebar filter/config tweaks so changing filters never hijacks into a network scan
+current_filter_state = (
+    float(min_ratio),
+    int(min_volume),
+    bool(exclude_gap_up),
+    bool(exclude_gap_down),
+    float(gap_threshold),
+    int(max_workers),
+)
+if (
+    st.session_state._last_filter_state is not None
+    and st.session_state._last_filter_state != current_filter_state
+):
+    st.session_state._skip_auto_scan_once = True
+st.session_state._last_filter_state = current_filter_state
 
 
-def _reset_default_columns():
+def _mark_ui_interaction() -> None:
+    st.session_state._skip_auto_scan_once = True
+
+
+def _reset_default_columns() -> None:
     st.session_state.selected_columns = DEFAULT_COLUMNS.copy()
+    st.session_state._skip_auto_scan_once = True
+
+
+def _should_auto_scan(
+    now: datetime,
+    last_scan_dt: datetime | None,
+    refresh_seconds: int,
+    market_open: bool,
+    holidays_set: set,
+    skip_auto_scan: bool,
+) -> bool:
+    """
+    Decide whether a scheduled auto-refresh scan should execute:
+    - Never run during pure UI/filter interactions.
+    - Poll every refresh_seconds while NSE is open.
+    - Allow at most ONE final post-close snapshot after 15:30 IST on a trading day.
+    - Stay idle pre-market, on weekends, and on holidays.
+    """
+    if skip_auto_scan:
+        return False
+
+    if market_open:
+        if last_scan_dt is None or last_scan_dt.date() != now.date():
+            return True
+        elapsed = (now - last_scan_dt).total_seconds()
+        return elapsed >= max(refresh_seconds - 1, 1)
+
+    is_trading_day = now.weekday() < 5 and now.date() not in holidays_set
+    if is_trading_day and now.time() > MARKET_CLOSE_TIME:
+        market_close_dt = now.replace(hour=15, minute=30, second=0, microsecond=0)
+        if last_scan_dt is None or last_scan_dt.date() < now.date() or last_scan_dt < market_close_dt:
+            return True
+
+    return False
 
 
 def render_scanner(
@@ -186,6 +263,7 @@ def render_scanner(
     refresh_seconds: int,
 ):
     now = datetime.now(IST)
+    holidays_set = get_holidays()
     prev_day = get_previous_trading_day(now.date())
     market_open = is_market_open(now)
 
@@ -198,41 +276,58 @@ def render_scanner(
 
     col_btn, col_info = st.columns([1, 2])
     with col_btn:
-        scan_clicked = st.button("🔄 Scan Now", type="primary", use_container_width=True)
-    with col_info:
-        if auto_refresh:
-            st.caption(
-                f"⏱️ **Auto-refresh active** (every {refresh_seconds}s). "
-                "Updating in the background without full-page reloads."
-            )
+        scan_clicked = st.button("🔄 Scan Now", type="primary", width="stretch")
+
+    last_scan_dt = st.session_state.scan_times_by_interval.get(interval)
+    skip_once = bool(st.session_state._skip_auto_scan_once)
+    st.session_state._skip_auto_scan_once = False
 
     should_scan = False
     if scan_clicked:
         should_scan = True
     elif auto_refresh:
-        if st.session_state.last_scan_time is None:
-            should_scan = True
-        else:
-            elapsed = (datetime.now(IST) - st.session_state.last_scan_time).total_seconds()
-            if elapsed >= max(refresh_seconds - 5, 10):
-                should_scan = True
+        should_scan = _should_auto_scan(
+            now=now,
+            last_scan_dt=last_scan_dt,
+            refresh_seconds=refresh_seconds,
+            market_open=market_open,
+            holidays_set=holidays_set,
+            skip_auto_scan=skip_once,
+        )
+
+    with col_info:
+        if auto_refresh:
+            if market_open:
+                st.caption(
+                    f"⏱️ **Auto-refresh active** (every {refresh_seconds}s). "
+                    "Updating in the background without full-page reloads."
+                )
+            elif should_scan:
+                st.caption("⏱️ **Auto-refresh**: running final post-close snapshot before pausing.")
+            else:
+                st.caption("⏸️ **Auto-refresh paused** (market closed). Manual **Scan Now** still works anytime.")
+
+    # Reserve layout slots before slow network calls to minimize stale greying & remounting
+    status_slot = st.container()
+    results_slot = st.container()
 
     if should_scan:
-        with st.spinner(f"Scanning {len(symbols)} F&O stocks..."):
-            # Fetch unfiltered snapshot so sidebar filter changes apply instantly in memory
-            raw_df = run_scan(
-                symbols=symbols,
-                min_ratio=0.0,
-                min_volume=0,
-                interval=interval,
-                max_workers=max_workers,
-            )
-            st.session_state.raw_results_df = raw_df
-            st.session_state.last_scan_time = datetime.now(IST)
-            st.session_state.last_scan_interval = interval
+        with status_slot:
+            with st.spinner(f"Scanning {len(symbols)} F&O stocks ({interval} bars)..."):
+                # Fetch unfiltered snapshot so sidebar filter changes apply instantly in memory
+                raw_df = run_scan(
+                    symbols=symbols,
+                    min_ratio=0.0,
+                    min_volume=0,
+                    interval=interval,
+                    max_workers=max_workers,
+                )
+                st.session_state.results_by_interval[interval] = raw_df
+                last_scan_dt = datetime.now(IST)
+                st.session_state.scan_times_by_interval[interval] = last_scan_dt
 
-    # Client-side filtering on the cached scan snapshot
-    raw_df = st.session_state.raw_results_df
+    # Client-side filtering on the cached scan snapshot for the active interval
+    raw_df = st.session_state.results_by_interval.get(interval, pd.DataFrame())
     gap_missing = False
     gap_excluded_count = 0
 
@@ -243,7 +338,7 @@ def render_scanner(
         if "Gap_Pct" not in working_df.columns and {"Day_Open", "Prev_Close"}.issubset(working_df.columns):
             working_df = working_df.copy()
             valid_prev = working_df["Prev_Close"].notna() & (working_df["Prev_Close"] > 0)
-            working_df["Gap_Pct"] = None
+            working_df["Gap_Pct"] = float("nan")
             working_df.loc[valid_prev, "Gap_Pct"] = (
                 (working_df.loc[valid_prev, "Day_Open"] - working_df.loc[valid_prev, "Prev_Close"])
                 / working_df.loc[valid_prev, "Prev_Close"]
@@ -264,58 +359,63 @@ def render_scanner(
 
         df = working_df[mask].reset_index(drop=True)
 
-    if st.session_state.last_scan_time:
-        gap_note = ""
-        if (exclude_gap_up or exclude_gap_down) and not gap_missing:
-            gap_note = f" | Excluded by gap filter: **{gap_excluded_count}**"
-        st.success(
-            f"Last scan: {st.session_state.last_scan_time.strftime('%H:%M:%S IST')} "
-            f"({st.session_state.last_scan_interval} bars) | "
-            f"Showing **{len(df)}** of **{len(raw_df)}** scanned stocks{gap_note}"
-        )
-        if gap_missing:
-            st.warning(
-                "Current results were scanned before Gap % data was added — click **Scan Now** once to apply the gap filter."
+    with status_slot:
+        if last_scan_dt is not None:
+            gap_note = ""
+            if (exclude_gap_up or exclude_gap_down) and not gap_missing:
+                gap_note = f" | Excluded by gap filter: **{gap_excluded_count}**"
+            st.success(
+                f"Last scan: {last_scan_dt.strftime('%H:%M:%S IST')} "
+                f"({interval} bars) | "
+                f"Showing **{len(df)}** of **{len(raw_df)}** scanned stocks{gap_note}"
             )
-        if st.session_state.last_scan_interval and st.session_state.last_scan_interval != interval:
-            st.info(f"Bar interval changed to **{interval}** — click **Scan Now** to fetch {interval} bars.")
+            if gap_missing:
+                st.warning(
+                    "Current results were scanned before Gap % data was added — click **Scan Now** once to apply the gap filter."
+                )
+        elif st.session_state.results_by_interval:
+            st.info(f"No **{interval}** snapshot yet — click **Scan Now** to fetch {interval} bars.")
 
-    if df.empty:
-        if st.session_state.last_scan_time is None:
-            st.info("Click **Scan Now** or enable **Auto-refresh** in the sidebar to run the scan.")
+    with results_slot:
+        if df.empty:
+            if last_scan_dt is None:
+                st.info("Click **Scan Now** or enable **Auto-refresh** in the sidebar to run the scan.")
+            else:
+                st.warning("No stocks matched the current filters. Try lowering the Minimum Ratio or Volume.")
         else:
-            st.warning("No stocks matched the current filters. Try lowering the Minimum Ratio or Volume.")
-    else:
-        with st.popover("⚙️ Customize Columns"):
-            st.multiselect(
-                "Visible columns (add, remove, or reorder)",
-                options=ALL_COLUMNS,
-                format_func=lambda col: COLUMN_LABELS.get(col, col),
-                key="selected_columns",
-            )
-            st.button("Reset to Default", on_click=_reset_default_columns)
+            with st.popover("⚙️ Customize Columns"):
+                st.multiselect(
+                    "Visible columns (add, remove, or reorder)",
+                    options=ALL_COLUMNS,
+                    format_func=lambda col: COLUMN_LABELS.get(col, col),
+                    key="selected_columns",
+                    on_change=_mark_ui_interaction,
+                )
+                st.button("Reset to Default", on_click=_reset_default_columns)
 
-        visible_cols = [c for c in st.session_state.selected_columns if c in df.columns]
-        if not visible_cols:
-            st.warning("Select at least one column in **Customize Columns** to display results.")
-        else:
-            display_df = df[visible_cols]
-            active_config = {c: COLUMN_CONFIG[c] for c in visible_cols if c in COLUMN_CONFIG}
+            visible_cols = [c for c in st.session_state.selected_columns if c in df.columns]
+            if not visible_cols:
+                st.warning("Select at least one column in **Customize Columns** to display results.")
+            else:
+                display_df = df[visible_cols]
+                active_config = {c: COLUMN_CONFIG[c] for c in visible_cols if c in COLUMN_CONFIG}
 
-            st.dataframe(
-                display_df,
-                use_container_width=True,
-                hide_index=True,
-                column_config=active_config,
-            )
+                st.dataframe(
+                    display_df,
+                    width="stretch",
+                    hide_index=True,
+                    column_config=active_config,
+                    key="scanner_table",
+                )
 
-            csv = display_df.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "⬇️ Download CSV",
-                data=csv,
-                file_name=f"relative_volume_{now.strftime('%Y%m%d_%H%M')}.csv",
-                mime="text/csv",
-            )
+                csv = display_df.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "⬇️ Download CSV",
+                    data=csv,
+                    file_name=f"relative_volume_{interval}_{now.strftime('%Y%m%d_%H%M')}.csv",
+                    mime="text/csv",
+                    on_click="ignore",
+                )
 
 
 # Bind fragment dynamically with run_every when auto_refresh is enabled
