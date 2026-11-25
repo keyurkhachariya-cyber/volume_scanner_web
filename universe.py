@@ -6,7 +6,7 @@ Includes optional live sync from NSE India with local cache and built-in fallbac
 from datetime import datetime
 import json
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from holidays import IST
 
@@ -67,16 +67,30 @@ def fetch_nse_fno_universe(timeout: int = 10) -> List[str]:
     """Fetch live NSE F&O equity underlyings directly from NSE India."""
     from curl_cffi import requests
 
-    session = requests.Session(impersonate="chrome")
-    session.get("https://www.nseindia.com/market-data/equity-derivatives-watch", timeout=timeout)
-    resp = session.get("https://www.nseindia.com/api/underlying-information", timeout=timeout)
-    resp.raise_for_status()
+    with requests.Session(impersonate="chrome") as session:
+        session.get("https://www.nseindia.com/market-data/equity-derivatives-watch", timeout=timeout)
+        resp = session.get("https://www.nseindia.com/api/underlying-information", timeout=timeout)
+        resp.raise_for_status()
+        items = resp.json().get("data", {}).get("UnderlyingList", [])
 
-    items = resp.json().get("data", {}).get("UnderlyingList", [])
     symbols = sorted({f"{item['symbol']}.NS" for item in items if item.get("symbol")})
     if not symbols:
         raise ValueError("Empty UnderlyingList returned from NSE")
     return symbols
+
+
+def _load_cached_universe() -> Optional[Tuple[List[str], str]]:
+    if not CACHE_FILE.exists():
+        return None
+    try:
+        payload = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+        symbols = payload.get("symbols") or []
+        synced_date = payload.get("date", "cached")
+        if symbols:
+            return sorted(set(symbols)), synced_date
+    except Exception:
+        pass
+    return None
 
 
 def get_fno_universe(force_refresh: bool = False) -> Tuple[List[str], str]:
@@ -86,15 +100,11 @@ def get_fno_universe(force_refresh: bool = False) -> Tuple[List[str], str]:
     """
     today_str = datetime.now(IST).date().isoformat()
 
-    if not force_refresh and CACHE_FILE.exists():
-        try:
-            payload = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
-            symbols = payload.get("symbols") or []
-            synced_date = payload.get("date", "cached")
-            if symbols:
-                return sorted(set(symbols)), f"NSE Live (synced {synced_date})"
-        except Exception:
-            pass
+    if not force_refresh:
+        cached = _load_cached_universe()
+        if cached is not None:
+            symbols, synced_date = cached
+            return symbols, f"NSE Live (synced {synced_date})"
 
     if force_refresh:
         try:
@@ -106,6 +116,10 @@ def get_fno_universe(force_refresh: bool = False) -> Tuple[List[str], str]:
             )
             return symbols, f"NSE Live (synced {today_str})"
         except Exception:
+            cached = _load_cached_universe()
+            if cached is not None:
+                symbols, synced_date = cached
+                return symbols, f"NSE Live (cached {synced_date}; refresh failed)"
             return FNO_STOCKS, "Built-in list (NSE sync failed)"
 
     return FNO_STOCKS, "Built-in NSE F&O list"

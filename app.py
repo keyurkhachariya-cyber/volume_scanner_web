@@ -118,6 +118,12 @@ if "_skip_auto_scan_once" not in st.session_state:
     st.session_state._skip_auto_scan_once = False
 if "_last_filter_state" not in st.session_state:
     st.session_state._last_filter_state = None
+if "_post_close_attempts_by_interval" not in st.session_state:
+    st.session_state._post_close_attempts_by_interval = {}
+if "_last_scan_empty_by_interval" not in st.session_state:
+    st.session_state._last_scan_empty_by_interval = {}
+if "_cached_prev_day" not in st.session_state:
+    st.session_state._cached_prev_day = None
 
 # Sidebar controls
 with st.sidebar:
@@ -183,6 +189,7 @@ with st.sidebar:
             get_holidays(force_refresh=True)
             st.session_state.universe_symbols = syms
             st.session_state.universe_source = src
+            st.session_state._cached_prev_day = None
             st.session_state._skip_auto_scan_once = True
 
     active_universe = st.session_state.universe_symbols
@@ -224,12 +231,14 @@ def _should_auto_scan(
     market_open: bool,
     holidays_set: set,
     skip_auto_scan: bool,
+    post_close_attempts: int = 0,
+    max_post_close_attempts: int = 2,
 ) -> bool:
     """
     Decide whether a scheduled auto-refresh scan should execute:
     - Never run during pure UI/filter interactions.
     - Poll every refresh_seconds while NSE is open.
-    - Allow at most ONE final post-close snapshot after 15:30 IST on a trading day.
+    - Allow a bounded post-close snapshot (up to max_post_close_attempts on empty data) after 15:30 IST.
     - Stay idle pre-market, on weekends, and on holidays.
     """
     if skip_auto_scan:
@@ -243,6 +252,8 @@ def _should_auto_scan(
 
     is_trading_day = now.weekday() < 5 and now.date() not in holidays_set
     if is_trading_day and now.time() > MARKET_CLOSE_TIME:
+        if post_close_attempts >= max_post_close_attempts:
+            return False
         market_close_dt = now.replace(hour=15, minute=30, second=0, microsecond=0)
         if last_scan_dt is None or last_scan_dt.date() < now.date() or last_scan_dt < market_close_dt:
             return True
@@ -264,28 +275,18 @@ def render_scanner(
 ):
     now = datetime.now(IST)
     holidays_set = get_holidays()
-    prev_day = get_previous_trading_day(now.date())
     market_open = is_market_open(now)
-
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Current IST", now.strftime("%Y-%m-%d %H:%M:%S"))
-    col2.metric("Previous Trading Day", prev_day.strftime("%Y-%m-%d"))
-    col3.metric("Market Status", "🟢 OPEN" if market_open else "🔴 CLOSED")
-
-    st.markdown("---")
-
-    col_btn, col_info = st.columns([1, 2])
-    with col_btn:
-        scan_clicked = st.button("🔄 Scan Now", type="primary", width="stretch")
 
     last_scan_dt = st.session_state.scan_times_by_interval.get(interval)
     skip_once = bool(st.session_state._skip_auto_scan_once)
     st.session_state._skip_auto_scan_once = False
 
+    attempt_rec = st.session_state._post_close_attempts_by_interval.get(interval)
+    post_close_attempts = attempt_rec[1] if (attempt_rec and attempt_rec[0] == now.date()) else 0
+
     should_scan = False
-    if scan_clicked:
-        should_scan = True
-    elif auto_refresh:
+    if auto_refresh:
+        # Checked before widgets below; manual button click also forces a scan once rendered.
         should_scan = _should_auto_scan(
             now=now,
             last_scan_dt=last_scan_dt,
@@ -293,19 +294,34 @@ def render_scanner(
             market_open=market_open,
             holidays_set=holidays_set,
             skip_auto_scan=skip_once,
+            post_close_attempts=post_close_attempts,
         )
 
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Current IST", now.strftime("%Y-%m-%d %H:%M:%S"))
+    prev_day_slot = col2.empty()
+    col3.metric("Market Status", "🟢 OPEN" if market_open else "🔴 CLOSED")
+
+    st.markdown("---")
+
+    col_btn, col_info = st.columns([1, 2])
+    with col_btn:
+        scan_clicked = st.button("🔄 Scan Now", type="primary", width="stretch")
+    if scan_clicked:
+        should_scan = True
+
+    cached_prev = st.session_state._cached_prev_day
+    if should_scan or cached_prev is None or cached_prev[0] != now.date():
+        prev_day = get_previous_trading_day(now.date())
+        st.session_state._cached_prev_day = (now.date(), prev_day)
+    else:
+        prev_day = cached_prev[1]
+    prev_day_slot.metric("Previous Trading Day", prev_day.strftime("%Y-%m-%d"))
+
     with col_info:
-        if auto_refresh:
-            if market_open:
-                st.caption(
-                    f"⏱️ **Auto-refresh active** (every {refresh_seconds}s). "
-                    "Updating in the background without full-page reloads."
-                )
-            elif should_scan:
-                st.caption("⏱️ **Auto-refresh**: running final post-close snapshot before pausing.")
-            else:
-                st.caption("⏸️ **Auto-refresh paused** (market closed). Manual **Scan Now** still works anytime.")
+        info_slot = st.empty()
+        if auto_refresh and should_scan and not market_open and not scan_clicked:
+            info_slot.caption("⏱️ **Auto-refresh**: running final post-close snapshot before pausing.")
 
     # Reserve layout slots before slow network calls to minimize stale greying & remounting
     status_slot = st.container()
@@ -322,12 +338,34 @@ def render_scanner(
                     interval=interval,
                     max_workers=max_workers,
                 )
-                st.session_state.results_by_interval[interval] = raw_df
-                last_scan_dt = datetime.now(IST)
-                st.session_state.scan_times_by_interval[interval] = last_scan_dt
+                if not raw_df.empty:
+                    st.session_state.results_by_interval[interval] = raw_df
+                    last_scan_dt = datetime.now(IST)
+                    st.session_state.scan_times_by_interval[interval] = last_scan_dt
+                    st.session_state._last_scan_empty_by_interval.pop(interval, None)
+                    if not market_open:
+                        st.session_state._post_close_attempts_by_interval.pop(interval, None)
+                else:
+                    st.session_state._last_scan_empty_by_interval[interval] = datetime.now(IST)
+                    if not scan_clicked and not market_open and now.time() > MARKET_CLOSE_TIME:
+                        st.session_state._post_close_attempts_by_interval[interval] = (
+                            now.date(),
+                            post_close_attempts + 1,
+                        )
+
+    if auto_refresh:
+        now_after = datetime.now(IST)
+        if is_market_open(now_after):
+            info_slot.caption(
+                f"⏱️ **Auto-refresh active** (every {refresh_seconds}s). "
+                "Updating in the background without full-page reloads."
+            )
+        else:
+            info_slot.caption("⏸️ **Auto-refresh paused** (market closed). Manual **Scan Now** still works anytime.")
 
     # Client-side filtering on the cached scan snapshot for the active interval
     raw_df = st.session_state.results_by_interval.get(interval, pd.DataFrame())
+    empty_scan_dt = st.session_state._last_scan_empty_by_interval.get(interval)
     gap_missing = False
     gap_excluded_count = 0
 
@@ -369,18 +407,28 @@ def render_scanner(
                 f"({interval} bars) | "
                 f"Showing **{len(df)}** of **{len(raw_df)}** scanned stocks{gap_note}"
             )
+            if empty_scan_dt is not None and not raw_df.empty:
+                st.warning(
+                    f"Latest scan at {empty_scan_dt.strftime('%H:%M:%S IST')} returned no data — "
+                    "showing the previous snapshot."
+                )
             if gap_missing:
                 st.warning(
                     "Current results were scanned before Gap % data was added — click **Scan Now** once to apply the gap filter."
                 )
+        elif empty_scan_dt is not None:
+            st.warning(
+                f"Scan at {empty_scan_dt.strftime('%H:%M:%S IST')} returned no intraday data for today "
+                "(market may be pre-open, closed, or Yahoo Finance has no bars yet)."
+            )
         elif st.session_state.results_by_interval:
             st.info(f"No **{interval}** snapshot yet — click **Scan Now** to fetch {interval} bars.")
 
     with results_slot:
         if df.empty:
-            if last_scan_dt is None:
+            if last_scan_dt is None and empty_scan_dt is None:
                 st.info("Click **Scan Now** or enable **Auto-refresh** in the sidebar to run the scan.")
-            else:
+            elif not raw_df.empty:
                 st.warning("No stocks matched the current filters. Try lowering the Minimum Ratio or Volume.")
         else:
             with st.popover("⚙️ Customize Columns"):

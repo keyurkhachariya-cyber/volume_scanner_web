@@ -70,12 +70,11 @@ def fetch_nse_holidays(timeout: int = 4) -> Set[date]:
     """Fetch official NSE trading holidays from NSE India API."""
     from curl_cffi import requests
 
-    session = requests.Session(impersonate="chrome")
-    session.get("https://www.nseindia.com/resources/exchange-communication-holidays", timeout=timeout)
-    resp = session.get("https://www.nseindia.com/api/holiday-master?type=trading", timeout=timeout)
-    resp.raise_for_status()
-
-    payload = resp.json()
+    with requests.Session(impersonate="chrome") as session:
+        session.get("https://www.nseindia.com/resources/exchange-communication-holidays", timeout=timeout)
+        resp = session.get("https://www.nseindia.com/api/holiday-master?type=trading", timeout=timeout)
+        resp.raise_for_status()
+        payload = resp.json()
     if not isinstance(payload, dict):
         raise ValueError("Unexpected NSE holiday-master payload type")
 

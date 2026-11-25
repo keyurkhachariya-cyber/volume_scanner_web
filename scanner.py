@@ -8,8 +8,11 @@ Optimized relative-volume scanner logic using yfinance with:
 
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from datetime import datetime, time, timedelta, date
+import os
 from pathlib import Path
+import tempfile
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 import pickle
 import threading
@@ -41,12 +44,13 @@ _PREV_DAY_MEMORY_CACHE: "OrderedDict[Tuple[date, str], Dict[str, Any]]" = Ordere
 _NEG_CACHE: Dict[Tuple[date, str], Dict[str, float]] = {}
 _CACHE_LOCK = threading.Lock()
 
-# Persistent HTTP session & reusable worker pools (kept warm across scans)
+# Persistent thread-local HTTP sessions & reusable worker pools (kept warm across scans)
 _SESSION_LOCK = threading.Lock()
-_YF_SESSION: Any = None
+_YF_PRIMING_DONE = False
+_THREAD_LOCAL = threading.local()
 
 _EXECUTOR_LOCK = threading.Lock()
-_EXECUTORS: "OrderedDict[int, ThreadPoolExecutor]" = OrderedDict()
+_EXECUTORS: "OrderedDict[int, Dict[str, Any]]" = OrderedDict()
 _MAX_POOLS = 4
 
 
@@ -69,32 +73,53 @@ def _create_http_session() -> Any:
 
 
 def _get_yf_session() -> Any:
-    """Return a process-wide persistent session and prime yfinance's YfData singleton."""
-    global _YF_SESSION
-    if _YF_SESSION is not None:
-        return _YF_SESSION
-    with _SESSION_LOCK:
-        if _YF_SESSION is None:
-            session = _create_http_session()
-            YfData(session=session)
-            _YF_SESSION = session
-    return _YF_SESSION
+    """Return a thread-local persistent session and prime yfinance's YfData singleton once."""
+    global _YF_PRIMING_DONE
+    session = getattr(_THREAD_LOCAL, "yf_session", None)
+    if session is None:
+        session = _create_http_session()
+        _THREAD_LOCAL.yf_session = session
+    if not _YF_PRIMING_DONE:
+        with _SESSION_LOCK:
+            if not _YF_PRIMING_DONE:
+                YfData(session=session)
+                _YF_PRIMING_DONE = True
+    return session
 
 
-def _get_executor(max_workers: int) -> ThreadPoolExecutor:
-    """Return a reusable ThreadPoolExecutor so worker threads keep thread-local HTTP/2 sockets warm."""
+@contextmanager
+def _borrow_executor(max_workers: int):
+    """Borrow a reusable ThreadPoolExecutor and defer shutting down evicted pools until idle."""
     workers = max(1, int(max_workers))
     with _EXECUTOR_LOCK:
-        executor = _EXECUTORS.get(workers)
-        if executor is not None:
+        entry = _EXECUTORS.get(workers)
+        if entry is None:
+            entry = {
+                "executor": ThreadPoolExecutor(max_workers=workers, thread_name_prefix=f"yf_scan_{workers}"),
+                "active": 0,
+                "retired": False,
+            }
+            _EXECUTORS[workers] = entry
+        else:
             _EXECUTORS.move_to_end(workers)
-            return executor
-        executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix=f"yf_scan_{workers}")
-        _EXECUTORS[workers] = executor
+        entry["active"] += 1
+
         while len(_EXECUTORS) > _MAX_POOLS:
             _, oldest = _EXECUTORS.popitem(last=False)
-            oldest.shutdown(wait=False)
-        return executor
+            oldest["retired"] = True
+            if oldest["active"] == 0:
+                oldest["executor"].shutdown(wait=False)
+
+    try:
+        yield entry["executor"]
+    finally:
+        should_shutdown = False
+        with _EXECUTOR_LOCK:
+            entry["active"] -= 1
+            if entry["retired"] and entry["active"] == 0:
+                should_shutdown = True
+        if should_shutdown:
+            entry["executor"].shutdown(wait=False)
 
 
 def _prune_old_cache(max_age_days: int = CACHE_RETENTION_DAYS) -> None:
@@ -175,7 +200,8 @@ def _build_prev_day_baseline(
 
     prev_close: Optional[float] = None
     if "Close" in df_prev.columns:
-        close_arr = df_prev["Close"].to_numpy(dtype=float, copy=False)
+        df_close = df_prev if df_prev.index.is_monotonic_increasing else df_prev.sort_index(kind="mergesort")
+        close_arr = df_close["Close"].to_numpy(dtype=float, copy=False)
         valid_close = close_arr[~np.isnan(close_arr)]
         if len(valid_close) > 0:
             prev_close = float(valid_close[-1])
@@ -299,26 +325,6 @@ def _get_neg_cached(cache_key: Tuple[date, str]) -> Set[str]:
         return set(bucket.keys())
 
 
-def _mark_neg_cached(cache_key: Tuple[date, str], symbols: Iterable[str]) -> None:
-    syms = list(symbols)
-    if not syms:
-        return
-    exp = pytime.monotonic() + _NEG_CACHE_TTL_SECONDS
-    with _CACHE_LOCK:
-        bucket = _NEG_CACHE.setdefault(cache_key, {})
-        for sym in syms:
-            bucket[sym] = exp
-
-
-def _clear_neg_cached(cache_key: Tuple[date, str], symbols: Iterable[str]) -> None:
-    with _CACHE_LOCK:
-        bucket = _NEG_CACHE.get(cache_key)
-        if not bucket:
-            return
-        for sym in symbols:
-            bucket.pop(sym, None)
-
-
 def _get_cached_store(cache_key: Tuple[date, str]) -> Optional[Dict[str, Any]]:
     with _CACHE_LOCK:
         store = _PREV_DAY_MEMORY_CACHE.get(cache_key)
@@ -360,16 +366,72 @@ def _load_disk_baseline(prev_day: date, interval: str) -> Optional[Dict[str, Any
 
 def _save_disk_baseline(prev_day: date, interval: str, store: Dict[str, Any]) -> None:
     cache_file = CACHE_DIR / f"prev_baseline_{prev_day.isoformat()}_{interval}.pkl"
+    tmp_path: Optional[Path] = None
     try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
         # Omit symbol_to_idx and never persist negative-cache entries to disk
         disk_payload = {
             k: v for k, v in store.items() if k not in ("symbol_to_idx", "missing_symbols")
         }
         disk_payload["missing_symbols"] = set()
-        with open(cache_file, "wb") as f:
+        fd, raw_tmp = tempfile.mkstemp(
+            dir=str(CACHE_DIR),
+            prefix=f".tmp_{prev_day.isoformat()}_{interval}_",
+            suffix=".pkl",
+        )
+        tmp_path = Path(raw_tmp)
+        with os.fdopen(fd, "wb") as f:
             pickle.dump(disk_payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+            f.flush()
+        os.replace(tmp_path, cache_file)
     except Exception:
-        pass
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+def _commit_baseline_updates(
+    cache_key: Tuple[date, str],
+    prev_day: date,
+    interval: str,
+    new_entries: Dict[str, Optional[Dict[str, Any]]],
+    neg_syms: Iterable[str],
+) -> Dict[str, Any]:
+    """Synchronize negative-cache updates, merge against latest store, and persist atomically."""
+    neg_list = list(neg_syms)
+    now_mono = pytime.monotonic()
+    with _CACHE_LOCK:
+        if neg_list:
+            exp = now_mono + _NEG_CACHE_TTL_SECONDS
+            bucket = _NEG_CACHE.setdefault(cache_key, {})
+            for sym in neg_list:
+                bucket[sym] = exp
+        if new_entries:
+            bucket = _NEG_CACHE.get(cache_key)
+            if bucket:
+                for sym in new_entries:
+                    bucket.pop(sym, None)
+
+        latest = _PREV_DAY_MEMORY_CACHE.get(cache_key)
+        if latest is None:
+            latest = _load_disk_baseline(prev_day, interval)
+
+        if new_entries:
+            store = _pack_baseline_store(new_entries, prev_day, interval, existing=latest)
+            _save_disk_baseline(prev_day, interval, store)
+        elif latest is not None:
+            store = latest
+        else:
+            store = _empty_baseline_store(prev_day, interval)
+
+        _PREV_DAY_MEMORY_CACHE[cache_key] = store
+        _PREV_DAY_MEMORY_CACHE.move_to_end(cache_key)
+        while len(_PREV_DAY_MEMORY_CACHE) > MEMORY_CACHE_MAX_ENTRIES:
+            evicted_key, _ = _PREV_DAY_MEMORY_CACHE.popitem(last=False)
+            _NEG_CACHE.pop(evicted_key, None)
+        return store
 
 
 def extract_ticker_df(batch_df: pd.DataFrame, symbol: str) -> pd.DataFrame:
@@ -461,8 +523,7 @@ def _fetch_histories_concurrent(
     if not tasks:
         return {}, set()
 
-    _get_yf_session()  # Prime shared cookie/crumb before parallel fan-out
-    executor = _get_executor(max_workers)
+    _get_yf_session()  # Prime YfData once before parallel fan-out
 
     # Optional explicit chunking only if a caller specifically requests chunk_size > 0
     if chunk_size and chunk_size > 0 and len(tasks) > chunk_size:
@@ -473,35 +534,36 @@ def _fetch_histories_concurrent(
     results: Dict[str, pd.DataFrame] = {}
     failed: Set[str] = set()
 
-    for batch in batches:
-        futures = [
-            executor.submit(_fetch_one_history, sym, interval, period, start, end)
-            for sym, period in batch
-        ]
-        for fut in as_completed(futures):
-            sym, df, ok = fut.result()
-            if df is not None and not df.empty:
-                results[sym] = df
-            elif not ok:
-                failed.add(sym)
+    with _borrow_executor(max_workers) as executor:
+        for batch in batches:
+            futures = [
+                executor.submit(_fetch_one_history, sym, interval, period, start, end)
+                for sym, period in batch
+            ]
+            for fut in as_completed(futures):
+                sym, df, ok = fut.result()
+                if df is not None and not df.empty:
+                    results[sym] = df
+                elif not ok:
+                    failed.add(sym)
 
     # Single reduced-concurrency backoff retry for transient failures (e.g. 429/timeout)
     if failed:
         period_by_sym = dict(tasks)
         retry_syms = sorted(failed)
         pytime.sleep(0.5)
-        retry_executor = _get_executor(min(2, max(1, int(max_workers))))
-        retry_futures = [
-            retry_executor.submit(_fetch_one_history, sym, interval, period_by_sym.get(sym), start, end)
-            for sym in retry_syms
-        ]
-        for fut in as_completed(retry_futures):
-            sym, df, ok = fut.result()
-            if df is not None and not df.empty:
-                results[sym] = df
-                failed.discard(sym)
-            elif ok:
-                failed.discard(sym)
+        with _borrow_executor(min(2, max(1, int(max_workers)))) as retry_executor:
+            retry_futures = [
+                retry_executor.submit(_fetch_one_history, sym, interval, period_by_sym.get(sym), start, end)
+                for sym in retry_syms
+            ]
+            for fut in as_completed(retry_futures):
+                sym, df, ok = fut.result()
+                if df is not None and not df.empty:
+                    results[sym] = df
+                    failed.discard(sym)
+                elif ok:
+                    failed.discard(sym)
 
     return results, failed
 
@@ -554,12 +616,8 @@ def get_previous_day_data(
             else:
                 neg_syms.append(sym)
 
-        if neg_syms:
-            _mark_neg_cached(cache_key, neg_syms)
-        if new_entries:
-            _clear_neg_cached(cache_key, new_entries.keys())
-            store = _pack_baseline_store(new_entries, prev_day, interval, existing=store)
-            _save_disk_baseline(prev_day, interval, store)
+        store = _commit_baseline_updates(cache_key, prev_day, interval, new_entries, neg_syms)
+        return store
 
     _put_cached_store(cache_key, store)
     return store
@@ -607,8 +665,38 @@ def _summarize_today_df(
         return None
 
     df_reg = df_today.loc[mask_reg]
-    reg_times = df_reg.index.time
-    last_bar_time = max(reg_times)
+    price_cols = [c for c in ("Open", "High", "Low", "Close") if c in df_reg.columns]
+    has_price = df_reg[price_cols].notna().any(axis=1) if price_cols else pd.Series(False, index=df_reg.index)
+    has_pos_vol = (
+        df_reg["Volume"].fillna(0.0) > 0.0
+        if "Volume" in df_reg.columns
+        else pd.Series(False, index=df_reg.index)
+    )
+    df_reg = df_reg.loc[has_price | has_pos_vol]
+    if df_reg.empty:
+        return None
+
+    if not df_reg.index.is_monotonic_increasing:
+        df_reg = df_reg.sort_index(kind="mergesort")
+
+    if df_reg.index.has_duplicates:
+        agg_map = {
+            col: fn
+            for col, fn in (
+                ("Open", "first"),
+                ("High", "max"),
+                ("Low", "min"),
+                ("Close", "last"),
+                ("Volume", "max"),
+            )
+            if col in df_reg.columns
+        }
+        if agg_map:
+            df_reg = df_reg.groupby(level=0, sort=True).agg(agg_map)
+        else:
+            df_reg = df_reg[~df_reg.index.duplicated(keep="last")]
+
+    last_bar_time = df_reg.index[-1].time()
 
     if "Volume" in df_reg.columns:
         vol_arr = df_reg["Volume"].to_numpy(dtype=float, copy=False)
@@ -748,14 +836,9 @@ def run_scan(
                 else:
                     neg_syms.append(sym)
 
-        if neg_syms:
-            _mark_neg_cached(cache_key, neg_syms)
-        if new_entries:
-            _clear_neg_cached(cache_key, new_entries.keys())
-            store = _pack_baseline_store(new_entries, prev_day, interval, existing=store)
-            _save_disk_baseline(prev_day, interval, store)
-
-    _put_cached_store(cache_key, store)
+        store = _commit_baseline_updates(cache_key, prev_day, interval, new_entries, neg_syms)
+    else:
+        _put_cached_store(cache_key, store)
 
     # 4. Per-ticker bar-aligned baseline lookup (prevents look-ahead bias on lagging feeds)
     times_sec = store["times_sec"]
