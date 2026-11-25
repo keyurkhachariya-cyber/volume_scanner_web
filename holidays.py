@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 import threading
 import time as pytime
-from typing import Optional, Set, Tuple
+from typing import Dict, Optional, Set, Tuple
 import pytz
 
 IST = pytz.timezone("Asia/Kolkata")
@@ -49,7 +49,7 @@ HOLIDAYS: Set[date] = {
 _STATE_LOCK = threading.Lock()
 _HOLIDAYS_MEMORY: Optional[Tuple[date, Set[date]]] = None
 _NSE_HOLIDAY_COOLDOWN_UNTIL: float = 0.0
-_NSEI_CACHE: Optional[Tuple[float, Optional[Set[date]]]] = None
+_NSEI_CACHE: Dict[str, Tuple[date, float, Optional[Set[date]]]] = {}
 
 _RETRY_COOLDOWN_SECONDS = 900.0  # 15 minutes
 _NSEI_TTL_SECONDS = 900.0
@@ -144,10 +144,11 @@ def get_holidays(force_refresh: bool = False) -> Set[date]:
     with _STATE_LOCK:
         if not force_refresh and _HOLIDAYS_MEMORY is not None:
             synced_date, cached_set = _HOLIDAYS_MEMORY
-            if (today - synced_date).days <= _HOLIDAY_DISK_MAX_AGE_DAYS and any(
+            is_fresh = (today - synced_date).days <= _HOLIDAY_DISK_MAX_AGE_DAYS and any(
                 d.year == today.year for d in cached_set
-            ):
-                return cached_set
+            )
+            if is_fresh or now_mono < _NSE_HOLIDAY_COOLDOWN_UNTIL:
+                return set(cached_set)
 
         disk_loaded = _load_disk_holidays() if not force_refresh else None
         if disk_loaded is not None:
@@ -157,7 +158,7 @@ def get_holidays(force_refresh: bool = False) -> Set[date]:
             ):
                 merged = set(disk_set)
                 _HOLIDAYS_MEMORY = (synced_date, merged)
-                return merged
+                return set(merged)
 
         should_fetch = force_refresh or (now_mono >= _NSE_HOLIDAY_COOLDOWN_UNTIL)
 
@@ -171,35 +172,46 @@ def get_holidays(force_refresh: bool = False) -> Set[date]:
             with _STATE_LOCK:
                 _HOLIDAYS_MEMORY = (today, merged)
                 _NSE_HOLIDAY_COOLDOWN_UNTIL = 0.0
-            return merged
+            return set(merged)
         except Exception:
             with _STATE_LOCK:
                 _NSE_HOLIDAY_COOLDOWN_UNTIL = pytime.monotonic() + _RETRY_COOLDOWN_SECONDS
 
-    # Fall back to disk cache (even if slightly stale) or built-in HOLIDAYS
+    # Preserve original disk sync date so stale caches still retry after the cooldown window.
+    if disk_loaded is None and force_refresh:
+        disk_loaded = _load_disk_holidays()
     if disk_loaded is not None:
-        _, disk_set = disk_loaded
+        disk_synced_date, disk_set = disk_loaded
+        merged_disk = set(disk_set)
         with _STATE_LOCK:
-            _HOLIDAYS_MEMORY = (today, disk_set)
-        return disk_set
+            _HOLIDAYS_MEMORY = (disk_synced_date, merged_disk)
+        return set(merged_disk)
 
     with _STATE_LOCK:
         if _HOLIDAYS_MEMORY is not None:
-            return _HOLIDAYS_MEMORY[1]
+            return set(_HOLIDAYS_MEMORY[1])
     return set(HOLIDAYS)
 
 
-def _fetch_nsei_trading_dates(timeout: int = 3) -> Optional[Set[date]]:
-    """Fetch recent Nifty 50 (^NSEI) daily bar dates to detect actual trading sessions."""
+def _fetch_nsei_trading_dates(
+    period: str = "15d",
+    interval: str = "1d",
+    timeout: int = 3,
+) -> Optional[Set[date]]:
+    """Fetch recent Nifty 50 (^NSEI) bar dates to detect actual trading sessions."""
     try:
         import yfinance as yf
 
         tkr = yf.Ticker("^NSEI")
         if getattr(tkr, "_tz", None) is None:
             tkr._tz = "Asia/Kolkata"
-        df = tkr.history(period="15d", interval="1d", prepost=False, actions=False, timeout=timeout)
+        df = tkr.history(period=period, interval=interval, prepost=False, actions=False, timeout=timeout)
         if df is None or df.empty:
             return None
+        if "Close" in df.columns:
+            df = df.dropna(subset=["Close"])
+            if df.empty:
+                return None
         if df.index.tz is None:
             df.index = df.index.tz_localize("UTC").tz_convert(IST)
         elif str(df.index.tz) != "Asia/Kolkata":
@@ -210,21 +222,51 @@ def _fetch_nsei_trading_dates(timeout: int = 3) -> Optional[Set[date]]:
         return None
 
 
-def _get_recent_nsei_trading_dates() -> Optional[Set[date]]:
-    """Cached empirical ^NSEI trading dates with 15-minute TTL and failure cooldown."""
-    global _NSEI_CACHE
+def _get_recent_nsei_trading_dates(
+    today_ist: date,
+    interval: str = "1d",
+) -> Optional[Set[date]]:
+    """Cached empirical ^NSEI trading dates keyed by interval and IST date with 15-minute TTL."""
     now_mono = pytime.monotonic()
     with _STATE_LOCK:
-        if _NSEI_CACHE is not None:
-            expires_at, cached_dates = _NSEI_CACHE
-            if now_mono < expires_at:
-                return cached_dates
+        cached = _NSEI_CACHE.get(interval)
+        if cached is not None:
+            cached_for_date, expires_at, cached_dates = cached
+            if cached_for_date == today_ist and now_mono < expires_at:
+                return set(cached_dates) if cached_dates is not None else None
 
-    dates = _fetch_nsei_trading_dates()
+    dates = _fetch_nsei_trading_dates(period="15d", interval=interval)
     with _STATE_LOCK:
         ttl = _NSEI_TTL_SECONDS if dates else _RETRY_COOLDOWN_SECONDS
-        _NSEI_CACHE = (pytime.monotonic() + ttl, dates)
-    return dates
+        _NSEI_CACHE[interval] = (today_ist, pytime.monotonic() + ttl, dates)
+        return set(dates) if dates is not None else None
+
+
+def _confirm_calendar_prev_via_intraday(
+    today_ist: date,
+    cal_prev: date,
+    emp_prev: date,
+) -> date:
+    """
+    Resolve emp_prev < cal_prev by checking ^NSEI hourly bars:
+    - If cal_prev has intraday bars, Yahoo 1d lagged/dropped a bar -> return cal_prev.
+    - If hourly bars confirm an earlier session (<= emp_prev) without cal_prev -> return emp_prev.
+    - If hourly verification is inconclusive/unavailable -> fall back safely to cal_prev.
+    """
+    hourly_dates = _get_recent_nsei_trading_dates(today_ist, interval="1h")
+    if not hourly_dates:
+        return cal_prev
+
+    if cal_prev in hourly_dates:
+        with _STATE_LOCK:
+            cached_1d = _NSEI_CACHE.get("1d")
+            if cached_1d is not None and cached_1d[0] == today_ist and cached_1d[2] is not None:
+                _NSEI_CACHE["1d"] = (today_ist, cached_1d[1], set(cached_1d[2]) | hourly_dates)
+        return cal_prev
+
+    if any(d <= emp_prev for d in hourly_dates):
+        return emp_prev
+    return cal_prev
 
 
 def get_previous_trading_day(
@@ -233,27 +275,31 @@ def get_previous_trading_day(
 ) -> date:
     """
     Return the most recent trading day before ref_date (or today).
-    For the live current date, empirically checks recent ^NSEI trading sessions first
-    (handling unscheduled closures and special sessions) and falls back to the NSE holiday calendar.
+    Uses the NSE holiday calendar as baseline, and for today checks recent ^NSEI sessions
+    to catch special weekend sessions or verified unscheduled closures without letting
+    Yahoo 1d bar lag skip a real trading day.
     """
     today_ist = datetime.now(IST).date()
     if ref_date is None:
         ref_date = today_ist
 
+    holidays = get_holidays()
+    cal_prev = ref_date - timedelta(days=1)
+    while cal_prev.weekday() >= 5 or cal_prev in holidays:  # Sat=5, Sun=6
+        cal_prev -= timedelta(days=1)
+
     if use_market_data and ref_date == today_ist:
-        nsei_dates = _get_recent_nsei_trading_dates()
+        nsei_dates = _get_recent_nsei_trading_dates(today_ist)
         if nsei_dates:
             past_dates = [d for d in nsei_dates if d < ref_date]
             if past_dates:
                 emp_prev = max(past_dates)
                 if (ref_date - emp_prev).days <= 14:
-                    return emp_prev
+                    if emp_prev >= cal_prev:
+                        return emp_prev
+                    return _confirm_calendar_prev_via_intraday(today_ist, cal_prev, emp_prev)
 
-    holidays = get_holidays()
-    d = ref_date - timedelta(days=1)
-    while d.weekday() >= 5 or d in holidays:  # Sat=5, Sun=6
-        d -= timedelta(days=1)
-    return d
+    return cal_prev
 
 
 def is_market_open(now: datetime | None = None) -> bool:
