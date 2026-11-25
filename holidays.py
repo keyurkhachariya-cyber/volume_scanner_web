@@ -51,10 +51,10 @@ def get_previous_trading_day(ref_date: date | None = None) -> date:
 
 
 def is_market_open(now: datetime | None = None) -> bool:
-    """Rough check: Mon-Fri, 09:15 - 15:30 IST (ignores holidays for simplicity)."""
+    """Check whether NSE equity market is open: Mon-Fri (excluding HOLIDAYS), 09:15 - 15:30 IST."""
     if now is None:
         now = datetime.now(IST)
-    if now.weekday() >= 5:
+    if now.weekday() >= 5 or now.date() in HOLIDAYS:
         return False
     t = now.time()
     return (t >= datetime.strptime("09:15", "%H:%M").time() and

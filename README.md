@@ -5,7 +5,7 @@ Compares **today's cumulative volume from 09:15 IST till now** with the **previo
 Built with Streamlit + yfinance.
 
 ## Features
-- F&O equity universe (curated liquid list ~80 stocks, easy to expand)
+- Complete official NSE F&O equity universe (218 stocks, with one-click live NSE sync)
 - 1-minute (or 5-minute) bars
 - Customizable minimum ratio (default 1.5×)
 - Minimum volume filter

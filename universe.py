@@ -1,58 +1,111 @@
 """
-NSE F&O Equity Underlyings (liquid subset for MVP).
-Symbols are Yahoo Finance format (with .NS).
-Expand this list as needed. Full F&O list is ~180-200 stocks.
+NSE F&O Equity Underlyings (official NSE F&O equity list, Yahoo Finance .NS format).
+Includes optional live sync from NSE India with local cache and built-in fallback.
 """
 
+from datetime import datetime
+import json
+from pathlib import Path
+from typing import List, Tuple
+
+from holidays import IST
+
+CACHE_FILE = Path(__file__).parent / ".cache" / "fno_universe.json"
+
 FNO_STOCKS = [
-    "360ONE.NS", "AARTIIND.NS", "ABB.NS", "ABBOTINDIA.NS", "ABCAPITAL.NS",
-    "ABFRL.NS", "ACC.NS", "ADANIENSOL.NS", "ADANIENT.NS", "ADANIGREEN.NS",
-    "ADANIPORTS.NS", "ADANIPOWER.NS", "ATGL.NS", "ALKEM.NS", "AMARAJABAT.NS",
-    "AMBER.NS", "AMBUJACEM.NS", "ANGELONE.NS", "APLAPOLLO.NS", "APOLLOHOSP.NS",
-    "APOLLOTYRE.NS", "ASHOKLEY.NS", "ASIANPAINT.NS", "ASTRAL.NS", "ATUL.NS",
-    "AUBANK.NS", "AUROPHARMA.NS", "AXISBANK.NS", "BAJAJ-AUTO.NS", "BAJAJFINSV.NS",
-    "BAJFINANCE.NS", "BALKRISIND.NS", "BALRAMCHIN.NS", "BANDHANBNK.NS", "BANKBARODA.NS",
-    "BANKINDIA.NS", "BATAINDIA.NS", "BEL.NS", "BERGEPAINT.NS", "BHARATFORG.NS",
-    "BHARTIARTL.NS", "BHEL.NS", "BIOCON.NS", "BOSCHLTD.NS", "BPCL.NS",
-    "BRITANNIA.NS", "BSE.NS", "BSOFT.NS", "CAMS.NS", "CANBK.NS",
-    "CANFINHOME.NS", "CDSL.NS", "CESC.NS", "CGPOWER.NS", "CHAMBLFERT.NS",
-    "CHOLAFIN.NS", "CIPLA.NS", "COALINDIA.NS", "COFORGE.NS", "COLPAL.NS",
-    "CONCOR.NS", "COROMANDEL.NS", "CROMPTON.NS", "CUB.NS", "CUMMINSIND.NS",
-    "CYIENT.NS", "DABUR.NS", "DEEPAKNTR.NS", "DELHIVERY.NS", "DIVISLAB.NS",
-    "DIXON.NS", "DLF.NS", "DRREDDY.NS", "EICHERMOT.NS", "ESCORTS.NS",
-    "EXIDEIND.NS", "FACT.NS", "FEDERALBNK.NS", "FORTIS.NS", "GAIL.NS",
-    "GLAXO.NS", "GLENMARK.NS", "GMRINFRA.NS", "GNFC.NS", "GODREJCP.NS",
-    "GODREJPROP.NS", "GRANULES.NS", "GRASIM.NS", "GUJGASLTD.NS", "HAL.NS",
-    "HAVELLS.NS", "HCLTECH.NS", "HDFCAMC.NS", "HDFCBANK.NS", "HDFCLIFE.NS",
-    "HEROMOTOCO.NS", "HFCL.NS", "HINDALCO.NS", "HINDCOPPER.NS", "HINDPETRO.NS",
-    "HINDUNILVR.NS", "HUDCO.NS", "ICICIBANK.NS", "ICICIGI.NS", "ICICIPRULI.NS",
-    "IDEA.NS", "IDFCFIRSTB.NS", "IEX.NS", "IGL.NS", "INDHOTEL.NS",
-    "INDIACEM.NS", "INDIAMART.NS", "INDIGO.NS", "INDUSINDBK.NS", "INDUSTOWER.NS",
-    "INFABEAM.NS", "INFY.NS", "IOC.NS", "IPCALAB.NS", "IRB.NS",
-    "IRCTC.NS", "IRFC.NS", "ITC.NS", "JINDALSTEL.NS", "JIOFIN.NS",
-    "JKCEMENT.NS", "JSL.NS", "JSWENERGY.NS", "JSWSTEEL.NS", "JUBLFOOD.NS",
-    "KALYANKJIL.NS", "KEI.NS", "KOTAKBANK.NS", "KPITTECH.NS", "LALPATHLAB.NS",
-    "LAURUSLABS.NS", "LICHSGFIN.NS", "LICI.NS", "LODHA.NS", "LT.NS",
-    "LTF.NS", "LTIM.NS", "LTTS.NS", "LUPIN.NS", "M&M.NS",
-    "M&MFIN.NS", "MANAPPURAM.NS", "MARICO.NS", "MARUTI.NS", "MAXHEALTH.NS",
-    "MCX.NS", "METROPOLIS.NS", "MFSL.NS", "MGL.NS", "MOTHERSON.NS",
-    "MPHASIS.NS", "MRF.NS", "MUTHOOTFIN.NS", "NATIONALUM.NS", "NAUKRI.NS",
-    "NAVINFLUOR.NS", "NCC.NS", "NESTLEIND.NS", "NHPC.NS", "NMDC.NS",
-    "NTPC.NS", "NYKAA.NS", "OBEROIRLTY.NS", "OFSS.NS", "OIL.NS",
-    "ONGC.NS", "PAGEIND.NS", "PAYTM.NS", "PEL.NS", "PERSISTENT.NS",
-    "PETRONET.NS", "PFC.NS", "PHOENIXLTD.NS", "PIDILITIND.NS", "PIIND.NS",
-    "PNB.NS", "PNBHOUSING.NS", "POLICYBZR.NS", "POLYCAB.NS", "POWERGRID.NS",
-    "PRESTIGE.NS", "PVRINOX.NS", "RAMCOCEM.NS", "RBLBANK.NS", "REC.NS",
-    "RELIANCE.NS", "RVNL.NS", "SAIL.NS", "SBICARD.NS", "SBILIFE.NS",
+    "360ONE.NS", "ABB.NS", "ABCAPITAL.NS", "ACUTAAS.NS", "ADANIENSOL.NS",
+    "ADANIENT.NS", "ADANIGREEN.NS", "ADANIPORTS.NS", "ADANIPOWER.NS", "ALKEM.NS",
+    "AMBER.NS", "AMBUJACEM.NS", "ANANDRATHI.NS", "ANGELONE.NS", "APARINDS.NS",
+    "APLAPOLLO.NS", "APOLLOHOSP.NS", "ASHOKLEY.NS", "ASIANPAINT.NS", "ASTRAL.NS",
+    "ATHERENERG.NS", "AUBANK.NS", "AUROPHARMA.NS", "AXISBANK.NS", "BAJAJ-AUTO.NS",
+    "BAJAJFINSV.NS", "BAJFINANCE.NS", "BANDHANBNK.NS", "BANKBARODA.NS", "BANKINDIA.NS",
+    "BDL.NS", "BEL.NS", "BHARATFORG.NS", "BHARTIARTL.NS", "BHEL.NS",
+    "BIOCON.NS", "BLUESTARCO.NS", "BOSCHLTD.NS", "BPCL.NS", "BRITANNIA.NS",
+    "BSE.NS", "CAMS.NS", "CANBK.NS", "CDSL.NS", "CGPOWER.NS",
+    "CHOLAFIN.NS", "CIPLA.NS", "COALINDIA.NS", "COCHINSHIP.NS", "COFORGE.NS",
+    "COLPAL.NS", "CONCOR.NS", "COROMANDEL.NS", "CROMPTON.NS", "CUB.NS",
+    "CUMMINSIND.NS", "DABUR.NS", "DATAPATTNS.NS", "DELHIVERY.NS", "DIVISLAB.NS",
+    "DIXON.NS", "DLF.NS", "DMART.NS", "DRREDDY.NS", "EICHERMOT.NS",
+    "ENRIN.NS", "ETERNAL.NS", "FEDERALBNK.NS", "FORCEMOT.NS", "FORTIS.NS",
+    "GAIL.NS", "GLENMARK.NS", "GMRAIRPORT.NS", "GODFRYPHLP.NS", "GODREJCP.NS",
+    "GODREJPROP.NS", "GRASIM.NS", "GVT&D.NS", "HAL.NS", "HAVELLS.NS",
+    "HCLTECH.NS", "HDFCAMC.NS", "HDFCBANK.NS", "HDFCLIFE.NS", "HEROMOTOCO.NS",
+    "HINDALCO.NS", "HINDPETRO.NS", "HINDUNILVR.NS", "HINDZINC.NS", "HYUNDAI.NS",
+    "ICICIBANK.NS", "ICICIGI.NS", "ICICILIFE.NS", "IDEA.NS", "IDFCFIRSTB.NS",
+    "INDHOTEL.NS", "INDIANB.NS", "INDIGO.NS", "INDUSINDBK.NS", "INDUSTOWER.NS",
+    "INFY.NS", "INOXWIND.NS", "IOC.NS", "IRFC.NS", "ITC.NS",
+    "JINDALSTEL.NS", "JIOFIN.NS", "JSWENERGY.NS", "JSWSTEEL.NS", "JUBLFOOD.NS",
+    "KALYANKJIL.NS", "KARURVYSYA.NS", "KAYNES.NS", "KEI.NS", "KFINTECH.NS",
+    "KOTAKBANK.NS", "KPITTECH.NS", "LAURUSLABS.NS", "LICHSGFIN.NS", "LICI.NS",
+    "LODHA.NS", "LT.NS", "LTF.NS", "LTM.NS", "LUPIN.NS",
+    "M&M.NS", "MAHABANK.NS", "MANAPPURAM.NS", "MANKIND.NS", "MARICO.NS",
+    "MARUTI.NS", "MAXHEALTH.NS", "MAZDOCK.NS", "MCX.NS", "MFSL.NS",
+    "MOTHERSON.NS", "MOTILALOFS.NS", "MPHASIS.NS", "MUTHOOTFIN.NS", "NAM-INDIA.NS",
+    "NATIONALUM.NS", "NAUKRI.NS", "NAVINFLUOR.NS", "NBCC.NS", "NESTLEIND.NS",
+    "NHPC.NS", "NMDC.NS", "NTPC.NS", "NYKAA.NS", "OBEROIRLTY.NS",
+    "OFSS.NS", "OIL.NS", "ONGC.NS", "PAGEIND.NS", "PATANJALI.NS",
+    "PAYTM.NS", "PERSISTENT.NS", "PETRONET.NS", "PFC.NS", "PGEL.NS",
+    "PHOENIXLTD.NS", "PIDILITIND.NS", "PIIND.NS", "PNB.NS", "PNBHOUSING.NS",
+    "POLICYBZR.NS", "POLYCAB.NS", "POWERGRID.NS", "POWERINDIA.NS", "PREMIERENE.NS",
+    "PRESTIGE.NS", "RADICO.NS", "RBLBANK.NS", "RECLTD.NS", "RELIANCE.NS",
+    "RVNL.NS", "SAGILITY.NS", "SAIL.NS", "SBICARD.NS", "SBILIFE.NS",
     "SBIN.NS", "SHREECEM.NS", "SHRIRAMFIN.NS", "SIEMENS.NS", "SOLARINDS.NS",
-    "SONACOMS.NS", "SRF.NS", "STARHEALTH.NS", "SUNPHARMA.NS", "SUPREMEIND.NS",
-    "SUZLON.NS", "SYNGENE.NS", "TATACOMM.NS", "TATACONSUM.NS", "TATAELEXSI.NS",
-    "TATAMOTORS.NS", "TATAPOWER.NS", "TATASTEEL.NS", "TATATECH.NS", "TCS.NS",
-    "TECHM.NS", "TIINDIA.NS", "TITAN.NS", "TORNTPHARM.NS", "TORNTPOWER.NS",
-    "TRENT.NS", "TVSMOTOR.NS", "UBL.NS", "ULTRACEMCO.NS", "UNIONBANK.NS",
-    "UPL.NS", "VBL.NS", "VEDL.NS", "VOLTAS.NS", "WIPRO.NS",
-    "YESBANK.NS", "ZEEL.NS", "ZOMATO.NS"
+    "SONACOMS.NS", "SRF.NS", "SUNPHARMA.NS", "SUPREMEIND.NS", "SUZLON.NS",
+    "SWIGGY.NS", "SYRMA.NS", "TATACONSUM.NS", "TATAELXSI.NS", "TATAPOWER.NS",
+    "TATASTEEL.NS", "TCS.NS", "TECHM.NS", "TIINDIA.NS", "TITAN.NS",
+    "TMPV.NS", "TORNTPHARM.NS", "TRENT.NS", "TVSMOTOR.NS", "UJJIVANSFB.NS",
+    "ULTRACEMCO.NS", "UNIONBANK.NS", "UNITDSPR.NS", "UNOMINDA.NS", "UPL.NS",
+    "VBL.NS", "VEDL.NS", "VMM.NS", "VOLTAS.NS", "WAAREEENER.NS",
+    "WIPRO.NS", "YESBANK.NS", "ZYDUSLIFE.NS",
 ]
 
 # Clean unique list
 FNO_STOCKS = sorted(list(set(FNO_STOCKS)))
+
+
+def fetch_nse_fno_universe(timeout: int = 10) -> List[str]:
+    """Fetch live NSE F&O equity underlyings directly from NSE India."""
+    from curl_cffi import requests
+
+    session = requests.Session(impersonate="chrome")
+    session.get("https://www.nseindia.com/market-data/equity-derivatives-watch", timeout=timeout)
+    resp = session.get("https://www.nseindia.com/api/underlying-information", timeout=timeout)
+    resp.raise_for_status()
+
+    items = resp.json().get("data", {}).get("UnderlyingList", [])
+    symbols = sorted({f"{item['symbol']}.NS" for item in items if item.get("symbol")})
+    if not symbols:
+        raise ValueError("Empty UnderlyingList returned from NSE")
+    return symbols
+
+
+def get_fno_universe(force_refresh: bool = False) -> Tuple[List[str], str]:
+    """
+    Return (symbols, source_label).
+    Uses cached live NSE sync if available; falls back cleanly to built-in FNO_STOCKS.
+    """
+    today_str = datetime.now(IST).date().isoformat()
+
+    if not force_refresh and CACHE_FILE.exists():
+        try:
+            payload = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+            symbols = payload.get("symbols") or []
+            synced_date = payload.get("date", "cached")
+            if symbols:
+                return sorted(set(symbols)), f"NSE Live (synced {synced_date})"
+        except Exception:
+            pass
+
+    if force_refresh:
+        try:
+            symbols = fetch_nse_fno_universe()
+            CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            CACHE_FILE.write_text(
+                json.dumps({"date": today_str, "symbols": symbols}),
+                encoding="utf-8",
+            )
+            return symbols, f"NSE Live (synced {today_str})"
+        except Exception:
+            return FNO_STOCKS, "Built-in list (NSE sync failed)"
+
+    return FNO_STOCKS, "Built-in NSE F&O list"

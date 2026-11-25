@@ -1,27 +1,64 @@
 """
 Optimized relative-volume scanner logic using yfinance with:
-1. Disk & In-Memory caching for previous trading day baseline (cuts 50% API calls).
-2. Batched chunk downloading via yf.download() (replaces 150+ individual HTTP connections).
-3. Direct previous-close extraction from cached baseline (eliminates 150 fast_info calls).
+1. Disk & In-Memory caching (with negative caching) for previous trading day baseline.
+2. Batched chunk downloading via yf.download() using a single flat thread pool.
+3. Direct previous-close extraction from cached baseline (eliminates fast_info calls).
 """
 
 from datetime import datetime, time, timedelta, date
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import pickle
 import pandas as pd
 import yfinance as yf
-import pytz
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from holidays import get_previous_trading_day, IST
 
 MARKET_OPEN = time(9, 15)
 CACHE_DIR = Path(__file__).parent / ".cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_RETENTION_DAYS = 7
 
-# In-memory session cache: (date, interval) -> Dict[symbol, pd.DataFrame]
-_PREV_DAY_MEMORY_CACHE: Dict[Tuple[date, str], Dict[str, pd.DataFrame]] = {}
+# In-memory session cache: (date, interval) -> Dict[symbol, Optional[Dict[str, Any]]]
+# Each entry stores {"cumvol": pd.Series (indexed by time), "prev_close": Optional[float]} or None.
+_PREV_DAY_MEMORY_CACHE: Dict[Tuple[date, str], Dict[str, Optional[Dict[str, Any]]]] = {}
+
+
+def _prune_old_cache(max_age_days: int = CACHE_RETENTION_DAYS) -> None:
+    """Remove cached .pkl files older than max_age_days."""
+    cutoff_ts = datetime.now().timestamp() - (max_age_days * 86400)
+    for path in CACHE_DIR.glob("*.pkl"):
+        try:
+            if path.stat().st_mtime < cutoff_ts:
+                path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _build_prev_day_baseline(df_prev: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    """
+    Pre-compute cumulative regular-hours volume Series (indexed by IST time-of-day)
+    and previous close scalar for O(1) .asof() lookups.
+    """
+    if df_prev is None or df_prev.empty or "Volume" not in df_prev.columns:
+        return None
+
+    mask_open = df_prev.index.time >= MARKET_OPEN
+    vol_series = df_prev.loc[mask_open, "Volume"].fillna(0.0)
+    if vol_series.empty:
+        return None
+
+    # Deduplicate/sort by time-of-day so .asof() always sees a strictly monotonic index
+    vol_by_time = pd.Series(vol_series.to_numpy(dtype=float), index=vol_series.index.time)
+    cumvol = vol_by_time.groupby(level=0).sum().sort_index().cumsum()
+
+    prev_close: Optional[float] = None
+    if "Close" in df_prev.columns:
+        close_series = df_prev["Close"].dropna()
+        if not close_series.empty:
+            prev_close = float(close_series.iloc[-1])
+
+    return {"cumvol": cumvol, "prev_close": prev_close}
 
 
 def _standardize_index_tz(df: pd.DataFrame) -> pd.DataFrame:
@@ -73,12 +110,16 @@ def _fetch_batch_chunk(
     start: str,
     end: str,
     interval: str,
-) -> Dict[str, pd.DataFrame]:
-    """Download a batch chunk of tickers and return symbol-keyed DataFrames."""
+    threads: int = 8,
+) -> Tuple[Dict[str, pd.DataFrame], bool]:
+    """
+    Download a batch chunk of tickers using yfinance's internal thread pool.
+    Returns (symbol_dfs, batch_succeeded).
+    """
     if not tickers:
-        return {}
+        return {}, True
 
-    result = {}
+    result: Dict[str, pd.DataFrame] = {}
     try:
         batch_df = yf.download(
             tickers=tickers,
@@ -87,16 +128,18 @@ def _fetch_batch_chunk(
             interval=interval,
             group_by="ticker",
             progress=False,
-            threads=True,
+            threads=max(1, threads),
         )
+        if batch_df is None or batch_df.empty:
+            return result, False
+
         for sym in tickers:
             sub = extract_ticker_df(batch_df, sym)
             if not sub.empty:
                 result[sym] = sub
+        return result, True
     except Exception:
-        pass
-
-    return result
+        return result, False
 
 
 def get_previous_day_data(
@@ -104,22 +147,22 @@ def get_previous_day_data(
     prev_day: date,
     interval: str = "1m",
     chunk_size: int = 50,
-) -> Dict[str, pd.DataFrame]:
+    max_workers: int = 8,
+) -> Dict[str, Optional[Dict[str, Any]]]:
     """
-    Fetch previous trading day's bars with two-level caching:
+    Fetch previous trading day's pre-computed baselines (cumvol Series + prev_close)
+    with two-level caching:
     1. In-memory dictionary.
-    2. Disk pickle cache in .cache/prev_{prev_day}_{interval}.pkl.
-    Only missing symbols are fetched via batched yf.download().
+    2. Disk pickle cache in .cache/prev_baseline_{prev_day}_{interval}.pkl.
+    Includes negative caching and auto-pruning of cache files older than 7 days.
     """
     cache_key = (prev_day, interval)
-    cached_data: Dict[str, pd.DataFrame] = {}
+    cached_data: Dict[str, Optional[Dict[str, Any]]] = {}
 
-    # Check in-memory cache
     if cache_key in _PREV_DAY_MEMORY_CACHE:
         cached_data = _PREV_DAY_MEMORY_CACHE[cache_key]
 
-    # Check disk cache if in-memory is empty
-    cache_file = CACHE_DIR / f"prev_{prev_day.isoformat()}_{interval}.pkl"
+    cache_file = CACHE_DIR / f"prev_baseline_{prev_day.isoformat()}_{interval}.pkl"
     if not cached_data and cache_file.exists():
         try:
             with open(cache_file, "rb") as f:
@@ -127,29 +170,36 @@ def get_previous_day_data(
         except Exception:
             cached_data = {}
 
-    # Determine missing symbols
     missing = [sym for sym in symbols if sym not in cached_data]
 
     if missing:
+        _prune_old_cache()
         start_str = prev_day.strftime("%Y-%m-%d")
         end_str = (prev_day + timedelta(days=1)).strftime("%Y-%m-%d")
+        updated = False
 
         chunks = [missing[i : i + chunk_size] for i in range(0, len(missing), chunk_size)]
-        with ThreadPoolExecutor(max_workers=min(len(chunks), 4)) as executor:
-            futures = [
-                executor.submit(_fetch_batch_chunk, chunk, start_str, end_str, interval)
-                for chunk in chunks
-            ]
-            for future in as_completed(futures):
-                chunk_result = future.result()
-                cached_data.update(chunk_result)
+        for chunk in chunks:
+            chunk_result, batch_ok = _fetch_batch_chunk(
+                chunk, start_str, end_str, interval, threads=max_workers
+            )
+            for sym, df_prev in chunk_result.items():
+                cached_data[sym] = _build_prev_day_baseline(df_prev)
+                updated = True
 
-        # Save to disk cache
-        try:
-            with open(cache_file, "wb") as f:
-                pickle.dump(cached_data, f, protocol=pickle.HIGHEST_PROTOCOL)
-        except Exception:
-            pass
+            # Negative-cache missing symbols only when the batch itself succeeded
+            if batch_ok:
+                for sym in chunk:
+                    if sym not in chunk_result:
+                        cached_data[sym] = None
+                updated = True
+
+        if updated:
+            try:
+                with open(cache_file, "wb") as f:
+                    pickle.dump(cached_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+            except Exception:
+                pass
 
     _PREV_DAY_MEMORY_CACHE[cache_key] = cached_data
     return cached_data
@@ -160,10 +210,11 @@ def get_today_data(
     today: date,
     interval: str = "1m",
     chunk_size: int = 50,
-    max_workers: int = 4,
+    max_workers: int = 8,
 ) -> Dict[str, pd.DataFrame]:
     """
-    Fetch today's bars using batched yf.download() across chunks in parallel.
+    Fetch today's bars sequentially across batch chunks using yfinance's flat thread pool.
+    Avoids nested thread pools and shared-state contention.
     """
     start_str = today.strftime("%Y-%m-%d")
     end_str = (today + timedelta(days=1)).strftime("%Y-%m-%d")
@@ -171,14 +222,11 @@ def get_today_data(
     chunks = [symbols[i : i + chunk_size] for i in range(0, len(symbols), chunk_size)]
     today_data: Dict[str, pd.DataFrame] = {}
 
-    with ThreadPoolExecutor(max_workers=min(len(chunks), max_workers)) as executor:
-        futures = [
-            executor.submit(_fetch_batch_chunk, chunk, start_str, end_str, interval)
-            for chunk in chunks
-        ]
-        for future in as_completed(futures):
-            chunk_result = future.result()
-            today_data.update(chunk_result)
+    for chunk in chunks:
+        chunk_result, _ = _fetch_batch_chunk(
+            chunk, start_str, end_str, interval, threads=max_workers
+        )
+        today_data.update(chunk_result)
 
     return today_data
 
@@ -188,13 +236,14 @@ def run_scan(
     min_ratio: float = 1.5,
     min_volume: int = 0,
     interval: str = "1m",
-    max_workers: int = 4,
+    max_workers: int = 8,
     chunk_size: int = 50,
 ) -> pd.DataFrame:
     """
     Run relative volume scan across symbols using:
     - Cached previous-day baseline (0 HTTP requests after 1st fetch)
-    - Batched download for today (only a few HTTP requests total)
+    - Batched download for today (flat thread pool, no nested pools)
+    Pass min_ratio=0.0 and min_volume=0 to retrieve all valid symbols for client-side filtering.
     """
     now = datetime.now(IST)
     cutoff = now.time()
@@ -202,7 +251,9 @@ def run_scan(
     prev_day = get_previous_trading_day(today)
 
     # 1. Fetch previous day data (cached in-memory / on-disk)
-    prev_data = get_previous_day_data(symbols, prev_day, interval=interval, chunk_size=chunk_size)
+    prev_data = get_previous_day_data(
+        symbols, prev_day, interval=interval, chunk_size=chunk_size, max_workers=max_workers
+    )
 
     # 2. Fetch today's data in batched chunks
     today_data = get_today_data(
@@ -215,39 +266,40 @@ def run_scan(
 
     results = []
 
-    # 3. Process metrics in-memory
+    # 3. Process metrics in-memory via O(1) .asof() lookup on pre-computed cumsum
     for sym in symbols:
         df_today = today_data.get(sym)
-        df_prev = prev_data.get(sym)
+        baseline = prev_data.get(sym)
 
-        if df_today is None or df_today.empty:
-            continue
-        if df_prev is None or df_prev.empty:
+        if df_today is None or df_today.empty or not baseline:
             continue
 
+        cumvol = baseline["cumvol"]
+        if cumvol.empty:
+            continue
+
+        raw_prev_vol = cumvol.asof(cutoff)
+        if pd.isna(raw_prev_vol) or raw_prev_vol <= 0:
+            continue
+
+        vol_prev = float(raw_prev_vol)
         vol_today = cumulative_volume_until(df_today, cutoff)
-        vol_prev = cumulative_volume_until(df_prev, cutoff)
-
-        if vol_prev <= 0:
-            continue
-
         ratio = vol_today / vol_prev
 
         if ratio < min_ratio or vol_today < min_volume:
             continue
 
-        # Extract latest price and previous close directly from cached bars
+        # Extract latest price from today and previous close directly from baseline
         last_price = None
         pct_change = None
-        if not df_today.empty and "Close" in df_today.columns:
-            last_price = float(df_today["Close"].dropna().iloc[-1])
+        if "Close" in df_today.columns:
+            close_series = df_today["Close"].dropna()
+            if not close_series.empty:
+                last_price = float(close_series.iloc[-1])
 
-        if not df_prev.empty and "Close" in df_prev.columns:
-            prev_close_series = df_prev["Close"].dropna()
-            if not prev_close_series.empty:
-                prev_close = float(prev_close_series.iloc[-1])
-                if last_price and prev_close > 0:
-                    pct_change = ((last_price - prev_close) / prev_close) * 100
+        prev_close = baseline.get("prev_close")
+        if last_price and prev_close and prev_close > 0:
+            pct_change = ((last_price - prev_close) / prev_close) * 100
 
         results.append(
             {

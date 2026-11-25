@@ -7,7 +7,7 @@ from datetime import datetime
 import streamlit as st
 import pandas as pd
 
-from universe import FNO_STOCKS
+from universe import get_fno_universe
 from scanner import run_scan
 from holidays import is_market_open, get_previous_trading_day, IST
 
@@ -19,6 +19,11 @@ st.set_page_config(
 
 st.title("📈 F&O Relative Volume Scanner")
 st.caption("Today's volume till now vs Previous trading day volume till same clock time (IST)")
+
+if "universe_symbols" not in st.session_state:
+    syms, src = get_fno_universe(force_refresh=False)
+    st.session_state.universe_symbols = syms
+    st.session_state.universe_source = src
 
 # Sidebar controls
 with st.sidebar:
@@ -44,7 +49,7 @@ with st.sidebar:
         index=0,
         help="1-minute is more precise but slower and more prone to gaps. 5-minute is more reliable.",
     )
-    max_workers = st.slider("Parallel workers", 4, 12, 8)
+    max_workers = st.slider("Parallel download threads", 4, 16, 8)
 
     st.markdown("---")
     auto_refresh = st.checkbox("Auto-refresh", value=False)
@@ -58,16 +63,29 @@ with st.sidebar:
             help="Interval between automated background scans.",
         )
     st.markdown("---")
-    st.info(f"Universe size: **{len(FNO_STOCKS)}** F&O stocks")
+    if st.button("🔄 Sync NSE F&O List", use_container_width=True):
+        with st.spinner("Fetching latest F&O list from NSE..."):
+            syms, src = get_fno_universe(force_refresh=True)
+            st.session_state.universe_symbols = syms
+            st.session_state.universe_source = src
+
+    active_universe = st.session_state.universe_symbols
+    st.info(
+        f"Universe size: **{len(active_universe)}** F&O stocks\n\n"
+        f"Source: {st.session_state.universe_source}"
+    )
 
 # Session state initialization
-if "results_df" not in st.session_state:
-    st.session_state.results_df = pd.DataFrame()
+if "raw_results_df" not in st.session_state:
+    st.session_state.raw_results_df = pd.DataFrame()
 if "last_scan_time" not in st.session_state:
     st.session_state.last_scan_time = None
+if "last_scan_interval" not in st.session_state:
+    st.session_state.last_scan_interval = None
 
 
 def render_scanner(
+    symbols: list[str],
     min_ratio: float,
     min_volume: int,
     interval: str,
@@ -108,25 +126,36 @@ def render_scanner(
                 should_scan = True
 
     if should_scan:
-        with st.spinner(f"Scanning {len(FNO_STOCKS)} F&O stocks... (this may take 30-90 seconds)"):
-            df = run_scan(
-                symbols=FNO_STOCKS,
-                min_ratio=min_ratio,
-                min_volume=int(min_volume),
+        with st.spinner(f"Scanning {len(symbols)} F&O stocks..."):
+            # Fetch unfiltered snapshot so sidebar filter changes apply instantly in memory
+            raw_df = run_scan(
+                symbols=symbols,
+                min_ratio=0.0,
+                min_volume=0,
                 interval=interval,
                 max_workers=max_workers,
             )
-            st.session_state.results_df = df
+            st.session_state.raw_results_df = raw_df
             st.session_state.last_scan_time = datetime.now(IST)
+            st.session_state.last_scan_interval = interval
 
-    # Display results
-    df = st.session_state.results_df
+    # Client-side filtering on the cached scan snapshot
+    raw_df = st.session_state.raw_results_df
+    if raw_df.empty:
+        df = raw_df
+    else:
+        df = raw_df[
+            (raw_df["Ratio"] >= min_ratio) & (raw_df["Vol_Today"] >= int(min_volume))
+        ].reset_index(drop=True)
 
     if st.session_state.last_scan_time:
         st.success(
-            f"Last scan: {st.session_state.last_scan_time.strftime('%H:%M:%S IST')} | "
-            f"Found **{len(df)}** stocks matching filters"
+            f"Last scan: {st.session_state.last_scan_time.strftime('%H:%M:%S IST')} "
+            f"({st.session_state.last_scan_interval} bars) | "
+            f"Showing **{len(df)}** of **{len(raw_df)}** scanned stocks"
         )
+        if st.session_state.last_scan_interval and st.session_state.last_scan_interval != interval:
+            st.info(f"Bar interval changed to **{interval}** — click **Scan Now** to fetch {interval} bars.")
 
     if df.empty:
         if st.session_state.last_scan_time is None:
@@ -134,26 +163,17 @@ def render_scanner(
         else:
             st.warning("No stocks matched the current filters. Try lowering the Minimum Ratio or Volume.")
     else:
-        display_df = df.copy()
-        display_df["Vol_Today"] = display_df["Vol_Today"].apply(lambda x: f"{x:,}")
-        display_df["Vol_Prev_Same_Time"] = display_df["Vol_Prev_Same_Time"].apply(lambda x: f"{x:,}")
-        display_df["Ratio"] = display_df["Ratio"].apply(lambda x: f"{x:.2f}×")
-        if "Pct_Change" in display_df.columns:
-            display_df["Pct_Change"] = display_df["Pct_Change"].apply(
-                lambda x: f"{x:+.2f}%" if pd.notna(x) else "—"
-            )
-
         st.dataframe(
-            display_df,
+            df,
             use_container_width=True,
             hide_index=True,
             column_config={
                 "Symbol": st.column_config.TextColumn("Symbol", width="medium"),
                 "LTP": st.column_config.NumberColumn("LTP", format="%.2f"),
-                "Vol_Today": st.column_config.TextColumn("Vol Today (till now)"),
-                "Vol_Prev_Same_Time": st.column_config.TextColumn("Vol Prev (same time)"),
-                "Ratio": st.column_config.TextColumn("Ratio"),
-                "Pct_Change": st.column_config.TextColumn("% Chg"),
+                "Vol_Today": st.column_config.NumberColumn("Vol Today (till now)", format="localized"),
+                "Vol_Prev_Same_Time": st.column_config.NumberColumn("Vol Prev (same time)", format="localized"),
+                "Ratio": st.column_config.NumberColumn("Ratio", format="%.2f×"),
+                "Pct_Change": st.column_config.NumberColumn("% Chg", format="%+.2f%%"),
             },
         )
 
@@ -173,6 +193,7 @@ scanner_fragment = st.fragment(
 )
 
 scanner_fragment(
+    symbols=active_universe,
     min_ratio=min_ratio,
     min_volume=int(min_volume),
     interval=interval,
