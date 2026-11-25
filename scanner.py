@@ -289,17 +289,52 @@ def run_scan(
         if ratio < min_ratio or vol_today < min_volume:
             continue
 
-        # Extract latest price from today and previous close directly from baseline
+        # Extract latest price, intraday OHLC metrics, and previous-day metrics
         last_price = None
+        day_open = None
+        day_high = None
+        day_low = None
         pct_change = None
-        if "Close" in df_today.columns:
-            close_series = df_today["Close"].dropna()
+        range_pct = None
+
+        df_reg = df_today.loc[
+            (df_today.index.time >= MARKET_OPEN) & (df_today.index.time <= cutoff)
+        ]
+        price_df = df_reg if not df_reg.empty else df_today
+
+        if "Close" in price_df.columns:
+            close_series = price_df["Close"].dropna()
             if not close_series.empty:
                 last_price = float(close_series.iloc[-1])
 
+        if "Open" in price_df.columns:
+            open_series = price_df["Open"].dropna()
+            if not open_series.empty:
+                day_open = float(open_series.iloc[0])
+
+        if "High" in price_df.columns:
+            high_series = price_df["High"].dropna()
+            if not high_series.empty:
+                day_high = float(high_series.max())
+
+        if "Low" in price_df.columns:
+            low_series = price_df["Low"].dropna()
+            if not low_series.empty:
+                day_low = float(low_series.min())
+
+        if day_high is not None and day_low is not None and day_low > 0:
+            range_pct = ((day_high - day_low) / day_low) * 100
+
         prev_close = baseline.get("prev_close")
+        gap_pct = None
+        if day_open is not None and prev_close and prev_close > 0:
+            gap_pct = ((day_open - prev_close) / prev_close) * 100
         if last_price and prev_close and prev_close > 0:
             pct_change = ((last_price - prev_close) / prev_close) * 100
+
+        prev_full_vol = float(cumvol.iloc[-1])
+        vol_diff = vol_today - vol_prev
+        turnover_cr = ((last_price * vol_today) / 1e7) if last_price is not None else None
 
         results.append(
             {
@@ -309,6 +344,15 @@ def run_scan(
                 "Vol_Prev_Same_Time": int(vol_prev),
                 "Ratio": round(ratio, 2),
                 "Pct_Change": round(pct_change, 2) if pct_change is not None else None,
+                "Gap_Pct": round(gap_pct, 2) if gap_pct is not None else None,
+                "Prev_Close": round(prev_close, 2) if prev_close is not None else None,
+                "Day_Open": round(day_open, 2) if day_open is not None else None,
+                "Day_High": round(day_high, 2) if day_high is not None else None,
+                "Day_Low": round(day_low, 2) if day_low is not None else None,
+                "Range_Pct": round(range_pct, 2) if range_pct is not None else None,
+                "Vol_Diff": int(vol_diff),
+                "Prev_Full_Vol": int(prev_full_vol),
+                "Turnover_Cr": round(turnover_cr, 2) if turnover_cr is not None else None,
             }
         )
 
