@@ -38,6 +38,7 @@ except ImportError:  # pragma: no cover - fallback for older yfinance versions
     _yf_new_session = None
 
 from holidays import get_previous_trading_day, IST
+from oi import classify_oi_buildup, get_oi_snapshot
 
 MARKET_OPEN = time(9, 15)
 _MARKET_OPEN_SEC = 9 * 3600 + 15 * 60
@@ -1262,6 +1263,7 @@ def run_scan(
     max_workers: int = 8,
     chunk_size: Optional[int] = None,
     prev_day: Optional[date] = None,
+    include_oi: bool = False,
 ) -> pd.DataFrame:
     """
     Run relative volume scan across symbols using:
@@ -1317,13 +1319,24 @@ def run_scan(
         else:
             symbol_periods.append((sym, "1d"))
 
-    fetched_arrays, failed_syms = _fetch_market_data(
-        symbol_periods,
-        interval=interval,
-        max_workers=max_workers,
-        chunk_size=chunk_size,
-        symbol_ranges=symbol_ranges if symbol_ranges else None,
-    )
+    oi_executor: Optional[ThreadPoolExecutor] = None
+    oi_future = None
+    if include_oi:
+        oi_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="nse_oi_fetch")
+        oi_future = oi_executor.submit(get_oi_snapshot)
+
+    try:
+        fetched_arrays, failed_syms = _fetch_market_data(
+            symbol_periods,
+            interval=interval,
+            max_workers=max_workers,
+            chunk_size=chunk_size,
+            symbol_ranges=symbol_ranges if symbol_ranges else None,
+        )
+    except Exception:
+        if oi_executor is not None:
+            oi_executor.shutdown(wait=False)
+        raise
 
     # 3. Extract & persist any newly fetched previous-day baselines from coalesced responses
     if missing_set:
@@ -1383,9 +1396,23 @@ def run_scan(
         store = _commit_baseline_updates(cache_key, prev_day, interval, new_entries, neg_syms)
 
     # 4. Per-ticker bar-aligned baseline lookup (prevents look-ahead bias on lagging feeds)
+    oi_snapshot: Dict[str, Any] = {}
+    if oi_future is not None:
+        try:
+            oi_snapshot = oi_future.result() or {}
+        except Exception as exc:
+            oi_snapshot = {"by_symbol": {}, "error": str(exc), "cooldown_seconds": 0.0}
+        finally:
+            if oi_executor is not None:
+                oi_executor.shutdown(wait=False)
+    oi_by_symbol: Dict[str, Dict[str, Optional[float]]] = oi_snapshot.get("by_symbol") or {}
+
     times_sec = store["times_sec"]
     if len(times_sec) == 0 or cutoff_sec < int(times_sec[0]):
-        return pd.DataFrame()
+        empty_df = pd.DataFrame()
+        if include_oi:
+            empty_df.attrs["oi_meta"] = {k: v for k, v in oi_snapshot.items() if k != "by_symbol"}
+        return empty_df
 
     today_day_start_sec = _ist_epoch_sec(today, time(0, 0))
     today_cutoff_bound_sec = today_day_start_sec + cutoff_sec
@@ -1461,30 +1488,55 @@ def run_scan(
         vol_diff = vol_today - vol_prev
         turnover_cr = ((last_price * vol_today) / 1e7) if last_price is not None else None
 
-        results.append(
-            {
-                "Symbol": sym.removesuffix(".NS"),
-                "LTP": round(last_price, 2) if last_price is not None else None,
-                "Vol_Today": int(vol_today),
-                "Vol_Prev_Same_Time": int(vol_prev),
-                "Ratio": round(ratio, 2),
-                "Pct_Change": round(pct_change, 2) if pct_change is not None else None,
-                "Last_Bar_Time": aligned_time.strftime("%H:%M"),
-                "Gap_Pct": round(gap_pct, 2) if gap_pct is not None else None,
-                "Prev_Close": round(prev_close, 2) if prev_close is not None else None,
-                "Day_Open": round(day_open, 2) if day_open is not None else None,
-                "Day_High": round(day_high, 2) if day_high is not None else None,
-                "Day_Low": round(day_low, 2) if day_low is not None else None,
-                "Range_Pct": round(range_pct, 2) if range_pct is not None else None,
-                "Vol_Diff": int(vol_diff),
-                "Prev_Full_Vol": int(prev_full_vol),
-                "Turnover_Cr": round(turnover_cr, 2) if turnover_cr is not None else None,
-            }
-        )
+        sym_clean = sym.removesuffix(".NS")
+        row_data: Dict[str, Any] = {
+            "Symbol": sym_clean,
+            "LTP": round(last_price, 2) if last_price is not None else None,
+            "Vol_Today": int(vol_today),
+            "Vol_Prev_Same_Time": int(vol_prev),
+            "Ratio": round(ratio, 2),
+            "Pct_Change": round(pct_change, 2) if pct_change is not None else None,
+            "Last_Bar_Time": aligned_time.strftime("%H:%M"),
+            "Gap_Pct": round(gap_pct, 2) if gap_pct is not None else None,
+            "Prev_Close": round(prev_close, 2) if prev_close is not None else None,
+            "Day_Open": round(day_open, 2) if day_open is not None else None,
+            "Day_High": round(day_high, 2) if day_high is not None else None,
+            "Day_Low": round(day_low, 2) if day_low is not None else None,
+            "Range_Pct": round(range_pct, 2) if range_pct is not None else None,
+            "Vol_Diff": int(vol_diff),
+            "Prev_Full_Vol": int(prev_full_vol),
+            "Turnover_Cr": round(turnover_cr, 2) if turnover_cr is not None else None,
+        }
+        if include_oi:
+            oi_rec = oi_by_symbol.get(sym_clean) or {}
+            oi_val = oi_rec.get("oi")
+            oi_prev = oi_rec.get("oi_prev")
+            oi_chg = oi_rec.get("oi_chg")
+            oi_chg_pct = oi_rec.get("oi_chg_pct")
+            oi_5m_chg = oi_rec.get("oi_5m_chg")
+            oi_5m_chg_pct = oi_rec.get("oi_5m_chg_pct")
+            oi_chg_rounded = int(round(oi_chg)) if oi_chg is not None else None
+            row_data.update(
+                {
+                    "OI": int(round(oi_val)) if oi_val is not None else None,
+                    "OI_Prev": int(round(oi_prev)) if oi_prev is not None else None,
+                    "OI_Chg": oi_chg_rounded,
+                    "OI_Chg_Pct": round(oi_chg_pct, 2) if oi_chg_pct is not None else None,
+                    "OI_5m_Chg": int(round(oi_5m_chg)) if oi_5m_chg is not None else None,
+                    "OI_5m_Chg_Pct": round(oi_5m_chg_pct, 2) if oi_5m_chg_pct is not None else None,
+                    "OI_Buildup": classify_oi_buildup(row_data["Pct_Change"], oi_chg_rounded),
+                }
+            )
+        results.append(row_data)
 
     if not results:
-        return pd.DataFrame()
+        empty_df = pd.DataFrame()
+        if include_oi:
+            empty_df.attrs["oi_meta"] = {k: v for k, v in oi_snapshot.items() if k != "by_symbol"}
+        return empty_df
 
     df_out = pd.DataFrame(results)
     df_out = df_out.sort_values("Ratio", ascending=False).reset_index(drop=True)
+    if include_oi:
+        df_out.attrs["oi_meta"] = {k: v for k, v in oi_snapshot.items() if k != "by_symbol"}
     return df_out

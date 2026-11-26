@@ -11,6 +11,7 @@ import pandas as pd
 from universe import get_fno_universe
 from scanner import prune_cache, run_scan
 from holidays import get_holidays, is_market_open, get_previous_trading_day, IST
+from oi import OI_BUILDUP_OPTIONS, classify_oi_buildup
 
 MARKET_CLOSE_TIME = time(15, 30)
 
@@ -30,6 +31,11 @@ DEFAULT_COLUMNS = [
     "Vol_Prev_Same_Time",
     "Ratio",
     "Pct_Change",
+    "OI",
+    "OI_Chg",
+    "OI_Chg_Pct",
+    "OI_5m_Chg_Pct",
+    "OI_Buildup",
     "Last_Bar_Time",
 ]
 
@@ -40,6 +46,13 @@ ALL_COLUMNS = [
     "Vol_Prev_Same_Time",
     "Ratio",
     "Pct_Change",
+    "OI",
+    "OI_Prev",
+    "OI_Chg",
+    "OI_Chg_Pct",
+    "OI_5m_Chg",
+    "OI_5m_Chg_Pct",
+    "OI_Buildup",
     "Last_Bar_Time",
     "Gap_Pct",
     "Prev_Close",
@@ -59,6 +72,13 @@ COLUMN_LABELS = {
     "Vol_Prev_Same_Time": "Vol Prev (same time)",
     "Ratio": "Ratio",
     "Pct_Change": "% Chg",
+    "OI": "OI (Lots)",
+    "OI_Prev": "Prev OI (Lots)",
+    "OI_Chg": "OI Chg (Day)",
+    "OI_Chg_Pct": "OI Chg % (Day)",
+    "OI_5m_Chg": "OI Chg (5m)",
+    "OI_5m_Chg_Pct": "OI Chg % (5m)",
+    "OI_Buildup": "OI Buildup",
     "Last_Bar_Time": "Last Bar (IST)",
     "Gap_Pct": "Gap %",
     "Prev_Close": "Prev Close",
@@ -71,6 +91,18 @@ COLUMN_LABELS = {
     "Turnover_Cr": "Turnover (₹ Cr)",
 }
 
+SORT_OPTIONS = {
+    "Ratio (High → Low)": ("Ratio", False, False),
+    "OI Chg % Day (High → Low)": ("OI_Chg_Pct", False, False),
+    "OI Chg % Day (Low → High)": ("OI_Chg_Pct", True, False),
+    "|OI Chg %| Day (Largest Moves)": ("OI_Chg_Pct", False, True),
+    "OI Chg Lots Day (High → Low)": ("OI_Chg", False, False),
+    "OI Chg % 5m (High → Low)": ("OI_5m_Chg_Pct", False, False),
+    "OI Chg % 5m (Low → High)": ("OI_5m_Chg_Pct", True, False),
+    "Price % Chg (High → Low)": ("Pct_Change", False, False),
+    "Turnover ₹ Cr (High → Low)": ("Turnover_Cr", False, False),
+}
+
 COLUMN_CONFIG = {
     "Symbol": st.column_config.TextColumn("Symbol", width="medium"),
     "LTP": st.column_config.NumberColumn("LTP", format="%.2f"),
@@ -78,6 +110,24 @@ COLUMN_CONFIG = {
     "Vol_Prev_Same_Time": st.column_config.NumberColumn("Vol Prev (same time)", format="localized"),
     "Ratio": st.column_config.NumberColumn("Ratio", format="%.2f×"),
     "Pct_Change": st.column_config.NumberColumn("% Chg", format="%+.2f%%"),
+    "OI": st.column_config.NumberColumn("OI (Lots)", format="localized"),
+    "OI_Prev": st.column_config.NumberColumn("Prev OI (Lots)", format="localized"),
+    "OI_Chg": st.column_config.NumberColumn("OI Chg (Day)", format="localized"),
+    "OI_Chg_Pct": st.column_config.NumberColumn("OI Chg % (Day)", format="%+.2f%%"),
+    "OI_5m_Chg": st.column_config.NumberColumn(
+        "OI Chg (5m)",
+        format="localized",
+        help="Rolling ~5-minute Change in OI from NSE snapshots (populates after 3+ minutes).",
+    ),
+    "OI_5m_Chg_Pct": st.column_config.NumberColumn(
+        "OI Chg % (5m)",
+        format="%+.2f%%",
+        help="Rolling ~5-minute % Change in OI from NSE snapshots (populates after 3+ minutes).",
+    ),
+    "OI_Buildup": st.column_config.TextColumn(
+        "OI Buildup",
+        help="Price Δ vs Day OI Δ classification: Long Buildup, Short Buildup, Short Covering, Long Unwinding.",
+    ),
     "Last_Bar_Time": st.column_config.TextColumn(
         "Last Bar (IST)",
         help="Latest regular-hours bar timestamp (IST) used for bar-aligned baseline lookup.",
@@ -178,6 +228,43 @@ with st.sidebar:
         ),
     )
     max_workers = st.slider("Parallel download threads", 4, 16, 8)
+    include_oi = st.checkbox(
+        "Include NSE OI & 5m ΔOI",
+        value=True,
+        help=(
+            "Fetch aggregate F&O Open Interest from NSE (1 rate-limited request every >=45s with backoff). "
+            "5m ΔOI populates after 3+ minutes of snapshots."
+        ),
+    )
+    min_oi_chg_pct = None
+    oi_buildup_filter: list[str] = []
+    if include_oi:
+        min_oi_chg_pct = st.number_input(
+            "Min OI Chg % (Day)",
+            min_value=-100.0,
+            max_value=1000.0,
+            value=None,
+            step=1.0,
+            placeholder="Any (e.g. 5.0)",
+            help="Show stocks with Day OI Chg % >= threshold (leave blank for all).",
+        )
+        oi_buildup_filter = st.multiselect(
+            "OI Buildup (Price Δ vs OI Δ)",
+            options=list(OI_BUILDUP_OPTIONS),
+            default=[],
+            placeholder="All patterns",
+            help="Filter by intraday Price Change vs Day OI Change pattern.",
+        )
+
+    available_sorts = [
+        label for label, (col, _, _) in SORT_OPTIONS.items() if include_oi or not col.startswith("OI")
+    ]
+    sort_by = st.selectbox(
+        "Sort results by",
+        options=available_sorts,
+        index=0,
+        help="Sort scanned results immediately in memory.",
+    )
 
     st.markdown("---")
     auto_refresh = st.checkbox("Auto-refresh", value=False)
@@ -217,6 +304,9 @@ current_filter_state = (
     bool(exclude_gap_down),
     float(gap_threshold),
     int(max_workers),
+    None if min_oi_chg_pct is None else float(min_oi_chg_pct),
+    tuple(oi_buildup_filter),
+    sort_by,
 )
 if (
     st.session_state._last_filter_state is not None
@@ -281,6 +371,88 @@ def _should_auto_scan(
     return False
 
 
+def _filter_and_sort_results(
+    raw_df: pd.DataFrame,
+    min_ratio: float,
+    min_volume: int,
+    exclude_gap_up: bool,
+    exclude_gap_down: bool,
+    gap_threshold: float,
+    include_oi: bool,
+    min_oi_chg_pct: float | None,
+    oi_buildup_filter: tuple[str, ...],
+    sort_by: str,
+) -> tuple[pd.DataFrame, bool, int, bool, int]:
+    """Apply volume, gap, OI threshold/buildup filters and sorting in memory."""
+    if raw_df.empty:
+        return raw_df, False, 0, False, 0
+
+    working_df = raw_df
+    if "Gap_Pct" not in working_df.columns and {"Day_Open", "Prev_Close"}.issubset(working_df.columns):
+        working_df = working_df.copy()
+        valid_prev = working_df["Prev_Close"].notna() & (working_df["Prev_Close"] > 0)
+        working_df["Gap_Pct"] = float("nan")
+        working_df.loc[valid_prev, "Gap_Pct"] = (
+            (working_df.loc[valid_prev, "Day_Open"] - working_df.loc[valid_prev, "Prev_Close"])
+            / working_df.loc[valid_prev, "Prev_Close"]
+        ) * 100
+
+    if include_oi and "OI_Buildup" not in working_df.columns and {"Pct_Change", "OI_Chg"}.issubset(working_df.columns):
+        if working_df is raw_df:
+            working_df = working_df.copy()
+        working_df["OI_Buildup"] = [
+            classify_oi_buildup(pct, oi_c)
+            for pct, oi_c in zip(working_df["Pct_Change"], working_df["OI_Chg"])
+        ]
+
+    base_mask = (working_df["Ratio"] >= min_ratio) & (working_df["Vol_Today"] >= int(min_volume))
+    mask = base_mask.copy()
+
+    gap_missing = False
+    gap_excluded_count = 0
+    if exclude_gap_up or exclude_gap_down:
+        if "Gap_Pct" not in working_df.columns:
+            gap_missing = True
+        else:
+            gap_vals = pd.to_numeric(working_df["Gap_Pct"], errors="coerce")
+            if exclude_gap_up:
+                mask &= gap_vals.isna() | (gap_vals <= gap_threshold)
+            if exclude_gap_down:
+                mask &= gap_vals.isna() | (gap_vals >= -gap_threshold)
+            gap_excluded_count = int(base_mask.sum() - mask.sum())
+
+    oi_missing = False
+    oi_excluded_count = 0
+    if include_oi and (min_oi_chg_pct is not None or oi_buildup_filter):
+        pre_oi_count = int(mask.sum())
+        if min_oi_chg_pct is not None:
+            if "OI_Chg_Pct" not in working_df.columns:
+                oi_missing = True
+            else:
+                oi_pct_vals = pd.to_numeric(working_df["OI_Chg_Pct"], errors="coerce")
+                mask &= oi_pct_vals.notna() & (oi_pct_vals >= float(min_oi_chg_pct))
+        if oi_buildup_filter:
+            if "OI_Buildup" not in working_df.columns:
+                oi_missing = True
+            else:
+                mask &= working_df["OI_Buildup"].isin(oi_buildup_filter)
+        if not oi_missing:
+            oi_excluded_count = pre_oi_count - int(mask.sum())
+
+    df = working_df[mask].copy()
+    sort_col, sort_asc, sort_abs = SORT_OPTIONS.get(sort_by, ("Ratio", False, False))
+    if sort_col in df.columns and not df.empty:
+        df = df.sort_values(
+            sort_col,
+            ascending=sort_asc,
+            key=(lambda s: pd.to_numeric(s, errors="coerce").abs())
+            if sort_abs
+            else (lambda s: pd.to_numeric(s, errors="coerce")),
+            na_position="last",
+        )
+    return df.reset_index(drop=True), gap_missing, gap_excluded_count, oi_missing, oi_excluded_count
+
+
 def render_scanner(
     symbols: list[str],
     min_ratio: float,
@@ -292,6 +464,10 @@ def render_scanner(
     max_workers: int,
     auto_refresh: bool,
     refresh_seconds: int,
+    include_oi: bool = True,
+    min_oi_chg_pct: float | None = None,
+    oi_buildup_filter: tuple[str, ...] = (),
+    sort_by: str = "Ratio (High → Low)",
 ):
     now = datetime.now(IST)
     holidays_set = get_holidays()
@@ -361,6 +537,7 @@ def render_scanner(
                     interval=interval,
                     max_workers=max_workers,
                     prev_day=prev_day,
+                    include_oi=include_oi,
                 )
                 if not raw_df.empty:
                     st.session_state.results_by_interval[interval] = raw_df
@@ -388,52 +565,52 @@ def render_scanner(
         else:
             info_slot.caption("⏸️ **Auto-refresh paused** (market closed). Manual **Scan Now** still works anytime.")
 
-    # Client-side filtering on the cached scan snapshot for the active interval
+    # Client-side filtering & sorting on the cached scan snapshot for the active interval
     raw_df = st.session_state.results_by_interval.get(interval, pd.DataFrame())
     raw_empty_dt = st.session_state._last_scan_empty_by_interval.get(interval)
     empty_scan_dt = raw_empty_dt if (raw_empty_dt is not None and raw_empty_dt.date() == now.date()) else None
-    gap_missing = False
-    gap_excluded_count = 0
-
-    if raw_df.empty:
-        df = raw_df
-    else:
-        working_df = raw_df
-        if "Gap_Pct" not in working_df.columns and {"Day_Open", "Prev_Close"}.issubset(working_df.columns):
-            working_df = working_df.copy()
-            valid_prev = working_df["Prev_Close"].notna() & (working_df["Prev_Close"] > 0)
-            working_df["Gap_Pct"] = float("nan")
-            working_df.loc[valid_prev, "Gap_Pct"] = (
-                (working_df.loc[valid_prev, "Day_Open"] - working_df.loc[valid_prev, "Prev_Close"])
-                / working_df.loc[valid_prev, "Prev_Close"]
-            ) * 100
-
-        base_mask = (working_df["Ratio"] >= min_ratio) & (working_df["Vol_Today"] >= int(min_volume))
-        mask = base_mask.copy()
-
-        if exclude_gap_up or exclude_gap_down:
-            if "Gap_Pct" not in working_df.columns:
-                gap_missing = True
-            else:
-                gap_vals = pd.to_numeric(working_df["Gap_Pct"], errors="coerce")
-                if exclude_gap_up:
-                    mask &= gap_vals.isna() | (gap_vals <= gap_threshold)
-                if exclude_gap_down:
-                    mask &= gap_vals.isna() | (gap_vals >= -gap_threshold)
-                gap_excluded_count = int(base_mask.sum() - mask.sum())
-
-        df = working_df[mask].reset_index(drop=True)
+    df, gap_missing, gap_excluded_count, oi_missing, oi_excluded_count = _filter_and_sort_results(
+        raw_df=raw_df,
+        min_ratio=min_ratio,
+        min_volume=min_volume,
+        exclude_gap_up=exclude_gap_up,
+        exclude_gap_down=exclude_gap_down,
+        gap_threshold=gap_threshold,
+        include_oi=include_oi,
+        min_oi_chg_pct=min_oi_chg_pct,
+        oi_buildup_filter=oi_buildup_filter,
+        sort_by=sort_by,
+    )
 
     with status_slot:
         if last_scan_dt is not None:
             gap_note = ""
             if (exclude_gap_up or exclude_gap_down) and not gap_missing:
                 gap_note = f" | Excluded by gap filter: **{gap_excluded_count}**"
+            oi_filter_note = ""
+            if include_oi and (min_oi_chg_pct is not None or oi_buildup_filter) and not oi_missing:
+                oi_filter_note = f" | Filtered by OI: **{oi_excluded_count}**"
+            oi_meta = raw_df.attrs.get("oi_meta") if include_oi else None
+            oi_note = ""
+            if isinstance(oi_meta, dict):
+                nse_ts = oi_meta.get("nse_timestamp")
+                base_ts = oi_meta.get("baseline_timestamp")
+                win_s = oi_meta.get("window_seconds")
+                if nse_ts and base_ts and win_s:
+                    oi_note = f" | NSE OI @ {nse_ts.split(' ')[-1]} (ΔOI {win_s / 60:.1f}m vs {base_ts.split(' ')[-1]})"
+                elif nse_ts:
+                    elapsed_m = (oi_meta.get("elapsed_since_oldest_seconds") or 0.0) / 60.0
+                    oi_note = f" | NSE OI @ {nse_ts.split(' ')[-1]} (building 5m history: {elapsed_m:.1f}m/3m)"
             st.success(
                 f"Last scan: {last_scan_dt.strftime('%H:%M:%S IST')} "
                 f"({interval} bars) | "
-                f"Showing **{len(df)}** of **{len(raw_df)}** scanned stocks{gap_note}"
+                f"Showing **{len(df)}** of **{len(raw_df)}** scanned stocks{gap_note}{oi_filter_note}{oi_note}"
             )
+            if isinstance(oi_meta, dict) and oi_meta.get("error"):
+                cd = int(round(oi_meta.get("cooldown_seconds") or 0))
+                cd_note = f" (cooling down {cd}s)" if cd > 0 else ""
+                fallback_msg = "using last cached OI snapshot" if oi_meta.get("nse_timestamp") else "OI unavailable"
+                st.warning(f"NSE OI notice: {oi_meta['error']}{cd_note} — {fallback_msg}.")
             if empty_scan_dt is not None and not raw_df.empty:
                 st.warning(
                     f"Latest scan at {empty_scan_dt.strftime('%H:%M:%S IST')} returned no data — "
@@ -442,6 +619,10 @@ def render_scanner(
             if gap_missing:
                 st.warning(
                     "Current results were scanned before Gap % data was added — click **Scan Now** once to apply the gap filter."
+                )
+            if oi_missing:
+                st.warning(
+                    "Current results were scanned without OI data — click **Scan Now** once to apply OI filters."
                 )
         elif empty_scan_dt is not None:
             st.warning(
@@ -512,6 +693,10 @@ scanner_fragment(
     max_workers=max_workers,
     auto_refresh=auto_refresh,
     refresh_seconds=refresh_seconds,
+    include_oi=include_oi,
+    min_oi_chg_pct=None if min_oi_chg_pct is None else float(min_oi_chg_pct),
+    oi_buildup_filter=tuple(oi_buildup_filter),
+    sort_by=sort_by,
 )
 
 st.markdown("---")
