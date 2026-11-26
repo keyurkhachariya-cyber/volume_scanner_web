@@ -34,7 +34,6 @@ DEFAULT_COLUMNS = [
     "OI",
     "OI_Chg",
     "OI_Chg_Pct",
-    "OI_5m_Chg_Pct",
     "OI_Buildup",
     "Last_Bar_Time",
 ]
@@ -50,8 +49,6 @@ ALL_COLUMNS = [
     "OI_Prev",
     "OI_Chg",
     "OI_Chg_Pct",
-    "OI_5m_Chg",
-    "OI_5m_Chg_Pct",
     "OI_Buildup",
     "Last_Bar_Time",
     "Gap_Pct",
@@ -76,8 +73,6 @@ COLUMN_LABELS = {
     "OI_Prev": "Prev OI (Lots)",
     "OI_Chg": "OI Chg (Day)",
     "OI_Chg_Pct": "OI Chg % (Day)",
-    "OI_5m_Chg": "OI Chg (5m)",
-    "OI_5m_Chg_Pct": "OI Chg % (5m)",
     "OI_Buildup": "OI Buildup",
     "Last_Bar_Time": "Last Bar (IST)",
     "Gap_Pct": "Gap %",
@@ -97,8 +92,6 @@ SORT_OPTIONS = {
     "OI Chg % Day (Low → High)": ("OI_Chg_Pct", True, False),
     "|OI Chg %| Day (Largest Moves)": ("OI_Chg_Pct", False, True),
     "OI Chg Lots Day (High → Low)": ("OI_Chg", False, False),
-    "OI Chg % 5m (High → Low)": ("OI_5m_Chg_Pct", False, False),
-    "OI Chg % 5m (Low → High)": ("OI_5m_Chg_Pct", True, False),
     "Price % Chg (High → Low)": ("Pct_Change", False, False),
     "Turnover ₹ Cr (High → Low)": ("Turnover_Cr", False, False),
 }
@@ -114,16 +107,6 @@ COLUMN_CONFIG = {
     "OI_Prev": st.column_config.NumberColumn("Prev OI (Lots)", format="localized"),
     "OI_Chg": st.column_config.NumberColumn("OI Chg (Day)", format="localized"),
     "OI_Chg_Pct": st.column_config.NumberColumn("OI Chg % (Day)", format="%+.2f%%"),
-    "OI_5m_Chg": st.column_config.NumberColumn(
-        "OI Chg (5m)",
-        format="localized",
-        help="Rolling ~5-minute Change in OI from NSE snapshots (populates after 3+ minutes).",
-    ),
-    "OI_5m_Chg_Pct": st.column_config.NumberColumn(
-        "OI Chg % (5m)",
-        format="%+.2f%%",
-        help="Rolling ~5-minute % Change in OI from NSE snapshots (populates after 3+ minutes).",
-    ),
     "OI_Buildup": st.column_config.TextColumn(
         "OI Buildup",
         help="Price Δ vs Day OI Δ classification: Long Buildup, Short Buildup, Short Covering, Long Unwinding.",
@@ -146,8 +129,9 @@ COLUMN_CONFIG = {
 
 @st.cache_resource
 def _run_startup_housekeeping() -> bool:
-    """Prune stale/legacy cache files once per Streamlit server lifecycle."""
+    """Prune stale/legacy cache files and warm holiday calendar asynchronously once per server lifecycle."""
     prune_cache()
+    get_holidays(background_refresh=True)
     return True
 
 
@@ -227,14 +211,20 @@ with st.sidebar:
             "though a forming 5m bar compares against the full previous-day 5m bar until that 5-minute window completes."
         ),
     )
-    max_workers = st.slider("Parallel download threads", 4, 16, 8)
-    include_oi = st.checkbox(
-        "Include NSE OI & 5m ΔOI",
-        value=True,
+    max_workers = st.slider(
+        "Parallel download threads",
+        4,
+        16,
+        8,
         help=(
-            "Fetch aggregate F&O Open Interest from NSE (1 rate-limited request every >=45s with backoff). "
-            "5m ΔOI populates after 3+ minutes of snapshots."
+            "Fallback yfinance thread count (default 8). The primary HTTP/2 async chart fetcher "
+            "automatically runs 3× this value concurrently, capped at 28 (default 8 → 24 async streams)."
         ),
+    )
+    include_oi = st.checkbox(
+        "Include NSE OI",
+        value=True,
+        help="Fetch aggregate F&O Open Interest & Day OI Change from NSE (1 rate-limited request every >=45s with backoff).",
     )
     min_oi_chg_pct = None
     oi_buildup_filter: list[str] = []
@@ -470,8 +460,8 @@ def render_scanner(
     sort_by: str = "Ratio (High → Low)",
 ):
     now = datetime.now(IST)
-    holidays_set = get_holidays()
-    market_open = is_market_open(now)
+    holidays_set = get_holidays(background_refresh=True)
+    market_open = is_market_open(now, background_refresh=True)
 
     last_scan_dt = st.session_state.scan_times_by_interval.get(interval)
     last_scan_started_dt = st.session_state._scan_started_by_interval.get(interval)
@@ -557,7 +547,7 @@ def render_scanner(
 
     if auto_refresh:
         now_after = datetime.now(IST)
-        if is_market_open(now_after):
+        if is_market_open(now_after, background_refresh=True):
             info_slot.caption(
                 f"⏱️ **Auto-refresh active** (every {refresh_seconds}s). "
                 "Updating in the background without full-page reloads."
@@ -594,13 +584,8 @@ def render_scanner(
             oi_note = ""
             if isinstance(oi_meta, dict):
                 nse_ts = oi_meta.get("nse_timestamp")
-                base_ts = oi_meta.get("baseline_timestamp")
-                win_s = oi_meta.get("window_seconds")
-                if nse_ts and base_ts and win_s:
-                    oi_note = f" | NSE OI @ {nse_ts.split(' ')[-1]} (ΔOI {win_s / 60:.1f}m vs {base_ts.split(' ')[-1]})"
-                elif nse_ts:
-                    elapsed_m = (oi_meta.get("elapsed_since_oldest_seconds") or 0.0) / 60.0
-                    oi_note = f" | NSE OI @ {nse_ts.split(' ')[-1]} (building 5m history: {elapsed_m:.1f}m/3m)"
+                if nse_ts:
+                    oi_note = f" | NSE OI @ {nse_ts.split(' ')[-1]}"
             st.success(
                 f"Last scan: {last_scan_dt.strftime('%H:%M:%S IST')} "
                 f"({interval} bars) | "

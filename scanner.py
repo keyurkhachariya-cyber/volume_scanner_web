@@ -1087,7 +1087,7 @@ def _fetch_market_data(
         has_async = False
 
     if has_async:
-        async_concurrency = min(24, max(8, int(max_workers) * 2))
+        async_concurrency = min(28, max(8, int(max_workers) * 3))
         try:
             arrays_by_sym, fallback_syms = _run_coro_sync(
                 lambda: _fetch_charts_async(
@@ -1280,44 +1280,6 @@ def run_scan(
     cutoff = now.time()
     cutoff_sec = _time_to_sec(cutoff)
     today = now.date()
-    if prev_day is None:
-        prev_day = get_previous_trading_day(today)
-    cache_key = (prev_day, interval)
-
-    # 1. Load existing baseline store (memory LRU -> disk) under lock
-    store = _get_or_load_store(cache_key, prev_day, interval)
-
-    neg_set = _get_neg_cached(cache_key)
-    known_set = set(store["symbols"]) | neg_set
-    missing = [sym for sym in symbols if sym not in known_set]
-    missing_set = set(missing)
-
-    gap_days = (today - prev_day).days
-    can_coalesce_range = 0 < gap_days <= (6 if interval == "1m" else 55)
-
-    # 2. Fetch histories in one concurrent wave (coalescing cold prev_day..today via exact start/end)
-    if missing and not can_coalesce_range:
-        # Rare >6-day holiday gap on 1m bars (or >55d on 5m): fetch prev_day explicitly first
-        store = get_previous_day_data(
-            symbols, prev_day, interval=interval, chunk_size=chunk_size, max_workers=max_workers
-        )
-        missing_set = set()
-        neg_set = _get_neg_cached(cache_key)
-
-    # Skip network fetches for symbols sitting in negative cache without any baseline entry
-    skip_today_set = neg_set - set(store["symbol_to_idx"].keys())
-    prev_day_str = prev_day.strftime("%Y-%m-%d")
-    tomorrow_str = (today + timedelta(days=1)).strftime("%Y-%m-%d")
-    symbol_ranges: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
-    symbol_periods: List[Tuple[str, Optional[str]]] = []
-    for sym in symbols:
-        if sym in skip_today_set:
-            continue
-        if sym in missing_set and can_coalesce_range:
-            symbol_periods.append((sym, None))
-            symbol_ranges[sym] = (prev_day_str, tomorrow_str)
-        else:
-            symbol_periods.append((sym, "1d"))
 
     oi_executor: Optional[ThreadPoolExecutor] = None
     oi_future = None
@@ -1326,6 +1288,45 @@ def run_scan(
         oi_future = oi_executor.submit(get_oi_snapshot)
 
     try:
+        if prev_day is None:
+            prev_day = get_previous_trading_day(today)
+        cache_key = (prev_day, interval)
+
+        # 1. Load existing baseline store (memory LRU -> disk) under lock
+        store = _get_or_load_store(cache_key, prev_day, interval)
+
+        neg_set = _get_neg_cached(cache_key)
+        known_set = set(store["symbols"]) | neg_set
+        missing = [sym for sym in symbols if sym not in known_set]
+        missing_set = set(missing)
+
+        gap_days = (today - prev_day).days
+        can_coalesce_range = 0 < gap_days <= (6 if interval == "1m" else 55)
+
+        # 2. Fetch histories in one concurrent wave (coalescing cold prev_day..today via exact start/end)
+        if missing and not can_coalesce_range:
+            # Rare >6-day holiday gap on 1m bars (or >55d on 5m): fetch prev_day explicitly first
+            store = get_previous_day_data(
+                symbols, prev_day, interval=interval, chunk_size=chunk_size, max_workers=max_workers
+            )
+            missing_set = set()
+            neg_set = _get_neg_cached(cache_key)
+
+        # Skip network fetches for symbols sitting in negative cache without any baseline entry
+        skip_today_set = neg_set - set(store["symbol_to_idx"].keys())
+        prev_day_str = prev_day.strftime("%Y-%m-%d")
+        tomorrow_str = (today + timedelta(days=1)).strftime("%Y-%m-%d")
+        symbol_ranges: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
+        symbol_periods: List[Tuple[str, Optional[str]]] = []
+        for sym in symbols:
+            if sym in skip_today_set:
+                continue
+            if sym in missing_set and can_coalesce_range:
+                symbol_periods.append((sym, None))
+                symbol_ranges[sym] = (prev_day_str, tomorrow_str)
+            else:
+                symbol_periods.append((sym, "1d"))
+
         fetched_arrays, failed_syms = _fetch_market_data(
             symbol_periods,
             interval=interval,
@@ -1513,8 +1514,6 @@ def run_scan(
             oi_prev = oi_rec.get("oi_prev")
             oi_chg = oi_rec.get("oi_chg")
             oi_chg_pct = oi_rec.get("oi_chg_pct")
-            oi_5m_chg = oi_rec.get("oi_5m_chg")
-            oi_5m_chg_pct = oi_rec.get("oi_5m_chg_pct")
             oi_chg_rounded = int(round(oi_chg)) if oi_chg is not None else None
             row_data.update(
                 {
@@ -1522,8 +1521,6 @@ def run_scan(
                     "OI_Prev": int(round(oi_prev)) if oi_prev is not None else None,
                     "OI_Chg": oi_chg_rounded,
                     "OI_Chg_Pct": round(oi_chg_pct, 2) if oi_chg_pct is not None else None,
-                    "OI_5m_Chg": int(round(oi_5m_chg)) if oi_5m_chg is not None else None,
-                    "OI_5m_Chg_Pct": round(oi_5m_chg_pct, 2) if oi_5m_chg_pct is not None else None,
                     "OI_Buildup": classify_oi_buildup(row_data["Pct_Change"], oi_chg_rounded),
                 }
             )

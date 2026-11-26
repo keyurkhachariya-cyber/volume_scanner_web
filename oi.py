@@ -1,42 +1,35 @@
 """
-NSE F&O Open Interest (OI) & rolling 5-minute Change in OI helper.
+NSE F&O Open Interest (OI) & Day Change in OI helper.
 
 Uses NSE India's aggregate OI spurts endpoint (1 request covers all F&O underlyings)
 with strict rate-limit safeguards:
 - Single-flight locking & minimum fetch interval (>=45s live, >=5m when market is closed)
 - Persistent curl_cffi browser-impersonated session with automatic Akamai cookie refresh
 - Exponential backoff cooldown (60s -> 600s) on HTTP 403/429/5xx or challenge pages
-- Bounded 30-minute rolling snapshot buffer (persisted atomically in .cache/) for 5m ΔOI
 """
 
-from collections import deque
 from datetime import datetime, date
-import json
 import math
-import os
-from pathlib import Path
 import random
-import tempfile
 import threading
 import time as pytime
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from holidays import IST, is_market_open
 
+try:
+    import orjson as _orjson
+except ImportError:  # pragma: no cover - optional faster JSON parser
+    _orjson = None
+
 _NSE_OI_WARMUP_URL = "https://www.nseindia.com/market-data/oi-spurts"
 _NSE_OI_API_URL = "https://www.nseindia.com/api/live-analysis-oi-spurts-underlyings"
-_DISK_CACHE_FILE = Path(__file__).parent / ".cache" / "nse_oi_history.json"
 
 _MIN_FETCH_INTERVAL_SECONDS = 45.0
 _CLOSED_CACHE_TTL_SECONDS = 300.0
 _SESSION_MAX_AGE_SECONDS = 1800.0
 _BASE_BACKOFF_SECONDS = 60.0
 _MAX_BACKOFF_SECONDS = 600.0
-
-_WINDOW_TARGET_SECONDS = 300.0
-_WINDOW_MIN_SECONDS = 180.0
-_WINDOW_MAX_SECONDS = 540.0
-_HISTORY_RETENTION_SECONDS = 1800.0
 
 _STATE_LOCK = threading.Lock()
 _FETCH_LOCK = threading.Lock()
@@ -48,10 +41,8 @@ _COOLDOWN_UNTIL_MONO: float = 0.0
 _CONSECUTIVE_FAILURES: int = 0
 _LAST_ERROR: Optional[str] = None
 
-_HISTORY_DATE: Optional[date] = None
-# Each entry: (snap_epoch_sec, nse_ts_str, {symbol: {"oi": float, "oi_prev": float, "oi_chg": float, "oi_chg_pct": float}})
-_OI_HISTORY: Deque[Tuple[float, str, Dict[str, Dict[str, Optional[float]]]]] = deque()
-_DISK_LOADED: bool = False
+# Latest cached snapshot: (trading_date, nse_ts_str, {symbol: {"oi", "oi_prev", "oi_chg", "oi_chg_pct"}})
+_CACHED_SNAPSHOT: Optional[Tuple[date, str, Dict[str, Dict[str, Optional[float]]]]] = None
 
 
 def _to_float(val: Any) -> Optional[float]:
@@ -62,6 +53,13 @@ def _to_float(val: Any) -> Optional[float]:
         return num
     except (TypeError, ValueError):
         return None
+
+
+def _decode_json_response(resp: Any) -> Any:
+    raw = getattr(resp, "content", None)
+    if _orjson is not None and raw:
+        return _orjson.loads(raw)
+    return resp.json()
 
 
 def _parse_nse_ts(raw: Optional[str]) -> Optional[datetime]:
@@ -123,69 +121,6 @@ def _create_warmed_session(timeout: int = 6) -> Any:
         raise
 
 
-def _load_disk_history_locked(target_date: date) -> None:
-    global _DISK_LOADED, _HISTORY_DATE
-    if _DISK_LOADED:
-        return
-    _DISK_LOADED = True
-    if not _DISK_CACHE_FILE.exists():
-        return
-    try:
-        payload = json.loads(_DISK_CACHE_FILE.read_text(encoding="utf-8"))
-        cached_date = _parse_nse_date(payload.get("date"))
-        if cached_date != target_date:
-            return
-        snaps = payload.get("snapshots") or []
-        now_epoch = datetime.now(IST).timestamp()
-        cutoff = now_epoch - _HISTORY_RETENTION_SECONDS
-        loaded: List[Tuple[float, str, Dict[str, Dict[str, Optional[float]]]]] = []
-        for item in snaps:
-            ts = _to_float(item.get("ts"))
-            ts_str = str(item.get("ts_str") or "")
-            rows = item.get("rows")
-            if ts is not None and ts >= cutoff and isinstance(rows, dict) and rows:
-                loaded.append((ts, ts_str, rows))
-        if loaded:
-            loaded.sort(key=lambda x: x[0])
-            _HISTORY_DATE = cached_date
-            _OI_HISTORY.clear()
-            _OI_HISTORY.extend(loaded)
-    except Exception:
-        pass
-
-
-def _save_disk_history(
-    hist_date: date,
-    snapshots: List[Tuple[float, str, Dict[str, Dict[str, Optional[float]]]]],
-) -> None:
-    tmp_path: Optional[Path] = None
-    try:
-        _DISK_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "date": hist_date.isoformat(),
-            "snapshots": [
-                {"ts": ts, "ts_str": ts_str, "rows": rows}
-                for ts, ts_str, rows in snapshots
-            ],
-        }
-        fd, raw_tmp = tempfile.mkstemp(
-            dir=str(_DISK_CACHE_FILE.parent),
-            prefix=".tmp_oi_hist_",
-            suffix=".json",
-        )
-        tmp_path = Path(raw_tmp)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(payload, f)
-            f.flush()
-        os.replace(tmp_path, _DISK_CACHE_FILE)
-    except Exception:
-        if tmp_path is not None:
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-
-
 def _parse_oi_payload(
     payload: Any,
 ) -> Tuple[Optional[date], float, str, Dict[str, Dict[str, Optional[float]]]]:
@@ -234,65 +169,19 @@ def _build_snapshot_result_locked(
     error_msg: Optional[str] = None,
 ) -> Dict[str, Any]:
     cooldown_s = max(0.0, _COOLDOWN_UNTIL_MONO - now_mono)
-    if not _OI_HISTORY:
+    if _CACHED_SNAPSHOT is None:
         return {
             "by_symbol": {},
             "nse_timestamp": None,
-            "baseline_timestamp": None,
-            "window_seconds": None,
-            "elapsed_since_oldest_seconds": 0.0,
             "from_cache": from_cache,
             "cooldown_seconds": cooldown_s,
             "error": error_msg,
         }
 
-    cur_ts, cur_ts_str, cur_rows = _OI_HISTORY[-1]
-    oldest_ts = _OI_HISTORY[0][0]
-    elapsed_oldest = max(0.0, cur_ts - oldest_ts)
-
-    best_base: Optional[Tuple[float, str, Dict[str, Dict[str, Optional[float]]]]] = None
-    best_dist = float("inf")
-    for hist_entry in _OI_HISTORY:
-        age = cur_ts - hist_entry[0]
-        if _WINDOW_MIN_SECONDS <= age <= _WINDOW_MAX_SECONDS:
-            dist = abs(age - _WINDOW_TARGET_SECONDS)
-            if dist < best_dist:
-                best_dist = dist
-                best_base = hist_entry
-
-    base_rows = best_base[2] if best_base is not None else None
-    base_ts_str = best_base[1] if best_base is not None else None
-    window_seconds = (cur_ts - best_base[0]) if best_base is not None else None
-
-    by_symbol: Dict[str, Dict[str, Optional[float]]] = {}
-    for sym, cur_rec in cur_rows.items():
-        oi_val = cur_rec.get("oi")
-        oi_5m_chg: Optional[float] = None
-        oi_5m_chg_pct: Optional[float] = None
-
-        if base_rows is not None and oi_val is not None:
-            base_rec = base_rows.get(sym)
-            base_oi = base_rec.get("oi") if base_rec is not None else None
-            if base_oi is not None:
-                oi_5m_chg = oi_val - base_oi
-                if base_oi > 0:
-                    oi_5m_chg_pct = (oi_5m_chg / base_oi) * 100.0
-
-        by_symbol[sym] = {
-            "oi": oi_val,
-            "oi_prev": cur_rec.get("oi_prev"),
-            "oi_chg": cur_rec.get("oi_chg"),
-            "oi_chg_pct": cur_rec.get("oi_chg_pct"),
-            "oi_5m_chg": oi_5m_chg,
-            "oi_5m_chg_pct": oi_5m_chg_pct,
-        }
-
+    _, cur_ts_str, cur_rows = _CACHED_SNAPSHOT
     return {
-        "by_symbol": by_symbol,
+        "by_symbol": cur_rows,
         "nse_timestamp": cur_ts_str,
-        "baseline_timestamp": base_ts_str,
-        "window_seconds": window_seconds,
-        "elapsed_since_oldest_seconds": elapsed_oldest,
         "from_cache": from_cache,
         "cooldown_seconds": cooldown_s,
         "error": error_msg,
@@ -328,7 +217,7 @@ def _fetch_nse_oi_raw(timeout: int = 6) -> Any:
     if resp.status_code != 200:
         raise RuntimeError(f"NSE OI HTTP {resp.status_code}")
 
-    return resp.json()
+    return _decode_json_response(resp)
 
 
 def get_oi_snapshot(
@@ -337,22 +226,20 @@ def get_oi_snapshot(
     timeout: int = 6,
 ) -> Dict[str, Any]:
     """
-    Fetch latest NSE F&O OI & rolling 5-minute Change in OI with strict rate-limit protection.
+    Fetch latest NSE F&O OI & Day Change in OI with strict rate-limit protection.
     Returns dict with keys:
-      by_symbol, nse_timestamp, baseline_timestamp, window_seconds,
-      elapsed_since_oldest_seconds, from_cache, cooldown_seconds, error.
+      by_symbol, nse_timestamp, from_cache, cooldown_seconds, error.
     """
-    global _LAST_FETCH_MONO, _COOLDOWN_UNTIL_MONO, _CONSECUTIVE_FAILURES, _LAST_ERROR, _HISTORY_DATE
+    global _LAST_FETCH_MONO, _COOLDOWN_UNTIL_MONO, _CONSECUTIVE_FAILURES, _LAST_ERROR, _CACHED_SNAPSHOT
 
     now_ist = datetime.now(IST)
-    today_ist = now_ist.date()
     market_open = is_market_open(now_ist)
     effective_min_interval = max(float(min_interval_seconds), _MIN_FETCH_INTERVAL_SECONDS)
 
     def _can_serve_cached(now_mono: float) -> Optional[Dict[str, Any]]:
         if now_mono < _COOLDOWN_UNTIL_MONO:
             return _build_snapshot_result_locked(now_mono, from_cache=True, error_msg=_LAST_ERROR)
-        if _OI_HISTORY and _LAST_FETCH_MONO > 0.0:
+        if _CACHED_SNAPSHOT is not None and _LAST_FETCH_MONO > 0.0:
             age = now_mono - _LAST_FETCH_MONO
             if not force_refresh and age < effective_min_interval:
                 return _build_snapshot_result_locked(now_mono, from_cache=True)
@@ -361,7 +248,6 @@ def get_oi_snapshot(
         return None
 
     with _STATE_LOCK:
-        _load_disk_history_locked(today_ist)
         cached = _can_serve_cached(pytime.monotonic())
         if cached is not None:
             return cached
@@ -374,7 +260,7 @@ def get_oi_snapshot(
 
         try:
             payload = _fetch_nse_oi_raw(timeout=timeout)
-            trading_date, snap_ts, nse_ts_str, rows = _parse_oi_payload(payload)
+            trading_date, _, nse_ts_str, rows = _parse_oi_payload(payload)
         except Exception as exc:
             with _STATE_LOCK:
                 _close_session_locked()
@@ -388,31 +274,13 @@ def get_oi_snapshot(
                 _LAST_ERROR = str(exc)
                 return _build_snapshot_result_locked(now_mono, from_cache=True, error_msg=_LAST_ERROR)
 
-        disk_snapshot: Optional[List[Tuple[float, str, Dict[str, Dict[str, Optional[float]]]]]] = None
         with _STATE_LOCK:
             _CONSECUTIVE_FAILURES = 0
             _COOLDOWN_UNTIL_MONO = 0.0
             _LAST_ERROR = None
             _LAST_FETCH_MONO = pytime.monotonic()
-
-            if _HISTORY_DATE != trading_date:
-                _OI_HISTORY.clear()
-                _HISTORY_DATE = trading_date
-
-            cutoff = snap_ts - _HISTORY_RETENTION_SECONDS
-            while _OI_HISTORY and _OI_HISTORY[0][0] < cutoff:
-                _OI_HISTORY.popleft()
-
-            if not _OI_HISTORY or snap_ts > _OI_HISTORY[-1][0]:
-                _OI_HISTORY.append((snap_ts, nse_ts_str, rows))
-                disk_snapshot = list(_OI_HISTORY)
-
-            result = _build_snapshot_result_locked(_LAST_FETCH_MONO, from_cache=False)
-
-        if disk_snapshot is not None:
-            _save_disk_history(trading_date, disk_snapshot)
-
-        return result
+            _CACHED_SNAPSHOT = (trading_date, nse_ts_str, rows)
+            return _build_snapshot_result_locked(_LAST_FETCH_MONO, from_cache=False)
 
 
 OI_BUILDUP_OPTIONS: Tuple[str, ...] = (
