@@ -211,14 +211,30 @@ class AppOiUiTest(unittest.TestCase):
             self.assertEqual(mock_scan.call_count, 1)
             self.assertEqual(list(at.exception), [])
             rendered_df = at.dataframe[0].value
-            self.assertIn("Signal", rendered_df.columns)
-            self.assertIn("Vol_Burst_15m", rendered_df.columns)
-            self.assertIn("From_Open_Pct", rendered_df.columns)
-            self.assertIn("VWAP_Dist_Pct", rendered_df.columns)
-            self.assertIn("Range_Pos_Pct", rendered_df.columns)
-            self.assertIn("OI_Chg", rendered_df.columns)
-            self.assertIn("OI_Buildup", rendered_df.columns)
-            self.assertNotIn("OI_5m_Chg_Pct", rendered_df.columns)
+            self.assertEqual(
+                list(rendered_df.columns),
+                [
+                    "Signal",
+                    "Symbol",
+                    "LTP",
+                    "Ratio",
+                    "Vol_Burst_15m",
+                    "Pct_Change",
+                    "From_Open_Pct",
+                    "VWAP_Dist_Pct",
+                    "Range_Pos_Pct",
+                    "OI_Chg_Pct",
+                    "OI_Buildup",
+                ],
+            )
+            import table_config
+
+            for hidden_col in ("Vol_Today", "Vol_Prev_Same_Time", "OI", "OI_Chg", "Last_Bar_Time"):
+                self.assertNotIn(hidden_col, rendered_df.columns)
+                self.assertIn(hidden_col, table_config.ALL_COLUMNS)
+            for removed_col in ("OI_Prev", "VWAP", "Prev_Close", "Day_Open", "Day_High", "Day_Low", "Vol_Diff", "Prev_Full_Vol"):
+                self.assertNotIn(removed_col, table_config.ALL_COLUMNS)
+            self.assertEqual(len(table_config.ALL_COLUMNS), 19)
             self.assertEqual(list(rendered_df["Symbol"]), ["HDFCBANK", "NONFNO", "RELIANCE", "INFY", "TCS", "SBIN"])
             self.assertTrue(any("🟢 Bullish" in m.value and "**1**" in m.value for m in at.markdown))
 

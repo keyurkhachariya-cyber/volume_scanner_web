@@ -62,6 +62,10 @@ if "scan_times_by_interval" not in st.session_state:
     st.session_state.scan_times_by_interval = {}
 if "selected_columns" not in st.session_state:
     st.session_state.selected_columns = DEFAULT_COLUMNS.copy()
+else:
+    st.session_state.selected_columns = [
+        c for c in st.session_state.selected_columns if c in ALL_COLUMNS
+    ]
 if "_skip_auto_scan_once" not in st.session_state:
     st.session_state._skip_auto_scan_once = False
 if "_last_filter_state" not in st.session_state:
@@ -479,6 +483,9 @@ def render_scanner(
             if table_df.empty:
                 st.info(f"No **{sig_choice}** stocks matched the current scan and filters.")
             else:
+                st.session_state.selected_columns = [
+                    c for c in st.session_state.selected_columns if c in ALL_COLUMNS
+                ]
                 with st.popover("⚙️ Customize Columns"):
                     st.multiselect(
                         "Visible columns (add, remove, or reorder)",
