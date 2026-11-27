@@ -38,7 +38,7 @@ except ImportError:  # pragma: no cover - fallback for older yfinance versions
     _yf_new_session = None
 
 from holidays import get_previous_trading_day, IST
-from oi import classify_oi_buildup, get_oi_snapshot
+from oi import classify_oi_buildup, classify_trade_signal, get_oi_snapshot
 
 MARKET_OPEN = time(9, 15)
 _MARKET_OPEN_SEC = 9 * 3600 + 15 * 60
@@ -1515,13 +1515,19 @@ def run_scan(
             oi_chg = oi_rec.get("oi_chg")
             oi_chg_pct = oi_rec.get("oi_chg_pct")
             oi_chg_rounded = int(round(oi_chg)) if oi_chg is not None else None
+            oi_chg_pct_rounded = round(oi_chg_pct, 2) if oi_chg_pct is not None else None
             row_data.update(
                 {
                     "OI": int(round(oi_val)) if oi_val is not None else None,
                     "OI_Prev": int(round(oi_prev)) if oi_prev is not None else None,
                     "OI_Chg": oi_chg_rounded,
-                    "OI_Chg_Pct": round(oi_chg_pct, 2) if oi_chg_pct is not None else None,
+                    "OI_Chg_Pct": oi_chg_pct_rounded,
                     "OI_Buildup": classify_oi_buildup(row_data["Pct_Change"], oi_chg_rounded),
+                    "Signal": classify_trade_signal(
+                        row_data["Ratio"],
+                        oi_chg_pct_rounded,
+                        row_data["Pct_Change"],
+                    ),
                 }
             )
         results.append(row_data)

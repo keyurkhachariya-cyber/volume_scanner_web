@@ -315,3 +315,41 @@ def classify_oi_buildup(
     if p == 0.0 or o == 0.0:
         return "Neutral"
     return _OI_BUILDUP_QUADRANTS[(p > 0.0, o > 0.0)]
+
+
+SIGNAL_BULLISH = "🟢 Bullish"
+SIGNAL_BEARISH = "🔴 Bearish"
+SIGNAL_NEUTRAL = "—"
+
+
+def classify_trade_signal(
+    ratio: Optional[float],
+    oi_chg_pct: Optional[float],
+    pct_change: Optional[float],
+    min_ratio: float = 1.0,
+    min_oi_chg_pct: float = 10.0,
+    min_price_chg_pct: float = 1.5,
+) -> str:
+    """
+    Classify Bullish / Bearish setup when all three criteria hold strictly:
+    - Ratio > min_ratio (higher volume till now vs previous day till same time)
+    - OI Chg % (Day) > min_oi_chg_pct (+10% fresh buildup)
+    - Pct_Change > +min_price_chg_pct (Bullish) or < -min_price_chg_pct (Bearish)
+    """
+    if ratio is None or oi_chg_pct is None or pct_change is None:
+        return SIGNAL_NEUTRAL
+    try:
+        r = float(ratio)
+        o = float(oi_chg_pct)
+        p = float(pct_change)
+    except (TypeError, ValueError):
+        return SIGNAL_NEUTRAL
+    if math.isnan(r) or math.isnan(o) or math.isnan(p):
+        return SIGNAL_NEUTRAL
+    if r <= min_ratio or o <= min_oi_chg_pct:
+        return SIGNAL_NEUTRAL
+    if p > min_price_chg_pct:
+        return SIGNAL_BULLISH
+    if p < -min_price_chg_pct:
+        return SIGNAL_BEARISH
+    return SIGNAL_NEUTRAL

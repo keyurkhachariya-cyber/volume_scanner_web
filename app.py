@@ -3,6 +3,8 @@ Relative Volume Scanner (F&O Stocks) - Streamlit Web App
 Today's cumulative volume till now vs Previous day's volume till same time.
 """
 
+from __future__ import annotations
+
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, time
 import streamlit as st
@@ -11,7 +13,13 @@ import pandas as pd
 from universe import get_fno_universe
 from scanner import prune_cache, run_scan
 from holidays import get_holidays, is_market_open, get_previous_trading_day, IST
-from oi import OI_BUILDUP_OPTIONS, classify_oi_buildup
+from oi import (
+    OI_BUILDUP_OPTIONS,
+    SIGNAL_BEARISH,
+    SIGNAL_BULLISH,
+    classify_oi_buildup,
+    classify_trade_signal,
+)
 
 MARKET_CLOSE_TIME = time(15, 30)
 
@@ -25,6 +33,7 @@ st.title("📈 F&O Relative Volume Scanner")
 st.caption("Today's volume till now vs Previous trading day volume till same clock time (IST)")
 
 DEFAULT_COLUMNS = [
+    "Signal",
     "Symbol",
     "LTP",
     "Vol_Today",
@@ -39,6 +48,7 @@ DEFAULT_COLUMNS = [
 ]
 
 ALL_COLUMNS = [
+    "Signal",
     "Symbol",
     "LTP",
     "Vol_Today",
@@ -63,6 +73,7 @@ ALL_COLUMNS = [
 ]
 
 COLUMN_LABELS = {
+    "Signal": "Signal",
     "Symbol": "Symbol",
     "LTP": "LTP",
     "Vol_Today": "Vol Today (till now)",
@@ -88,6 +99,7 @@ COLUMN_LABELS = {
 
 SORT_OPTIONS = {
     "Ratio (High → Low)": ("Ratio", False, False),
+    "Signal (Bullish / Bearish first)": ("Signal", False, False),
     "OI Chg % Day (High → Low)": ("OI_Chg_Pct", False, False),
     "OI Chg % Day (Low → High)": ("OI_Chg_Pct", True, False),
     "|OI Chg %| Day (Largest Moves)": ("OI_Chg_Pct", False, True),
@@ -97,6 +109,10 @@ SORT_OPTIONS = {
 }
 
 COLUMN_CONFIG = {
+    "Signal": st.column_config.TextColumn(
+        "Signal",
+        help="🟢 Bullish: Ratio > 1.0×, OI Chg > +10%, % Chg > +1.5% | 🔴 Bearish: Ratio > 1.0×, OI Chg > +10%, % Chg < -1.5%",
+    ),
     "Symbol": st.column_config.TextColumn("Symbol", width="medium"),
     "LTP": st.column_config.NumberColumn("LTP", format="%.2f"),
     "Vol_Today": st.column_config.NumberColumn("Vol Today (till now)", format="localized"),
@@ -247,7 +263,9 @@ with st.sidebar:
         )
 
     available_sorts = [
-        label for label, (col, _, _) in SORT_OPTIONS.items() if include_oi or not col.startswith("OI")
+        label
+        for label, (col, _, _) in SORT_OPTIONS.items()
+        if include_oi or (not col.startswith("OI") and col != "Signal")
     ]
     sort_by = st.selectbox(
         "Sort results by",
@@ -361,6 +379,29 @@ def _should_auto_scan(
     return False
 
 
+_SIGNAL_RANK = {SIGNAL_BULLISH: 0, SIGNAL_BEARISH: 1}
+_SIGNAL_ROW_CSS = {
+    SIGNAL_BULLISH: ("background-color: rgba(16, 185, 129, 0.16);", "color: #10b981; font-weight: 600;"),
+    SIGNAL_BEARISH: ("background-color: rgba(239, 68, 68, 0.16);", "color: #ef4444; font-weight: 600;"),
+}
+_SIGNAL_ACCENT_COLS = {"Signal", "Pct_Change", "OI_Chg_Pct", "OI_Buildup"}
+
+
+def _style_scanner_df(display_df: pd.DataFrame, signals: pd.Series):
+    """Apply translucent green/red row highlights and text accents for Bullish/Bearish rows."""
+    sig_map = dict(zip(display_df.index, signals))
+    cols = list(display_df.columns)
+
+    def _row_styles(row: pd.Series) -> list[str]:
+        styles = _SIGNAL_ROW_CSS.get(sig_map.get(row.name))
+        if styles is None:
+            return [""] * len(cols)
+        bg_css, accent_css = styles
+        return [bg_css + (accent_css if col in _SIGNAL_ACCENT_COLS else "") for col in cols]
+
+    return display_df.style.apply(_row_styles, axis=1)
+
+
 def _filter_and_sort_results(
     raw_df: pd.DataFrame,
     min_ratio: float,
@@ -393,6 +434,14 @@ def _filter_and_sort_results(
         working_df["OI_Buildup"] = [
             classify_oi_buildup(pct, oi_c)
             for pct, oi_c in zip(working_df["Pct_Change"], working_df["OI_Chg"])
+        ]
+
+    if include_oi and "Signal" not in working_df.columns and {"Ratio", "OI_Chg_Pct", "Pct_Change"}.issubset(working_df.columns):
+        if working_df is raw_df:
+            working_df = working_df.copy()
+        working_df["Signal"] = [
+            classify_trade_signal(r, o, p)
+            for r, o, p in zip(working_df["Ratio"], working_df["OI_Chg_Pct"], working_df["Pct_Change"])
         ]
 
     base_mask = (working_df["Ratio"] >= min_ratio) & (working_df["Vol_Today"] >= int(min_volume))
@@ -432,14 +481,21 @@ def _filter_and_sort_results(
     df = working_df[mask].copy()
     sort_col, sort_asc, sort_abs = SORT_OPTIONS.get(sort_by, ("Ratio", False, False))
     if sort_col in df.columns and not df.empty:
-        df = df.sort_values(
-            sort_col,
-            ascending=sort_asc,
-            key=(lambda s: pd.to_numeric(s, errors="coerce").abs())
-            if sort_abs
-            else (lambda s: pd.to_numeric(s, errors="coerce")),
-            na_position="last",
-        )
+        if sort_col == "Signal":
+            df = (
+                df.assign(_sig_rank=df["Signal"].map(_SIGNAL_RANK).fillna(2))
+                .sort_values(["_sig_rank", "Ratio"], ascending=[True, False], na_position="last")
+                .drop(columns=["_sig_rank"])
+            )
+        else:
+            df = df.sort_values(
+                sort_col,
+                ascending=sort_asc,
+                key=(lambda s: pd.to_numeric(s, errors="coerce").abs())
+                if sort_abs
+                else (lambda s: pd.to_numeric(s, errors="coerce")),
+                na_position="last",
+            )
     return df.reset_index(drop=True), gap_missing, gap_excluded_count, oi_missing, oi_excluded_count
 
 
@@ -624,41 +680,79 @@ def render_scanner(
             elif not raw_df.empty:
                 st.warning("No stocks matched the current filters. Try lowering the Minimum Ratio or Volume.")
         else:
-            with st.popover("⚙️ Customize Columns"):
-                st.multiselect(
-                    "Visible columns (add, remove, or reorder)",
-                    options=ALL_COLUMNS,
-                    format_func=lambda col: COLUMN_LABELS.get(col, col),
-                    key="selected_columns",
-                    on_change=_mark_ui_interaction,
-                )
-                st.button("Reset to Default", on_click=_reset_default_columns)
+            has_signals = include_oi and ("Signal" in df.columns)
+            table_df = df
+            sig_choice = "All"
+            if has_signals:
+                bullish_count = int((df["Signal"] == SIGNAL_BULLISH).sum())
+                bearish_count = int((df["Signal"] == SIGNAL_BEARISH).sum())
+                total_count = len(df)
+                col_sig_summary, col_sig_pills = st.columns([3, 2], vertical_alignment="center")
+                with col_sig_summary:
+                    st.markdown(
+                        f"**Signals:** &nbsp;{SIGNAL_BULLISH}: **{bullish_count}** &nbsp;|&nbsp; "
+                        f"{SIGNAL_BEARISH}: **{bearish_count}** &nbsp;|&nbsp; **All:** {total_count}"
+                    )
+                    st.caption("Highlight rule: Ratio > 1.0×, OI Chg > +10%, % Chg > +1.5% / < -1.5%")
+                with col_sig_pills:
+                    sig_choice = (
+                        st.segmented_control(
+                            "Quick Signal Filter",
+                            options=["All", SIGNAL_BULLISH, SIGNAL_BEARISH],
+                            default="All",
+                            selection_mode="single",
+                            label_visibility="collapsed",
+                            key="quick_signal_filter",
+                            on_change=_mark_ui_interaction,
+                        )
+                        or "All"
+                    )
+                if sig_choice in (SIGNAL_BULLISH, SIGNAL_BEARISH):
+                    table_df = df[df["Signal"] == sig_choice].reset_index(drop=True)
 
-            visible_cols = [c for c in st.session_state.selected_columns if c in df.columns]
-            if not visible_cols:
-                st.warning("Select at least one column in **Customize Columns** to display results.")
+            if table_df.empty:
+                st.info(f"No **{sig_choice}** stocks matched the current scan and filters.")
             else:
-                display_df = df[visible_cols]
-                active_config = {c: COLUMN_CONFIG[c] for c in visible_cols if c in COLUMN_CONFIG}
+                with st.popover("⚙️ Customize Columns"):
+                    st.multiselect(
+                        "Visible columns (add, remove, or reorder)",
+                        options=ALL_COLUMNS,
+                        format_func=lambda col: COLUMN_LABELS.get(col, col),
+                        key="selected_columns",
+                        on_change=_mark_ui_interaction,
+                    )
+                    st.button("Reset to Default", on_click=_reset_default_columns)
 
-                st.dataframe(
-                    display_df,
-                    width="stretch",
-                    hide_index=True,
-                    column_config=active_config,
-                    key="scanner_table",
-                )
+                visible_cols = [c for c in st.session_state.selected_columns if c in table_df.columns]
+                if not visible_cols:
+                    st.warning("Select at least one column in **Customize Columns** to display results.")
+                else:
+                    display_df = table_df[visible_cols]
+                    active_config = {c: COLUMN_CONFIG[c] for c in visible_cols if c in COLUMN_CONFIG}
+                    table_data = (
+                        _style_scanner_df(display_df, table_df["Signal"])
+                        if has_signals
+                        else display_df
+                    )
 
-                csv = display_df.to_csv(index=False).encode("utf-8")
-                csv_ts = (last_scan_dt or now).strftime("%Y%m%d_%H%M")
-                st.download_button(
-                    "⬇️ Download CSV",
-                    data=csv,
-                    file_name=f"relative_volume_{interval}_{csv_ts}.csv",
-                    mime="text/csv",
-                    key=f"download_csv_{interval}",
-                    on_click="ignore",
-                )
+                    st.dataframe(
+                        table_data,
+                        width="stretch",
+                        hide_index=True,
+                        column_config=active_config,
+                        key="scanner_table",
+                    )
+
+                    csv = display_df.to_csv(index=False).encode("utf-8")
+                    csv_ts = (last_scan_dt or now).strftime("%Y%m%d_%H%M")
+                    st.download_button(
+                        "⬇️ Download CSV",
+                        data=csv,
+                        file_name=f"relative_volume_{interval}_{csv_ts}.csv",
+                        mime="text/csv",
+                        key=f"download_csv_{interval}",
+                        on_click="ignore",
+                    )
 
 
 # Bind fragment dynamically with run_every when auto_refresh is enabled
