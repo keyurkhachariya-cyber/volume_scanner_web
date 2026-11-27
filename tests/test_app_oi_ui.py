@@ -354,7 +354,7 @@ class AppOiUiTest(unittest.TestCase):
             buildup_ms.set_value(["Short Covering"]).run()
             self.assertEqual(list(at.dataframe[0].value["Symbol"]), ["INFY"])
 
-    def test_upstox_data_source_sidebar_controls(self):
+    def test_upstox_and_fivepaisa_data_source_sidebar_controls(self):
         at = AppTest.from_file(os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")), "app.py"), default_timeout=15)
         with patch.object(universe, "get_fno_universe", return_value=(["RELIANCE.NS"], "Mock")):
             at.run()
@@ -363,6 +363,14 @@ class AppOiUiTest(unittest.TestCase):
             self.assertEqual(list(at.exception), [])
             self.assertTrue(any(t.label == "Upstox Access Token (Daily)" for t in at.text_input))
             self.assertTrue(any(c.label.startswith("Stream Live WSS") for c in at.checkbox))
+
+            src_ctrl = [c for c in at.segmented_control if c.label == "Data Source"][0]
+            src_ctrl.set_value("5paisa Xstream").run()
+            self.assertEqual(list(at.exception), [])
+            self.assertTrue(any(t.label == "5paisa Access Token (Daily)" for t in at.text_input))
+            self.assertTrue(any(t.label == "5paisa Client Code" for t in at.text_input))
+            self.assertTrue(any(c.label == "Stream Live WSS (MarketFeedV3)" for c in at.checkbox))
+            self.assertTrue(any(b.label == "Login via TOTP & Save Token" for b in at.button))
 
 
 if __name__ == "__main__":

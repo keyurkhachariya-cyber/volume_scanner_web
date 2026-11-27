@@ -14,11 +14,16 @@ from scanner import prune_cache, run_scan
 from holidays import get_holidays, is_market_open, get_previous_trading_day, IST
 from oi import OI_BUILDUP_OPTIONS, SIGNAL_BEARISH, SIGNAL_BULLISH
 from providers import (
+    FivePaisaProvider,
     UpstoxProvider,
     YahooProvider,
+    build_fivepaisa_login_url,
     build_upstox_login_url,
+    exchange_fivepaisa_request_token,
     exchange_upstox_auth_code,
+    login_fivepaisa_totp,
 )
+from providers.fivepaisa_stream import stop_fivepaisa_stream
 from providers.upstox_stream import stop_upstox_stream
 from screener_filters import (
     MARKET_CLOSE_TIME,
@@ -63,18 +68,27 @@ if "universe_symbols" not in st.session_state:
     st.session_state.universe_symbols = syms
     st.session_state.universe_source = src
 
-def _get_upstox_secret(field: str, default: str = "") -> str:
-    """Safely read Upstox config from st.secrets['upstox'] or UPSTOX_* env vars."""
-    env_key = f"UPSTOX_{field.upper()}"
+def _get_broker_secret(section: str, field: str, default: str = "") -> str:
+    """Safely read broker config from st.secrets[section] or <SECTION>_<FIELD> env vars."""
+    env_key = f"{section.upper()}_{field.upper()}"
     try:
         secrets_obj = getattr(st, "secrets", None)
-        if secrets_obj is not None and "upstox" in secrets_obj:
-            val = secrets_obj["upstox"].get(field)
+        if secrets_obj is not None and section in secrets_obj:
+            val = secrets_obj[section].get(field)
             if isinstance(val, str) and val.strip():
                 return val.strip()
     except Exception:
         pass
     return (os.environ.get(env_key) or default).strip()
+
+
+def _snapshot_key(interval: str, data_source: str) -> str:
+    """Return isolated session snapshot cache key per interval and market data provider."""
+    if data_source == "Upstox v3":
+        return f"{interval}__upstox"
+    if data_source == "5paisa Xstream":
+        return f"{interval}__fivepaisa"
+    return interval
 
 
 # Session state initialization (keyed per snapshot_key so switching 1m/5m or Yahoo/Upstox preserves snapshots)
@@ -103,24 +117,32 @@ if "_last_interval" not in st.session_state:
 if "_scan_started_by_interval" not in st.session_state:
     st.session_state._scan_started_by_interval = {}
 if "upstox_access_token" not in st.session_state:
-    st.session_state.upstox_access_token = _get_upstox_secret("access_token")
+    st.session_state.upstox_access_token = _get_broker_secret("upstox", "access_token")
+if "fivepaisa_access_token" not in st.session_state:
+    st.session_state.fivepaisa_access_token = _get_broker_secret("fivepaisa", "access_token")
+if "fivepaisa_client_code" not in st.session_state:
+    st.session_state.fivepaisa_client_code = _get_broker_secret("fivepaisa", "client_code")
 
 # Sidebar controls
 with st.sidebar:
     st.header("Settings")
     data_source_raw = st.segmented_control(
         "Data Source",
-        options=["Yahoo Finance", "Upstox v3"],
+        options=["Yahoo Finance", "Upstox v3", "5paisa Xstream"],
         default="Yahoo Finance",
         selection_mode="single",
         key="data_source_choice",
-        help="Use free Yahoo Finance (no login) or Upstox v3 (daily token + real-time WebSocket stream).",
+        help="Use free Yahoo Finance (no login), Upstox v3, or 5paisa Xstream (daily token + real-time WebSocket stream).",
     )
-    use_upstox = data_source_raw == "Upstox v3"
-    data_source = "Upstox v3" if use_upstox else "Yahoo Finance"
+    data_source = data_source_raw if data_source_raw in ("Upstox v3", "5paisa Xstream") else "Yahoo Finance"
+    use_upstox = data_source == "Upstox v3"
+    use_fivepaisa = data_source == "5paisa Xstream"
 
     upstox_token = ""
     upstox_live_ws = True
+    fivepaisa_token = ""
+    fivepaisa_client_code = ""
+    fivepaisa_live_ws = True
     if use_upstox:
         upstox_token = st.text_input(
             "Upstox Access Token (Daily)",
@@ -143,18 +165,18 @@ with st.sidebar:
         with st.expander("🔑 Daily Login Helper (OAuth Code)", expanded=False):
             u_cid = st.text_input(
                 "API Key (client_id)",
-                value=_get_upstox_secret("client_id"),
+                value=_get_broker_secret("upstox", "client_id"),
                 key="upstox_client_id",
             )
             u_csec = st.text_input(
                 "API Secret",
-                value=_get_upstox_secret("client_secret"),
+                value=_get_broker_secret("upstox", "client_secret"),
                 type="password",
                 key="upstox_client_secret",
             )
             u_redir = st.text_input(
                 "Redirect URI",
-                value=_get_upstox_secret("redirect_uri", "http://localhost:8501"),
+                value=_get_broker_secret("upstox", "redirect_uri", "http://localhost:8501"),
                 key="upstox_redirect_uri",
             )
             if u_cid.strip() and u_redir.strip():
@@ -176,6 +198,116 @@ with st.sidebar:
                         st.success("Upstox token saved for today's session.")
                     else:
                         st.error(err or "Upstox token exchange failed.")
+    elif use_fivepaisa:
+        fivepaisa_token = st.text_input(
+            "5paisa Access Token (Daily)",
+            value=st.session_state.fivepaisa_access_token,
+            type="password",
+            placeholder="Paste today's JWT access_token or use TOTP Login below",
+            help="5paisa JWT access tokens expire daily. Generate one via TOTP/PIN or OAuth below.",
+        ).strip()
+        if fivepaisa_token != st.session_state.fivepaisa_access_token:
+            st.session_state.fivepaisa_access_token = fivepaisa_token
+
+        fivepaisa_client_code = st.text_input(
+            "5paisa Client Code",
+            value=st.session_state.fivepaisa_client_code,
+            placeholder="e.g. 50011110",
+            help="Required for MarketFeedV3 WebSocket subscriptions (auto-inferred from JWT if omitted).",
+        ).strip()
+        if fivepaisa_client_code != st.session_state.fivepaisa_client_code:
+            st.session_state.fivepaisa_client_code = fivepaisa_client_code
+
+        fivepaisa_live_ws = st.checkbox(
+            "Stream Live WSS (MarketFeedV3)",
+            value=True,
+            help="Stream live NSE MarketFeedV3 ticks over WebSocket (up to 3,000 scrips, 50/batch).",
+        )
+        if not fivepaisa_live_ws and fivepaisa_token:
+            stop_fivepaisa_stream(fivepaisa_token, fivepaisa_client_code)
+
+        with st.expander("🔑 Daily Login Helper (TOTP / OAuth)", expanded=False):
+            fp_user_key = st.text_input(
+                "User Key (VendorKey)",
+                value=_get_broker_secret("fivepaisa", "user_key"),
+                key="fp_user_key",
+            )
+            fp_enc_key = st.text_input(
+                "Encryption Key",
+                value=_get_broker_secret("fivepaisa", "encryption_key"),
+                type="password",
+                key="fp_enc_key",
+            )
+            fp_user_id = st.text_input(
+                "User ID",
+                value=_get_broker_secret("fivepaisa", "user_id"),
+                key="fp_user_id",
+            )
+            tab_totp, tab_oauth = st.tabs(["TOTP + PIN", "OAuth Redirect"])
+            with tab_totp:
+                fp_cc = st.text_input(
+                    "Client Code",
+                    value=fivepaisa_client_code or _get_broker_secret("fivepaisa", "client_code"),
+                    key="fp_totp_client_code",
+                )
+                fp_pin = st.text_input(
+                    "Trading PIN",
+                    value=_get_broker_secret("fivepaisa", "pin"),
+                    type="password",
+                    key="fp_totp_pin",
+                )
+                fp_totp_val = st.text_input(
+                    "TOTP (6-digit code or Base32 Secret)",
+                    value=_get_broker_secret("fivepaisa", "totp_secret"),
+                    type="password",
+                    key="fp_totp_secret_or_code",
+                )
+                if st.button("Login via TOTP & Save Token", width="stretch"):
+                    if not (fp_cc.strip() and fp_pin.strip() and fp_totp_val.strip() and fp_user_key.strip() and fp_enc_key.strip() and fp_user_id.strip()):
+                        st.warning("Fill User Key, Encryption Key, User ID, Client Code, PIN, and TOTP.")
+                    else:
+                        tok, ccode, err = login_fivepaisa_totp(
+                            fp_cc, fp_totp_val, fp_pin, fp_user_key, fp_enc_key, fp_user_id
+                        )
+                        if tok:
+                            st.session_state.fivepaisa_access_token = tok
+                            fivepaisa_token = tok
+                            if ccode:
+                                st.session_state.fivepaisa_client_code = ccode
+                                fivepaisa_client_code = ccode
+                            st.success("5paisa token generated via TOTP for today's session.")
+                        else:
+                            st.error(err or "5paisa TOTP login failed.")
+            with tab_oauth:
+                fp_redir = st.text_input(
+                    "Response URL",
+                    value=_get_broker_secret("fivepaisa", "redirect_uri", "http://localhost:8501"),
+                    key="fp_redirect_uri",
+                )
+                if fp_user_key.strip() and fp_redir.strip():
+                    fp_login_url = build_fivepaisa_login_url(fp_user_key, fp_redir)
+                    st.markdown(f"[Open 5paisa Daily Login]({fp_login_url})")
+                fp_req_tok = st.text_input(
+                    "RequestToken (from callback URL)",
+                    value="",
+                    key="fp_request_token",
+                )
+                if st.button("Exchange RequestToken", width="stretch"):
+                    if not (fp_req_tok.strip() and fp_user_key.strip() and fp_enc_key.strip() and fp_user_id.strip()):
+                        st.warning("Fill User Key, Encryption Key, User ID, and RequestToken.")
+                    else:
+                        tok, ccode, err = exchange_fivepaisa_request_token(
+                            fp_req_tok, fp_user_key, fp_enc_key, fp_user_id
+                        )
+                        if tok:
+                            st.session_state.fivepaisa_access_token = tok
+                            fivepaisa_token = tok
+                            if ccode:
+                                st.session_state.fivepaisa_client_code = ccode
+                                fivepaisa_client_code = ccode
+                            st.success("5paisa token saved for today's session.")
+                        else:
+                            st.error(err or "5paisa RequestToken exchange failed.")
     min_ratio = st.number_input(
         "Minimum Ratio (Today / Prev)",
         min_value=0.5,
@@ -307,14 +439,15 @@ with st.sidebar:
         )
 
     st.markdown("---")
+    live_ws_active = (use_upstox and upstox_live_ws) or (use_fivepaisa and fivepaisa_live_ws)
     auto_refresh = st.checkbox("Auto-refresh", value=False)
-    refresh_seconds = 10 if (use_upstox and upstox_live_ws) else 60
+    refresh_seconds = 10 if live_ws_active else 60
     if auto_refresh:
-        refresh_opts = [5, 10, 30, 60, 120, 300] if (use_upstox and upstox_live_ws) else [30, 60, 120, 300]
+        refresh_opts = [5, 10, 30, 60, 120, 300] if live_ws_active else [30, 60, 120, 300]
         refresh_seconds = st.selectbox(
             "Auto-refresh interval",
             options=refresh_opts,
-            index=1 if (use_upstox and upstox_live_ws) else 1,
+            index=1,
             format_func=lambda s: f"{s} seconds" if s < 60 else f"{s // 60} minute{'s' if s > 60 else ''}",
             help="Interval between automated background updates while NSE is open.",
         )
@@ -337,9 +470,10 @@ with st.sidebar:
         f"Source: {st.session_state.universe_source}"
     )
 
-snapshot_key = interval if not use_upstox else f"{interval}__upstox"
+snapshot_key = _snapshot_key(interval, data_source)
 
 # Detect sidebar filter/config tweaks so changing filters never hijacks into a network scan
+_source_state = False if data_source == "Yahoo Finance" else (True if use_upstox else "fivepaisa")
 current_filter_state = (
     float(min_ratio),
     int(min_volume),
@@ -348,7 +482,7 @@ current_filter_state = (
     float(gap_threshold),
     int(max_workers),
     bool(include_oi),
-    bool(use_upstox),
+    _source_state,
     None if min_oi_chg_pct is None else float(min_oi_chg_pct),
     tuple(oi_buildup_filter),
     sort_by,
@@ -426,12 +560,14 @@ def render_scanner(
     data_source: str = "Yahoo Finance",
     upstox_token: str = "",
     upstox_live_ws: bool = True,
+    fivepaisa_token: str = "",
+    fivepaisa_client_code: str = "",
+    fivepaisa_live_ws: bool = True,
 ):
     now = datetime.now(IST)
     holidays_set = get_holidays(background_refresh=True)
     market_open = is_market_open(now, background_refresh=True)
-    use_upstox = data_source == "Upstox v3"
-    snapshot_key = interval if not use_upstox else f"{interval}__upstox"
+    snapshot_key = _snapshot_key(interval, data_source)
 
     last_scan_dt = st.session_state.scan_times_by_interval.get(snapshot_key)
     last_scan_started_dt = st.session_state._scan_started_by_interval.get(snapshot_key)
@@ -487,8 +623,7 @@ def render_scanner(
 
     if should_scan:
         with status_slot:
-            source_label = "Upstox v3" if use_upstox else "Yahoo Finance"
-            with st.spinner(f"Scanning {len(symbols)} F&O stocks ({source_label}, {interval} bars)..."):
+            with st.spinner(f"Scanning {len(symbols)} F&O stocks ({data_source}, {interval} bars)..."):
                 scan_started_dt = datetime.now(IST)
                 scan_kwargs = {
                     "symbols": symbols,
@@ -499,10 +634,16 @@ def render_scanner(
                     "prev_day": prev_day,
                     "include_oi": include_oi,
                 }
-                if use_upstox:
+                if data_source == "Upstox v3":
                     scan_kwargs["provider"] = UpstoxProvider(
                         access_token=upstox_token,
                         use_live_ws=upstox_live_ws,
+                    )
+                elif data_source == "5paisa Xstream":
+                    scan_kwargs["provider"] = FivePaisaProvider(
+                        access_token=fivepaisa_token,
+                        client_code=fivepaisa_client_code,
+                        use_live_ws=fivepaisa_live_ws,
                     )
                 raw_df = run_scan(**scan_kwargs)
                 if not raw_df.empty:
@@ -656,12 +797,15 @@ def render_scanner(
                     oi_note = f" | NSE OI @ {nse_ts.split(' ')[-1]}"
             prov_meta = raw_df.attrs.get("provider_meta")
             prov_note = ""
-            if isinstance(prov_meta, dict) and prov_meta.get("provider") == "upstox":
+            prov_labels = {"upstox": "Upstox", "fivepaisa": "5paisa"}
+            prov_id = prov_meta.get("provider") if isinstance(prov_meta, dict) else None
+            if prov_id in prov_labels:
+                p_name = prov_labels[prov_id]
                 if prov_meta.get("mode") == "wss":
                     ws_badge = "🟢 WSS" if prov_meta.get("ws_connected") else "🟡 WSS"
-                    prov_note = f" | Upstox {ws_badge} ({prov_meta.get('ticks', 0)} ticks)"
+                    prov_note = f" | {p_name} {ws_badge} ({prov_meta.get('ticks', 0)} ticks)"
                 else:
-                    prov_note = " | Upstox REST"
+                    prov_note = f" | {p_name} REST"
             if sig_choice in (SIGNAL_BULLISH, SIGNAL_BEARISH):
                 count_summary = (
                     f"Showing **{len(table_df)}** {sig_choice} of **{len(df)}** matching "
@@ -675,7 +819,8 @@ def render_scanner(
                 f"{count_summary}{gap_note}{oi_filter_note}{mom_filter_note}{oi_note}{prov_note}"
             )
             if isinstance(prov_meta, dict) and prov_meta.get("error"):
-                st.warning(f"Upstox notice: {prov_meta['error']}")
+                p_label = prov_labels.get(prov_id, data_source)
+                st.warning(f"{p_label} notice: {prov_meta['error']}")
             if isinstance(oi_meta, dict) and oi_meta.get("error"):
                 cd = int(round(oi_meta.get("cooldown_seconds") or 0))
                 cd_note = f" (cooling down {cd}s)" if cd > 0 else ""
@@ -701,7 +846,8 @@ def render_scanner(
         elif empty_scan_dt is not None:
             last_prov_meta = st.session_state.get(f"_last_provider_meta_{snapshot_key}")
             if isinstance(last_prov_meta, dict) and last_prov_meta.get("error"):
-                st.warning(f"Upstox error: {last_prov_meta['error']}")
+                err_label = {"upstox": "Upstox", "fivepaisa": "5paisa"}.get(last_prov_meta.get("provider"), data_source)
+                st.warning(f"{err_label} error: {last_prov_meta['error']}")
             else:
                 st.warning(
                     f"Scan at {empty_scan_dt.strftime('%H:%M:%S IST')} returned no intraday data for today "
@@ -736,10 +882,13 @@ scanner_fragment(
     data_source=data_source,
     upstox_token=upstox_token,
     upstox_live_ws=upstox_live_ws,
+    fivepaisa_token=fivepaisa_token,
+    fivepaisa_client_code=fivepaisa_client_code,
+    fivepaisa_live_ws=fivepaisa_live_ws,
 )
 
 st.markdown("---")
 st.caption(
-    "Data sources: Yahoo Finance or Upstox v3 (intraday OHLCV / live WSS) & NSE India (F&O OI & holidays). "
+    "Data sources: Yahoo Finance, Upstox v3, or 5paisa Xstream (intraday OHLCV / live WSS) & NSE India (F&O OI & holidays). "
     "For educational / research purposes only — not investment advice."
 )

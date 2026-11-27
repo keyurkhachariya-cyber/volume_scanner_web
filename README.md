@@ -2,11 +2,11 @@
 
 Compares **today's cumulative volume from 09:15 IST till now** with the **previous trading day's cumulative volume till the same clock time**, combined with **NSE F&O Open Interest buildup** and intraday momentum quality metrics.
 
-Built with Streamlit + pluggable market data providers (**Yahoo Finance** HTTP/2 + `yfinance` fallback, or **Upstox API v3** REST + live `MarketDataStreamerV3` WebSocket) + `orjson` + NumPy baseline caching.
+Built with Streamlit + pluggable market data providers (**Yahoo Finance** HTTP/2 + `yfinance` fallback, **Upstox API v3** REST + live `MarketDataStreamerV3` WebSocket, or **5paisa Xstream** V2 REST + live `MarketFeedV3` WebSocket) + `orjson` + NumPy baseline caching.
 
 ## Features
-- Pluggable data sources in the sidebar: **Yahoo Finance** (zero login) or **Upstox v3** (historical/intraday v3 candles + real-time **Live WSS** streaming)
-- Official NSE F&O equity universe (~218 stocks) with one-click live NSE sync and cached Upstox `NSE.json.gz` equity key mapping
+- Pluggable data sources in the sidebar: **Yahoo Finance** (zero login), **Upstox v3** (OAuth daily token + **Live WSS**), or **5paisa Xstream** (TOTP/OAuth daily token + **Live WSS**)
+- Official NSE F&O equity universe (~218 stocks) with one-click live NSE sync and cached Upstox `NSE.json.gz` / 5paisa ScripMaster equity key mappings
 - 1-minute (or 5-minute) bars via multiplexed HTTP/2 `AsyncSession` fetching & isolated per-provider `.cache/` v2 NumPy baselines
 - Intraday momentum metrics: **15m Vol Burst**, **From Open %**, **VWAP Dist %**, and **Range Pos %**
 - Live NSE aggregate F&O Open Interest: **OI**, **OI Chg (Day)**, **OI Chg %**, and **OI Buildup** (`Long Buildup`, `Short Buildup`, `Short Covering`, `Long Unwinding`)
@@ -60,17 +60,16 @@ The app will open in your browser (usually `http://localhost:8501`).
 python -m unittest discover -s tests -v
 ```
 
-### Using Upstox v3 (Optional Live WSS)
-1. Switch **Data Source** in the sidebar to **Upstox v3**.
-2. Paste today's Upstox **Access Token** (or open **Daily Login Helper (OAuth Code)** with your Upstox API Key/Secret, or configure `st.secrets["upstox"]` / `UPSTOX_ACCESS_TOKEN`).
-3. Leave **Stream Live WSS (`MarketDataStreamerV3`)** checked for real-time full-quote updates (supports 5s–10s auto-refresh with zero repeated candle polling).
+### Using Upstox v3 or 5paisa Xstream (Optional Live WSS)
+- **Upstox v3:** Switch **Data Source** to **Upstox v3**, paste today's **Access Token** (or use **Daily Login Helper (OAuth Code)** / `st.secrets["upstox"]`), and leave **Stream Live WSS (`MarketDataStreamerV3`)** checked.
+- **5paisa Xstream:** Switch **Data Source** to **5paisa Xstream**, paste today's JWT **Access Token** + **Client Code** (or use **Daily Login Helper (TOTP / OAuth)** for one-click TOTP+PIN headless login / `st.secrets["fivepaisa"]`), and leave **Stream Live WSS (`MarketFeedV3`)** checked.
 
 ## Project Structure
 - `app.py` — Streamlit UI layout, sidebar controls, and auto-refresh fragment
 - `table_config.py` — Column schemas, labels, sort options, pinned columns, and column guide
 - `screener_filters.py` — Pure filtering, sorting, row styling, and auto-refresh schedule logic
 - `scanner.py` — Intraday bar summarization (`VWAP`, `Vol_Burst_15m`) and scan orchestration
-- `providers/` — Pluggable `MarketDataProvider` adapters (`yahoo_provider.py`, `upstox_provider.py`, `upstox_stream.py`, `upstox_instruments.py`)
+- `providers/` — Pluggable `MarketDataProvider` adapters (`yahoo_provider.py`, `upstox_*.py`, `fivepaisa_*.py`, `stream_base.py`)
 - `baseline_cache.py` — Vectorized v2 NumPy previous-day volume matrix and `.cache/` persistence
 - `yahoo_client.py` — Async HTTP/2 Yahoo Chart API client and `yfinance` thread-pool fallback
 - `oi.py` — Rate-limited NSE aggregate F&O Open Interest fetcher and Signal/Buildup classifiers
