@@ -252,11 +252,12 @@ class AppOiUiTest(unittest.TestCase):
             self.assertEqual(list(at.dataframe[0].value["Symbol"])[:2], ["RELIANCE", "SBIN"])
 
             # Quick-toggle segmented_control to 🔴 Bearish -> only SBIN and status count stays synced
-            at.segmented_control[0].set_value("🔴 Bearish").run()
+            sig_pills = [c for c in at.segmented_control if c.label == "Quick Signal Filter"][0]
+            sig_pills.set_value("🔴 Bearish").run()
             self.assertEqual(mock_scan.call_count, 1)
             self.assertEqual(list(at.dataframe[0].value["Symbol"]), ["SBIN"])
             self.assertTrue(any("Showing **1** 🔴 Bearish of **6** matching" in s.value for s in at.success))
-            at.segmented_control[0].set_value("All").run()
+            [c for c in at.segmented_control if c.label == "Quick Signal Filter"][0].set_value("All").run()
 
             # Sort by largest |OI Chg %| Day moves -> HDFCBANK (-25%) then RELIANCE (+20%) then SBIN (+14%)
             sort_sb = [s for s in at.selectbox if s.label == "Sort results by"][0]
@@ -343,15 +344,25 @@ class AppOiUiTest(unittest.TestCase):
             at.run()
             [b for b in at.button if "Scan Now" in b.label][0].click().run()
             self.assertIn("Signal", at.dataframe[0].value.columns)
-            at.segmented_control[0].set_value("🟢 Bullish").run()
+            [c for c in at.segmented_control if c.label == "Quick Signal Filter"][0].set_value("🟢 Bullish").run()
             self.assertEqual(list(at.dataframe[0].value["Symbol"]), ["RELIANCE"])
-            at.segmented_control[0].set_value("All").run()
+            [c for c in at.segmented_control if c.label == "Quick Signal Filter"][0].set_value("All").run()
             sort_sb = [s for s in at.selectbox if s.label == "Sort results by"][0]
             sort_sb.set_value("OI Chg Lots Day (High → Low)").run()
             self.assertEqual(list(at.exception), [])
             buildup_ms = [m for m in at.multiselect if m.label == "OI Buildup (Price Δ vs OI Δ)"][0]
             buildup_ms.set_value(["Short Covering"]).run()
             self.assertEqual(list(at.dataframe[0].value["Symbol"]), ["INFY"])
+
+    def test_upstox_data_source_sidebar_controls(self):
+        at = AppTest.from_file(os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")), "app.py"), default_timeout=15)
+        with patch.object(universe, "get_fno_universe", return_value=(["RELIANCE.NS"], "Mock")):
+            at.run()
+            src_ctrl = [c for c in at.segmented_control if c.label == "Data Source"][0]
+            src_ctrl.set_value("Upstox v3").run()
+            self.assertEqual(list(at.exception), [])
+            self.assertTrue(any(t.label == "Upstox Access Token (Daily)" for t in at.text_input))
+            self.assertTrue(any(c.label.startswith("Stream Live WSS") for c in at.checkbox))
 
 
 if __name__ == "__main__":

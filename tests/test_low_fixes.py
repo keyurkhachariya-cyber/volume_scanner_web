@@ -64,7 +64,7 @@ class LowFixesTest(unittest.TestCase):
         st_stub = MagicMock()
         st_stub.session_state = SessionState(
             scan_times_by_interval={"1m": datetime(2026, 11, 25, 10, 0, tzinfo=h.IST)},
-            _last_filter_state=(1.5, 50000, False, False, 0.5, 8, False, None, (), "Ratio (High → Low)", None),
+            _last_filter_state=(1.5, 50000, False, False, 0.5, 8, False, False, None, (), "Ratio (High → Low)", None),
             _last_interval="1m",
         )
         st_stub.cache_resource = lambda fn: fn

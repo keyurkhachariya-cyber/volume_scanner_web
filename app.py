@@ -5,6 +5,7 @@ Today's cumulative volume till now vs Previous day's volume till same time.
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+import os
 import streamlit as st
 import pandas as pd
 
@@ -12,6 +13,13 @@ from universe import get_fno_universe
 from scanner import prune_cache, run_scan
 from holidays import get_holidays, is_market_open, get_previous_trading_day, IST
 from oi import OI_BUILDUP_OPTIONS, SIGNAL_BEARISH, SIGNAL_BULLISH
+from providers import (
+    UpstoxProvider,
+    YahooProvider,
+    build_upstox_login_url,
+    exchange_upstox_auth_code,
+)
+from providers.upstox_stream import stop_upstox_stream
 from screener_filters import (
     MARKET_CLOSE_TIME,
     filter_and_sort_results,
@@ -55,7 +63,21 @@ if "universe_symbols" not in st.session_state:
     st.session_state.universe_symbols = syms
     st.session_state.universe_source = src
 
-# Session state initialization (keyed per bar interval so switching 1m/5m preserves snapshots)
+def _get_upstox_secret(field: str, default: str = "") -> str:
+    """Safely read Upstox config from st.secrets['upstox'] or UPSTOX_* env vars."""
+    env_key = f"UPSTOX_{field.upper()}"
+    try:
+        secrets_obj = getattr(st, "secrets", None)
+        if secrets_obj is not None and "upstox" in secrets_obj:
+            val = secrets_obj["upstox"].get(field)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+    except Exception:
+        pass
+    return (os.environ.get(env_key) or default).strip()
+
+
+# Session state initialization (keyed per snapshot_key so switching 1m/5m or Yahoo/Upstox preserves snapshots)
 if "results_by_interval" not in st.session_state:
     st.session_state.results_by_interval = {}
 if "scan_times_by_interval" not in st.session_state:
@@ -80,10 +102,80 @@ if "_last_interval" not in st.session_state:
     st.session_state._last_interval = None
 if "_scan_started_by_interval" not in st.session_state:
     st.session_state._scan_started_by_interval = {}
+if "upstox_access_token" not in st.session_state:
+    st.session_state.upstox_access_token = _get_upstox_secret("access_token")
 
 # Sidebar controls
 with st.sidebar:
     st.header("Settings")
+    data_source_raw = st.segmented_control(
+        "Data Source",
+        options=["Yahoo Finance", "Upstox v3"],
+        default="Yahoo Finance",
+        selection_mode="single",
+        key="data_source_choice",
+        help="Use free Yahoo Finance (no login) or Upstox v3 (daily token + real-time WebSocket stream).",
+    )
+    use_upstox = data_source_raw == "Upstox v3"
+    data_source = "Upstox v3" if use_upstox else "Yahoo Finance"
+
+    upstox_token = ""
+    upstox_live_ws = True
+    if use_upstox:
+        upstox_token = st.text_input(
+            "Upstox Access Token (Daily)",
+            value=st.session_state.upstox_access_token,
+            type="password",
+            placeholder="Paste today's Upstox access_token",
+            help="Upstox tokens expire daily. Paste today's token or use the OAuth Login Helper below.",
+        ).strip()
+        if upstox_token != st.session_state.upstox_access_token:
+            st.session_state.upstox_access_token = upstox_token
+
+        upstox_live_ws = st.checkbox(
+            "Stream Live WSS (MarketDataStreamerV3)",
+            value=True,
+            help="Stream live full-quote ticks over WebSocket (zero REST polling once initialized).",
+        )
+        if not upstox_live_ws and upstox_token:
+            stop_upstox_stream(upstox_token)
+
+        with st.expander("🔑 Daily Login Helper (OAuth Code)", expanded=False):
+            u_cid = st.text_input(
+                "API Key (client_id)",
+                value=_get_upstox_secret("client_id"),
+                key="upstox_client_id",
+            )
+            u_csec = st.text_input(
+                "API Secret",
+                value=_get_upstox_secret("client_secret"),
+                type="password",
+                key="upstox_client_secret",
+            )
+            u_redir = st.text_input(
+                "Redirect URI",
+                value=_get_upstox_secret("redirect_uri", "http://localhost:8501"),
+                key="upstox_redirect_uri",
+            )
+            if u_cid.strip() and u_redir.strip():
+                login_url = build_upstox_login_url(u_cid, u_redir)
+                st.markdown(f"[Open Upstox Daily Login]({login_url})")
+            u_code = st.text_input(
+                "Auth Code (from redirect ?code=...)",
+                value="",
+                key="upstox_auth_code",
+            )
+            if st.button("Exchange Code for Token", width="stretch"):
+                if not (u_code.strip() and u_cid.strip() and u_csec.strip() and u_redir.strip()):
+                    st.warning("Fill API Key, API Secret, Redirect URI, and Auth Code.")
+                else:
+                    tok, err = exchange_upstox_auth_code(u_code, u_cid, u_csec, u_redir)
+                    if tok:
+                        st.session_state.upstox_access_token = tok
+                        upstox_token = tok
+                        st.success("Upstox token saved for today's session.")
+                    else:
+                        st.error(err or "Upstox token exchange failed.")
     min_ratio = st.number_input(
         "Minimum Ratio (Today / Prev)",
         min_value=0.5,
@@ -216,14 +308,15 @@ with st.sidebar:
 
     st.markdown("---")
     auto_refresh = st.checkbox("Auto-refresh", value=False)
-    refresh_seconds = 60
+    refresh_seconds = 10 if (use_upstox and upstox_live_ws) else 60
     if auto_refresh:
+        refresh_opts = [5, 10, 30, 60, 120, 300] if (use_upstox and upstox_live_ws) else [30, 60, 120, 300]
         refresh_seconds = st.selectbox(
             "Auto-refresh interval",
-            options=[30, 60, 120, 300],
-            index=1,
+            options=refresh_opts,
+            index=1 if (use_upstox and upstox_live_ws) else 1,
             format_func=lambda s: f"{s} seconds" if s < 60 else f"{s // 60} minute{'s' if s > 60 else ''}",
-            help="Interval between automated background scans while NSE is open.",
+            help="Interval between automated background updates while NSE is open.",
         )
     st.markdown("---")
     if st.button("🔄 Sync NSE F&O List", width="stretch"):
@@ -244,6 +337,8 @@ with st.sidebar:
         f"Source: {st.session_state.universe_source}"
     )
 
+snapshot_key = interval if not use_upstox else f"{interval}__upstox"
+
 # Detect sidebar filter/config tweaks so changing filters never hijacks into a network scan
 current_filter_state = (
     float(min_ratio),
@@ -253,6 +348,7 @@ current_filter_state = (
     float(gap_threshold),
     int(max_workers),
     bool(include_oi),
+    bool(use_upstox),
     None if min_oi_chg_pct is None else float(min_oi_chg_pct),
     tuple(oi_buildup_filter),
     sort_by,
@@ -265,12 +361,12 @@ if (
     st.session_state._skip_auto_scan_once = True
 elif (
     st.session_state._last_interval is not None
-    and st.session_state._last_interval != interval
-    and interval in st.session_state.scan_times_by_interval
+    and st.session_state._last_interval != snapshot_key
+    and snapshot_key in st.session_state.scan_times_by_interval
 ):
     st.session_state._skip_auto_scan_once = True
 st.session_state._last_filter_state = current_filter_state
-st.session_state._last_interval = interval
+st.session_state._last_interval = snapshot_key
 
 
 def _mark_ui_interaction() -> None:
@@ -327,17 +423,22 @@ def render_scanner(
     oi_buildup_filter: tuple[str, ...] = (),
     sort_by: str = "Ratio (High → Low)",
     momentum_filter_state: tuple[bool, bool, int, float] | None = None,
+    data_source: str = "Yahoo Finance",
+    upstox_token: str = "",
+    upstox_live_ws: bool = True,
 ):
     now = datetime.now(IST)
     holidays_set = get_holidays(background_refresh=True)
     market_open = is_market_open(now, background_refresh=True)
+    use_upstox = data_source == "Upstox v3"
+    snapshot_key = interval if not use_upstox else f"{interval}__upstox"
 
-    last_scan_dt = st.session_state.scan_times_by_interval.get(interval)
-    last_scan_started_dt = st.session_state._scan_started_by_interval.get(interval)
+    last_scan_dt = st.session_state.scan_times_by_interval.get(snapshot_key)
+    last_scan_started_dt = st.session_state._scan_started_by_interval.get(snapshot_key)
     skip_once = bool(st.session_state._skip_auto_scan_once)
     st.session_state._skip_auto_scan_once = False
 
-    attempt_rec = st.session_state._post_close_attempts_by_interval.get(interval)
+    attempt_rec = st.session_state._post_close_attempts_by_interval.get(snapshot_key)
     post_close_attempts = attempt_rec[1] if (attempt_rec and attempt_rec[0] == now.date()) else 0
 
     should_scan = False
@@ -386,30 +487,39 @@ def render_scanner(
 
     if should_scan:
         with status_slot:
-            with st.spinner(f"Scanning {len(symbols)} F&O stocks ({interval} bars)..."):
+            source_label = "Upstox v3" if use_upstox else "Yahoo Finance"
+            with st.spinner(f"Scanning {len(symbols)} F&O stocks ({source_label}, {interval} bars)..."):
                 scan_started_dt = datetime.now(IST)
-                # Fetch unfiltered snapshot so sidebar filter changes apply instantly in memory
-                raw_df = run_scan(
-                    symbols=symbols,
-                    min_ratio=0.0,
-                    min_volume=0,
-                    interval=interval,
-                    max_workers=max_workers,
-                    prev_day=prev_day,
-                    include_oi=include_oi,
-                )
+                scan_kwargs = {
+                    "symbols": symbols,
+                    "min_ratio": 0.0,
+                    "min_volume": 0,
+                    "interval": interval,
+                    "max_workers": max_workers,
+                    "prev_day": prev_day,
+                    "include_oi": include_oi,
+                }
+                if use_upstox:
+                    scan_kwargs["provider"] = UpstoxProvider(
+                        access_token=upstox_token,
+                        use_live_ws=upstox_live_ws,
+                    )
+                raw_df = run_scan(**scan_kwargs)
                 if not raw_df.empty:
-                    st.session_state.results_by_interval[interval] = raw_df
+                    st.session_state.results_by_interval[snapshot_key] = raw_df
                     last_scan_dt = datetime.now(IST)
-                    st.session_state.scan_times_by_interval[interval] = last_scan_dt
-                    st.session_state._scan_started_by_interval[interval] = scan_started_dt
-                    st.session_state._last_scan_empty_by_interval.pop(interval, None)
+                    st.session_state.scan_times_by_interval[snapshot_key] = last_scan_dt
+                    st.session_state._scan_started_by_interval[snapshot_key] = scan_started_dt
+                    st.session_state._last_scan_empty_by_interval.pop(snapshot_key, None)
                     if not market_open:
-                        st.session_state._post_close_attempts_by_interval.pop(interval, None)
+                        st.session_state._post_close_attempts_by_interval.pop(snapshot_key, None)
                 else:
-                    st.session_state._last_scan_empty_by_interval[interval] = datetime.now(IST)
+                    st.session_state._last_scan_empty_by_interval[snapshot_key] = datetime.now(IST)
+                    empty_meta = raw_df.attrs.get("provider_meta")
+                    if isinstance(empty_meta, dict):
+                        st.session_state[f"_last_provider_meta_{snapshot_key}"] = empty_meta
                     if not scan_clicked and not market_open and now.time() > MARKET_CLOSE_TIME:
-                        st.session_state._post_close_attempts_by_interval[interval] = (
+                        st.session_state._post_close_attempts_by_interval[snapshot_key] = (
                             now.date(),
                             post_close_attempts + 1,
                         )
@@ -424,9 +534,9 @@ def render_scanner(
         else:
             info_slot.caption("⏸️ **Auto-refresh paused** (market closed). Manual **Scan Now** still works anytime.")
 
-    # Client-side filtering & sorting on the cached scan snapshot for the active interval
-    raw_df = st.session_state.results_by_interval.get(interval, pd.DataFrame())
-    raw_empty_dt = st.session_state._last_scan_empty_by_interval.get(interval)
+    # Client-side filtering & sorting on the cached scan snapshot for the active source & interval
+    raw_df = st.session_state.results_by_interval.get(snapshot_key, pd.DataFrame())
+    raw_empty_dt = st.session_state._last_scan_empty_by_interval.get(snapshot_key)
     empty_scan_dt = raw_empty_dt if (raw_empty_dt is not None and raw_empty_dt.date() == now.date()) else None
     df, gap_missing, gap_excluded_count, oi_missing, oi_excluded_count, momentum_missing, momentum_excluded_count = _filter_and_sort_results(
         raw_df=raw_df,
@@ -544,6 +654,14 @@ def render_scanner(
                 nse_ts = oi_meta.get("nse_timestamp")
                 if nse_ts:
                     oi_note = f" | NSE OI @ {nse_ts.split(' ')[-1]}"
+            prov_meta = raw_df.attrs.get("provider_meta")
+            prov_note = ""
+            if isinstance(prov_meta, dict) and prov_meta.get("provider") == "upstox":
+                if prov_meta.get("mode") == "wss":
+                    ws_badge = "🟢 WSS" if prov_meta.get("ws_connected") else "🟡 WSS"
+                    prov_note = f" | Upstox {ws_badge} ({prov_meta.get('ticks', 0)} ticks)"
+                else:
+                    prov_note = " | Upstox REST"
             if sig_choice in (SIGNAL_BULLISH, SIGNAL_BEARISH):
                 count_summary = (
                     f"Showing **{len(table_df)}** {sig_choice} of **{len(df)}** matching "
@@ -554,8 +672,10 @@ def render_scanner(
             st.success(
                 f"Last scan: {last_scan_dt.strftime('%H:%M:%S IST')} "
                 f"({interval} bars) | "
-                f"{count_summary}{gap_note}{oi_filter_note}{mom_filter_note}{oi_note}"
+                f"{count_summary}{gap_note}{oi_filter_note}{mom_filter_note}{oi_note}{prov_note}"
             )
+            if isinstance(prov_meta, dict) and prov_meta.get("error"):
+                st.warning(f"Upstox notice: {prov_meta['error']}")
             if isinstance(oi_meta, dict) and oi_meta.get("error"):
                 cd = int(round(oi_meta.get("cooldown_seconds") or 0))
                 cd_note = f" (cooling down {cd}s)" if cd > 0 else ""
@@ -579,12 +699,16 @@ def render_scanner(
                     "Current results were scanned before VWAP / 15m Vol Burst metrics were added — click **Scan Now** once to apply all momentum filters."
                 )
         elif empty_scan_dt is not None:
-            st.warning(
-                f"Scan at {empty_scan_dt.strftime('%H:%M:%S IST')} returned no intraday data for today "
-                "(market may be pre-open, closed, or Yahoo Finance has no bars yet)."
-            )
+            last_prov_meta = st.session_state.get(f"_last_provider_meta_{snapshot_key}")
+            if isinstance(last_prov_meta, dict) and last_prov_meta.get("error"):
+                st.warning(f"Upstox error: {last_prov_meta['error']}")
+            else:
+                st.warning(
+                    f"Scan at {empty_scan_dt.strftime('%H:%M:%S IST')} returned no intraday data for today "
+                    "(market may be pre-open, closed, or the data feed has no bars yet)."
+                )
         elif st.session_state.results_by_interval:
-            st.info(f"No **{interval}** snapshot yet — click **Scan Now** to fetch {interval} bars.")
+            st.info(f"No **{data_source} ({interval})** snapshot yet — click **Scan Now** to fetch {interval} bars.")
 
 
 # Bind fragment dynamically with run_every when auto_refresh is enabled
@@ -609,10 +733,13 @@ scanner_fragment(
     oi_buildup_filter=tuple(oi_buildup_filter),
     sort_by=sort_by,
     momentum_filter_state=momentum_filter_state,
+    data_source=data_source,
+    upstox_token=upstox_token,
+    upstox_live_ws=upstox_live_ws,
 )
 
 st.markdown("---")
 st.caption(
-    "Data sources: Yahoo Finance (intraday OHLCV) & NSE India (F&O OI & holidays). "
-    "1-minute data is limited and may have gaps. For educational / research purposes only — not investment advice."
+    "Data sources: Yahoo Finance or Upstox v3 (intraday OHLCV / live WSS) & NSE India (F&O OI & holidays). "
+    "For educational / research purposes only — not investment advice."
 )

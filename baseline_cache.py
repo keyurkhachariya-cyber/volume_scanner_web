@@ -12,7 +12,7 @@ import pickle
 import tempfile
 import threading
 import time as pytime
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -29,11 +29,25 @@ MEMORY_CACHE_MAX_ENTRIES = 4
 BASELINE_FORMAT_VERSION = 2
 _NEG_CACHE_TTL_SECONDS = 300.0
 
-# Bounded LRU memory cache: (date, interval) -> BaselineStore (version 2)
-_PREV_DAY_MEMORY_CACHE: "OrderedDict[Tuple[date, str], Dict[str, Any]]" = OrderedDict()
-# Short-TTL in-memory negative cache: (date, interval) -> {symbol: expiry_monotonic}
-_NEG_CACHE: Dict[Tuple[date, str], Dict[str, float]] = {}
+# Bounded LRU memory cache: cache_key -> BaselineStore (version 2)
+_PREV_DAY_MEMORY_CACHE: "OrderedDict[Tuple[Any, ...], Dict[str, Any]]" = OrderedDict()
+# Short-TTL in-memory negative cache: cache_key -> {symbol: expiry_monotonic}
+_NEG_CACHE: Dict[Tuple[Any, ...], Dict[str, float]] = {}
 _CACHE_LOCK = threading.Lock()
+
+
+def make_cache_key(prev_day: date, interval: str, cache_namespace: str = "") -> Tuple[Any, ...]:
+    """Return canonical cache key (keeps legacy 2-tuple when namespace is empty)."""
+    return (cache_namespace, prev_day, interval) if cache_namespace else (prev_day, interval)
+
+
+def _baseline_filename(prev_day: date, interval: str, cache_namespace: str = "") -> str:
+    prefix = f"prev_baseline_{cache_namespace}" if cache_namespace else "prev_baseline"
+    return f"{prefix}_{prev_day.isoformat()}_{interval}.pkl"
+
+
+def _namespace_from_key(cache_key: Tuple[Any, ...]) -> str:
+    return str(cache_key[0]) if len(cache_key) == 3 and cache_key[0] else ""
 
 
 def _prune_old_cache(max_age_days: int = CACHE_RETENTION_DAYS) -> None:
@@ -226,7 +240,7 @@ def _upgrade_v1_baseline(raw_v1: Dict[str, Any], prev_day: date, interval: str) 
     return _pack_baseline_store(entries, prev_day, interval)
 
 
-def _get_neg_cached(cache_key: Tuple[date, str]) -> Set[str]:
+def _get_neg_cached(cache_key: Tuple[Any, ...]) -> Set[str]:
     now_mono = pytime.monotonic()
     with _CACHE_LOCK:
         bucket = _NEG_CACHE.get(cache_key)
@@ -238,7 +252,7 @@ def _get_neg_cached(cache_key: Tuple[date, str]) -> Set[str]:
         return set(bucket.keys())
 
 
-def _put_memory_cache_locked(cache_key: Tuple[date, str], store: Dict[str, Any]) -> None:
+def _put_memory_cache_locked(cache_key: Tuple[Any, ...], store: Dict[str, Any]) -> None:
     _PREV_DAY_MEMORY_CACHE[cache_key] = store
     _PREV_DAY_MEMORY_CACHE.move_to_end(cache_key)
     while len(_PREV_DAY_MEMORY_CACHE) > MEMORY_CACHE_MAX_ENTRIES:
@@ -246,22 +260,30 @@ def _put_memory_cache_locked(cache_key: Tuple[date, str], store: Dict[str, Any])
         _NEG_CACHE.pop(evicted_key, None)
 
 
-def _get_or_load_store(cache_key: Tuple[date, str], prev_day: date, interval: str) -> Dict[str, Any]:
+def _get_or_load_store(
+    cache_key: Tuple[Any, ...],
+    prev_day: date,
+    interval: str,
+    cache_namespace: Optional[str] = None,
+) -> Dict[str, Any]:
     """Load baseline store from LRU memory cache or disk under _CACHE_LOCK."""
+    ns = _namespace_from_key(cache_key) if cache_namespace is None else cache_namespace
     with _CACHE_LOCK:
         store = _PREV_DAY_MEMORY_CACHE.get(cache_key)
         if store is not None:
             _PREV_DAY_MEMORY_CACHE.move_to_end(cache_key)
             return store
-        store = _load_disk_baseline(prev_day, interval)
+        store = _load_disk_baseline(prev_day, interval, cache_namespace=ns)
         if store is None:
             store = _empty_baseline_store(prev_day, interval)
         _put_memory_cache_locked(cache_key, store)
         return store
 
 
-def _load_disk_baseline(prev_day: date, interval: str) -> Optional[Dict[str, Any]]:
-    cache_file = CACHE_DIR / f"prev_baseline_{prev_day.isoformat()}_{interval}.pkl"
+def _load_disk_baseline(
+    prev_day: date, interval: str, cache_namespace: str = ""
+) -> Optional[Dict[str, Any]]:
+    cache_file = CACHE_DIR / _baseline_filename(prev_day, interval, cache_namespace)
     if not cache_file.exists():
         return None
     try:
@@ -274,15 +296,17 @@ def _load_disk_baseline(prev_day: date, interval: str) -> Optional[Dict[str, Any
             return loaded
         if isinstance(loaded, dict):
             upgraded = _upgrade_v1_baseline(loaded, prev_day, interval)
-            _save_disk_baseline(prev_day, interval, upgraded)
+            _save_disk_baseline(prev_day, interval, upgraded, cache_namespace=cache_namespace)
             return upgraded
     except Exception:
         pass
     return None
 
 
-def _save_disk_baseline(prev_day: date, interval: str, store: Dict[str, Any]) -> None:
-    cache_file = CACHE_DIR / f"prev_baseline_{prev_day.isoformat()}_{interval}.pkl"
+def _save_disk_baseline(
+    prev_day: date, interval: str, store: Dict[str, Any], cache_namespace: str = ""
+) -> None:
+    cache_file = CACHE_DIR / _baseline_filename(prev_day, interval, cache_namespace)
     tmp_path: Optional[Path] = None
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -309,13 +333,15 @@ def _save_disk_baseline(prev_day: date, interval: str, store: Dict[str, Any]) ->
 
 
 def _commit_baseline_updates(
-    cache_key: Tuple[date, str],
+    cache_key: Tuple[Any, ...],
     prev_day: date,
     interval: str,
     new_entries: Dict[str, Optional[Dict[str, Any]]],
     neg_syms: Iterable[str],
+    cache_namespace: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Synchronize negative-cache updates, merge against latest store, and persist atomically."""
+    ns = _namespace_from_key(cache_key) if cache_namespace is None else cache_namespace
     neg_list = list(neg_syms)
     now_mono = pytime.monotonic()
     with _CACHE_LOCK:
@@ -332,11 +358,11 @@ def _commit_baseline_updates(
 
         latest = _PREV_DAY_MEMORY_CACHE.get(cache_key)
         if latest is None:
-            latest = _load_disk_baseline(prev_day, interval)
+            latest = _load_disk_baseline(prev_day, interval, cache_namespace=ns)
 
         if new_entries:
             store = _pack_baseline_store(new_entries, prev_day, interval, existing=latest)
-            _save_disk_baseline(prev_day, interval, store)
+            _save_disk_baseline(prev_day, interval, store, cache_namespace=ns)
         elif latest is not None:
             store = latest
         else:
@@ -352,13 +378,15 @@ def get_previous_day_data(
     interval: str = "1m",
     chunk_size: Optional[int] = None,
     max_workers: int = 8,
+    fetch_fn: Optional[Callable[..., Tuple[Dict[str, Any], Set[str]]]] = None,
+    cache_namespace: str = "",
 ) -> Dict[str, Any]:
     """
     Fetch/load previous trading day's compact BaselineStore (v2 matrix)
     with bounded in-memory LRU cache, disk cache, and short-TTL memory negative cache.
     """
-    cache_key = (prev_day, interval)
-    store = _get_or_load_store(cache_key, prev_day, interval)
+    cache_key = make_cache_key(prev_day, interval, cache_namespace)
+    store = _get_or_load_store(cache_key, prev_day, interval, cache_namespace=cache_namespace)
 
     known_set = set(store["symbols"]) | _get_neg_cached(cache_key)
     missing = [sym for sym in symbols if sym not in known_set]
@@ -367,8 +395,9 @@ def get_previous_day_data(
         _prune_old_cache()
         start_str = prev_day.strftime("%Y-%m-%d")
         end_str = (prev_day + timedelta(days=1)).strftime("%Y-%m-%d")
+        fetcher = yahoo_client._fetch_market_data if fetch_fn is None else fetch_fn
 
-        fetched, failed = yahoo_client._fetch_market_data(
+        fetched, failed = fetcher(
             ((sym, None) for sym in missing),
             interval=interval,
             max_workers=max_workers,
@@ -395,7 +424,11 @@ def get_previous_day_data(
             else:
                 neg_syms.append(sym)
 
-        store = _commit_baseline_updates(cache_key, prev_day, interval, new_entries, neg_syms)
+        store = _commit_baseline_updates(
+            cache_key, prev_day, interval, new_entries, neg_syms, cache_namespace=cache_namespace
+        )
         return store
 
-    return _commit_baseline_updates(cache_key, prev_day, interval, {}, [])
+    return _commit_baseline_updates(
+        cache_key, prev_day, interval, {}, [], cache_namespace=cache_namespace
+    )

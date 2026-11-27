@@ -16,6 +16,7 @@ import baseline_cache
 from baseline_cache import BASELINE_FORMAT_VERSION, get_previous_day_data, prune_cache
 from holidays import get_previous_trading_day
 from oi import classify_oi_buildup, classify_trade_signal, get_oi_snapshot
+from providers import MarketDataProvider, YahooProvider
 from utils import IST, ist_epoch_sec as _ist_epoch_sec, time_to_sec as _time_to_sec
 import yahoo_client
 
@@ -178,6 +179,7 @@ def _prepare_fetch_plan(
     interval: str,
     max_workers: int,
     chunk_size: Optional[int],
+    provider: Optional[MarketDataProvider] = None,
 ) -> Tuple[
     Dict[str, Any],
     List[str],
@@ -186,7 +188,8 @@ def _prepare_fetch_plan(
     Dict[str, Tuple[Optional[str], Optional[str]]],
 ]:
     """Load cached baselines and build coalesced fetch tasks for today (+ cold prev_day where supported)."""
-    cache_key = (prev_day, interval)
+    cache_namespace = getattr(provider, "cache_namespace", "") if provider is not None else ""
+    cache_key = baseline_cache.make_cache_key(prev_day, interval, cache_namespace)
     store = baseline_cache._get_or_load_store(cache_key, prev_day, interval)
     neg_set = baseline_cache._get_neg_cached(cache_key)
     known_set = set(store["symbols"]) | neg_set
@@ -194,11 +197,18 @@ def _prepare_fetch_plan(
     missing_set = set(missing)
 
     gap_days = (today - prev_day).days
-    can_coalesce_range = 0 < gap_days <= (6 if interval == "1m" else 55)
+    allow_coalesce = getattr(provider, "supports_coalesced_range", True) if provider is not None else True
+    can_coalesce_range = allow_coalesce and 0 < gap_days <= (6 if interval == "1m" else 55)
 
     if missing and not can_coalesce_range:
         store = baseline_cache.get_previous_day_data(
-            symbols, prev_day, interval=interval, chunk_size=chunk_size, max_workers=max_workers
+            symbols,
+            prev_day,
+            interval=interval,
+            chunk_size=chunk_size,
+            max_workers=max_workers,
+            fetch_fn=provider.fetch_bars if provider is not None else None,
+            cache_namespace=cache_namespace,
         )
         missing_set = set()
         neg_set = baseline_cache._get_neg_cached(cache_key)
@@ -229,10 +239,12 @@ def _extract_and_commit_baselines(
     interval: str,
     max_workers: int,
     chunk_size: Optional[int],
+    provider: Optional[MarketDataProvider] = None,
 ) -> Dict[str, Any]:
     """Extract prev_day baselines from coalesced fetches (with bounded fallback) and commit to cache."""
     baseline_cache._prune_old_cache()
-    cache_key = (prev_day, interval)
+    cache_namespace = getattr(provider, "cache_namespace", "") if provider is not None else ""
+    cache_key = baseline_cache.make_cache_key(prev_day, interval, cache_namespace)
     new_entries: Dict[str, Optional[Dict[str, Any]]] = {}
     neg_syms: List[str] = []
     fallback_missing: List[str] = []
@@ -262,7 +274,8 @@ def _extract_and_commit_baselines(
     if fallback_missing:
         start_str = prev_day.strftime("%Y-%m-%d")
         end_str = (prev_day + timedelta(days=1)).strftime("%Y-%m-%d")
-        fb_arrays, fb_failed = yahoo_client._fetch_market_data(
+        fetcher = provider.fetch_bars if provider is not None else yahoo_client._fetch_market_data
+        fb_arrays, fb_failed = fetcher(
             ((sym, None) for sym in fallback_missing),
             interval=interval,
             max_workers=max_workers,
@@ -403,6 +416,7 @@ def run_scan(
     chunk_size: Optional[int] = None,
     prev_day: Optional[date] = None,
     include_oi: bool = False,
+    provider: Optional[MarketDataProvider] = None,
 ) -> pd.DataFrame:
     """
     Run relative volume scan across symbols with bar-aligned baseline comparisons and optional NSE OI.
@@ -411,6 +425,7 @@ def run_scan(
     if not symbols:
         return pd.DataFrame()
 
+    active_provider: MarketDataProvider = provider if provider is not None else YahooProvider()
     now = datetime.now(IST)
     cutoff = now.time()
     cutoff_sec = _time_to_sec(cutoff)
@@ -422,19 +437,38 @@ def run_scan(
         oi_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="nse_oi_fetch")
         oi_future = oi_executor.submit(get_oi_snapshot)
 
+    live_summaries: Optional[Dict[str, Any]] = None
+    provider_meta: Dict[str, Any] = {"provider": active_provider.provider_id, "mode": "rest"}
+    fetched_arrays: Dict[str, Dict[str, Optional[np.ndarray]]] = {}
+    failed_syms: Set[str] = set()
+
     try:
         if prev_day is None:
             prev_day = get_previous_trading_day(today)
         store, missing, missing_set, symbol_periods, symbol_ranges = _prepare_fetch_plan(
-            symbols, today, prev_day, interval, max_workers, chunk_size
+            symbols, today, prev_day, interval, max_workers, chunk_size, provider=active_provider
         )
-        fetched_arrays, failed_syms = yahoo_client._fetch_market_data(
-            symbol_periods,
-            interval=interval,
-            max_workers=max_workers,
-            chunk_size=chunk_size,
-            symbol_ranges=symbol_ranges if symbol_ranges else None,
-        )
+
+        # If provider serves live summaries (e.g. WebSocket feed), skip redundant full-bar downloads
+        if not missing_set:
+            live_summaries, live_meta = active_provider.fetch_today_summaries(
+                symbols=symbols,
+                today=today,
+                cutoff=cutoff,
+                interval=interval,
+                max_workers=max_workers,
+            )
+            if isinstance(live_meta, dict):
+                provider_meta.update(live_meta)
+
+        if live_summaries is None:
+            fetched_arrays, failed_syms = active_provider.fetch_bars(
+                symbol_periods,
+                interval=interval,
+                max_workers=max_workers,
+                chunk_size=chunk_size,
+                symbol_ranges=symbol_ranges if symbol_ranges else None,
+            )
     except Exception:
         if oi_executor is not None:
             oi_executor.shutdown(wait=False)
@@ -442,8 +476,19 @@ def run_scan(
 
     if missing_set:
         store = _extract_and_commit_baselines(
-            missing, fetched_arrays, failed_syms, prev_day, interval, max_workers, chunk_size
+            missing,
+            fetched_arrays,
+            failed_syms,
+            prev_day,
+            interval,
+            max_workers,
+            chunk_size,
+            provider=active_provider,
         )
+
+    prov_err = active_provider.get_last_error()
+    if prov_err and not provider_meta.get("error"):
+        provider_meta["error"] = prov_err
 
     oi_snapshot: Dict[str, Any] = {}
     if oi_future is not None:
@@ -456,12 +501,15 @@ def run_scan(
                 oi_executor.shutdown(wait=False)
     oi_by_symbol: Dict[str, Dict[str, Optional[float]]] = oi_snapshot.get("by_symbol") or {}
 
+    def _attach_meta(df_target: pd.DataFrame) -> pd.DataFrame:
+        df_target.attrs["provider_meta"] = provider_meta
+        if include_oi:
+            df_target.attrs["oi_meta"] = {k: v for k, v in oi_snapshot.items() if k != "by_symbol"}
+        return df_target
+
     times_sec = store["times_sec"]
     if len(times_sec) == 0 or cutoff_sec < int(times_sec[0]):
-        empty_df = pd.DataFrame()
-        if include_oi:
-            empty_df.attrs["oi_meta"] = {k: v for k, v in oi_snapshot.items() if k != "by_symbol"}
-        return empty_df
+        return _attach_meta(pd.DataFrame())
 
     today_day_start_sec = _ist_epoch_sec(today, time(0, 0))
     today_cutoff_bound_sec = today_day_start_sec + cutoff_sec
@@ -477,24 +525,27 @@ def run_scan(
         col_idx = sym_to_idx.get(sym)
         if col_idx is None:
             continue
-        bundle = fetched_arrays.get(sym)
-        summary = (
-            _summarize_today_arrays(
-                bundle["ts_sec"],
-                bundle["open"],
-                bundle["high"],
-                bundle["low"],
-                bundle["close"],
-                bundle["volume"],
-                today,
-                cutoff,
-                today_day_start_sec,
-                today_cutoff_bound_sec,
-                bar_interval_sec,
+        if live_summaries is not None:
+            summary = live_summaries.get(sym)
+        else:
+            bundle = fetched_arrays.get(sym)
+            summary = (
+                _summarize_today_arrays(
+                    bundle["ts_sec"],
+                    bundle["open"],
+                    bundle["high"],
+                    bundle["low"],
+                    bundle["close"],
+                    bundle["volume"],
+                    today,
+                    cutoff,
+                    today_day_start_sec,
+                    today_cutoff_bound_sec,
+                    bar_interval_sec,
+                )
+                if bundle is not None
+                else None
             )
-            if bundle is not None
-            else None
-        )
         if summary is None:
             continue
 
@@ -517,13 +568,8 @@ def run_scan(
             results.append(row)
 
     if not results:
-        empty_df = pd.DataFrame()
-        if include_oi:
-            empty_df.attrs["oi_meta"] = {k: v for k, v in oi_snapshot.items() if k != "by_symbol"}
-        return empty_df
+        return _attach_meta(pd.DataFrame())
 
     df_out = pd.DataFrame(results)
     df_out = df_out.sort_values("Ratio", ascending=False).reset_index(drop=True)
-    if include_oi:
-        df_out.attrs["oi_meta"] = {k: v for k, v in oi_snapshot.items() if k != "by_symbol"}
-    return df_out
+    return _attach_meta(df_out)
