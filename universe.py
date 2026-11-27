@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from holidays import IST
+from utils import fetch_nse_json
 
 CACHE_FILE = Path(__file__).parent / ".cache" / "fno_universe.json"
 
@@ -65,13 +66,12 @@ FNO_STOCKS = sorted(list(set(FNO_STOCKS)))
 
 def fetch_nse_fno_universe(timeout: int = 10) -> List[str]:
     """Fetch live NSE F&O equity underlyings directly from NSE India."""
-    from curl_cffi import requests
-
-    with requests.Session(impersonate="chrome") as session:
-        session.get("https://www.nseindia.com/market-data/equity-derivatives-watch", timeout=timeout)
-        resp = session.get("https://www.nseindia.com/api/underlying-information", timeout=timeout)
-        resp.raise_for_status()
-        items = resp.json().get("data", {}).get("UnderlyingList", [])
+    payload = fetch_nse_json(
+        warmup_url="https://www.nseindia.com/market-data/equity-derivatives-watch",
+        api_url="https://www.nseindia.com/api/underlying-information",
+        timeout=timeout,
+    )
+    items = (payload or {}).get("data", {}).get("UnderlyingList", [])
 
     symbols = sorted({f"{item['symbol']}.NS" for item in items if item.get("symbol")})
     if not symbols:

@@ -15,12 +15,14 @@ import threading
 import time as pytime
 from typing import Any, Dict, Optional, Tuple
 
-from holidays import IST, is_market_open
-
-try:
-    import orjson as _orjson
-except ImportError:  # pragma: no cover - optional faster JSON parser
-    _orjson = None
+from holidays import is_market_open
+from utils import (
+    IST,
+    _orjson,
+    decode_json_response,
+    parse_nse_date as _parse_nse_date,
+    parse_nse_ts as _parse_nse_ts,
+)
 
 _NSE_OI_WARMUP_URL = "https://www.nseindia.com/market-data/oi-spurts"
 _NSE_OI_API_URL = "https://www.nseindia.com/api/live-analysis-oi-spurts-underlyings"
@@ -56,36 +58,7 @@ def _to_float(val: Any) -> Optional[float]:
 
 
 def _decode_json_response(resp: Any) -> Any:
-    raw = getattr(resp, "content", None)
-    if _orjson is not None and raw:
-        return _orjson.loads(raw)
-    return resp.json()
-
-
-def _parse_nse_ts(raw: Optional[str]) -> Optional[datetime]:
-    text = (raw or "").strip()
-    if not text:
-        return None
-    for fmt in ("%d-%b-%Y %H:%M:%S", "%d-%B-%Y %H:%M:%S", "%d-%b-%Y %H:%M"):
-        try:
-            dt_naive = datetime.strptime(text, fmt)
-            localize = getattr(IST, "localize", None)
-            return localize(dt_naive) if localize is not None else dt_naive.replace(tzinfo=IST)
-        except ValueError:
-            continue
-    return None
-
-
-def _parse_nse_date(raw: Optional[str]) -> Optional[date]:
-    text = (raw or "").strip()
-    if not text:
-        return None
-    for fmt in ("%d-%b-%Y", "%d-%B-%Y", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(text, fmt).date()
-        except ValueError:
-            continue
-    return None
+    return decode_json_response(resp, orjson_mod=_orjson)
 
 
 def _close_session_locked() -> None:

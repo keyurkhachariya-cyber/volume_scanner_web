@@ -3,25 +3,29 @@ Relative Volume Scanner (F&O Stocks) - Streamlit Web App
 Today's cumulative volume till now vs Previous day's volume till same time.
 """
 
-from __future__ import annotations
-
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, time
+from datetime import datetime
 import streamlit as st
 import pandas as pd
 
 from universe import get_fno_universe
 from scanner import prune_cache, run_scan
 from holidays import get_holidays, is_market_open, get_previous_trading_day, IST
-from oi import (
-    OI_BUILDUP_OPTIONS,
-    SIGNAL_BEARISH,
-    SIGNAL_BULLISH,
-    classify_oi_buildup,
-    classify_trade_signal,
+from oi import OI_BUILDUP_OPTIONS, SIGNAL_BEARISH, SIGNAL_BULLISH
+from screener_filters import (
+    MARKET_CLOSE_TIME,
+    filter_and_sort_results,
+    should_auto_scan as _should_auto_scan,
+    style_scanner_df as _style_scanner_df,
 )
-
-MARKET_CLOSE_TIME = time(15, 30)
+from table_config import (
+    ALL_COLUMNS,
+    COLUMN_CONFIG,
+    COLUMN_GUIDE_MARKDOWN,
+    COLUMN_LABELS,
+    DEFAULT_COLUMNS,
+    SORT_OPTIONS,
+)
 
 st.set_page_config(
     page_title="F&O Relative Volume Scanner",
@@ -32,115 +36,8 @@ st.set_page_config(
 st.title("📈 F&O Relative Volume Scanner")
 st.caption("Today's volume till now vs Previous trading day volume till same clock time (IST)")
 
-DEFAULT_COLUMNS = [
-    "Signal",
-    "Symbol",
-    "LTP",
-    "Vol_Today",
-    "Vol_Prev_Same_Time",
-    "Ratio",
-    "Pct_Change",
-    "OI",
-    "OI_Chg",
-    "OI_Chg_Pct",
-    "OI_Buildup",
-    "Last_Bar_Time",
-]
-
-ALL_COLUMNS = [
-    "Signal",
-    "Symbol",
-    "LTP",
-    "Vol_Today",
-    "Vol_Prev_Same_Time",
-    "Ratio",
-    "Pct_Change",
-    "OI",
-    "OI_Prev",
-    "OI_Chg",
-    "OI_Chg_Pct",
-    "OI_Buildup",
-    "Last_Bar_Time",
-    "Gap_Pct",
-    "Prev_Close",
-    "Day_Open",
-    "Day_High",
-    "Day_Low",
-    "Range_Pct",
-    "Vol_Diff",
-    "Prev_Full_Vol",
-    "Turnover_Cr",
-]
-
-COLUMN_LABELS = {
-    "Signal": "Signal",
-    "Symbol": "Symbol",
-    "LTP": "LTP",
-    "Vol_Today": "Vol Today (till now)",
-    "Vol_Prev_Same_Time": "Vol Prev (same time)",
-    "Ratio": "Ratio",
-    "Pct_Change": "% Chg",
-    "OI": "OI (Lots)",
-    "OI_Prev": "Prev OI (Lots)",
-    "OI_Chg": "OI Chg (Day)",
-    "OI_Chg_Pct": "OI Chg % (Day)",
-    "OI_Buildup": "OI Buildup",
-    "Last_Bar_Time": "Last Bar (IST)",
-    "Gap_Pct": "Gap %",
-    "Prev_Close": "Prev Close",
-    "Day_Open": "Day Open",
-    "Day_High": "Day High",
-    "Day_Low": "Day Low",
-    "Range_Pct": "Day Range %",
-    "Vol_Diff": "Vol Diff",
-    "Prev_Full_Vol": "Prev Full Day Vol",
-    "Turnover_Cr": "Turnover (₹ Cr)",
-}
-
-SORT_OPTIONS = {
-    "Ratio (High → Low)": ("Ratio", False, False),
-    "Signal (Bullish / Bearish first)": ("Signal", False, False),
-    "OI Chg % Day (High → Low)": ("OI_Chg_Pct", False, False),
-    "OI Chg % Day (Low → High)": ("OI_Chg_Pct", True, False),
-    "|OI Chg %| Day (Largest Moves)": ("OI_Chg_Pct", False, True),
-    "OI Chg Lots Day (High → Low)": ("OI_Chg", False, False),
-    "Price % Chg (High → Low)": ("Pct_Change", False, False),
-    "Turnover ₹ Cr (High → Low)": ("Turnover_Cr", False, False),
-}
-
-COLUMN_CONFIG = {
-    "Signal": st.column_config.TextColumn(
-        "Signal",
-        help="🟢 Bullish: Ratio > 1.0×, OI Chg > +10%, % Chg > +1.5% | 🔴 Bearish: Ratio > 1.0×, OI Chg > +10%, % Chg < -1.5%",
-    ),
-    "Symbol": st.column_config.TextColumn("Symbol", width="medium"),
-    "LTP": st.column_config.NumberColumn("LTP", format="%.2f"),
-    "Vol_Today": st.column_config.NumberColumn("Vol Today (till now)", format="localized"),
-    "Vol_Prev_Same_Time": st.column_config.NumberColumn("Vol Prev (same time)", format="localized"),
-    "Ratio": st.column_config.NumberColumn("Ratio", format="%.2f×"),
-    "Pct_Change": st.column_config.NumberColumn("% Chg", format="%+.2f%%"),
-    "OI": st.column_config.NumberColumn("OI (Lots)", format="localized"),
-    "OI_Prev": st.column_config.NumberColumn("Prev OI (Lots)", format="localized"),
-    "OI_Chg": st.column_config.NumberColumn("OI Chg (Day)", format="localized"),
-    "OI_Chg_Pct": st.column_config.NumberColumn("OI Chg % (Day)", format="%+.2f%%"),
-    "OI_Buildup": st.column_config.TextColumn(
-        "OI Buildup",
-        help="Price Δ vs Day OI Δ classification: Long Buildup, Short Buildup, Short Covering, Long Unwinding.",
-    ),
-    "Last_Bar_Time": st.column_config.TextColumn(
-        "Last Bar (IST)",
-        help="Latest regular-hours bar timestamp (IST) used for bar-aligned baseline lookup.",
-    ),
-    "Gap_Pct": st.column_config.NumberColumn("Gap %", format="%+.2f%%"),
-    "Prev_Close": st.column_config.NumberColumn("Prev Close", format="%.2f"),
-    "Day_Open": st.column_config.NumberColumn("Day Open", format="%.2f"),
-    "Day_High": st.column_config.NumberColumn("Day High", format="%.2f"),
-    "Day_Low": st.column_config.NumberColumn("Day Low", format="%.2f"),
-    "Range_Pct": st.column_config.NumberColumn("Day Range %", format="%.2f%%"),
-    "Vol_Diff": st.column_config.NumberColumn("Vol Diff", format="localized"),
-    "Prev_Full_Vol": st.column_config.NumberColumn("Prev Full Day Vol", format="localized"),
-    "Turnover_Cr": st.column_config.NumberColumn("Turnover (₹ Cr)", format="%.2f"),
-}
+with st.expander("📘 Column & Momentum Guide — How to Use", expanded=False):
+    st.markdown(COLUMN_GUIDE_MARKDOWN)
 
 
 @st.cache_resource
@@ -274,6 +171,45 @@ with st.sidebar:
         help="Sort scanned results immediately in memory.",
     )
 
+    use_momentum_filter = st.checkbox(
+        "Momentum Quality Filters",
+        value=False,
+        help="Filter out faded spikes, weak day-range closes, red-candle gap-ups, and dead morning volume.",
+    )
+    momentum_filter_state = None
+    if use_momentum_filter:
+        require_vwap_aligned = st.checkbox(
+            "VWAP aligned (+ above / - below)",
+            value=True,
+            help="Require LTP > VWAP for gainers (% Chg > 0) and LTP < VWAP for losers (% Chg < 0).",
+        )
+        require_open_aligned = st.checkbox(
+            "Intraday candle aligned (From Open %)",
+            value=True,
+            help="Require LTP > Day Open for gainers and LTP < Day Open for losers (filters faded gap-ups/downs).",
+        )
+        range_edge_pct = st.slider(
+            "Hold within % of Day High/Low",
+            10,
+            50,
+            30,
+            help="Require Range Pos >= (100 - X)% for gainers or <= X% for losers (e.g. 30 = top/bottom 30%).",
+        )
+        min_vol_burst_15m = st.number_input(
+            "Min 15m Vol Burst (×)",
+            min_value=0.0,
+            max_value=20.0,
+            value=1.2,
+            step=0.1,
+            help="Require recent 15m volume pace >= X times today's average pace (0 disables).",
+        )
+        momentum_filter_state = (
+            bool(require_vwap_aligned),
+            bool(require_open_aligned),
+            int(range_edge_pct),
+            float(min_vol_burst_15m),
+        )
+
     st.markdown("---")
     auto_refresh = st.checkbox("Auto-refresh", value=False)
     refresh_seconds = 60
@@ -312,9 +248,11 @@ current_filter_state = (
     bool(exclude_gap_down),
     float(gap_threshold),
     int(max_workers),
+    bool(include_oi),
     None if min_oi_chg_pct is None else float(min_oi_chg_pct),
     tuple(oi_buildup_filter),
     sort_by,
+    momentum_filter_state,
 )
 if (
     st.session_state._last_filter_state is not None
@@ -340,68 +278,6 @@ def _reset_default_columns() -> None:
     st.session_state._skip_auto_scan_once = True
 
 
-def _should_auto_scan(
-    now: datetime,
-    last_scan_dt: datetime | None,
-    refresh_seconds: int,
-    market_open: bool,
-    holidays_set: set,
-    skip_auto_scan: bool,
-    post_close_attempts: int = 0,
-    max_post_close_attempts: int = 2,
-    last_scan_started_dt: datetime | None = None,
-) -> bool:
-    """
-    Decide whether a scheduled auto-refresh scan should execute:
-    - Never run during pure UI/filter interactions.
-    - Poll every refresh_seconds while NSE is open.
-    - Allow a bounded post-close snapshot (up to max_post_close_attempts on empty data) after 15:30 IST.
-    - Stay idle pre-market, on weekends, and on holidays.
-    """
-    if skip_auto_scan:
-        return False
-
-    if market_open:
-        cadence_ref = last_scan_started_dt or last_scan_dt
-        if cadence_ref is None or cadence_ref.date() != now.date():
-            return True
-        elapsed = (now - cadence_ref).total_seconds()
-        return elapsed >= max(refresh_seconds - 1, 1)
-
-    is_trading_day = now.weekday() < 5 and now.date() not in holidays_set
-    if is_trading_day and now.time() > MARKET_CLOSE_TIME:
-        if post_close_attempts >= max_post_close_attempts:
-            return False
-        market_close_dt = now.replace(hour=15, minute=30, second=0, microsecond=0)
-        if last_scan_dt is None or last_scan_dt.date() < now.date() or last_scan_dt < market_close_dt:
-            return True
-
-    return False
-
-
-_SIGNAL_RANK = {SIGNAL_BULLISH: 0, SIGNAL_BEARISH: 1}
-_SIGNAL_ROW_CSS = {
-    SIGNAL_BULLISH: ("background-color: rgba(16, 185, 129, 0.16);", "color: #10b981; font-weight: 600;"),
-    SIGNAL_BEARISH: ("background-color: rgba(239, 68, 68, 0.16);", "color: #ef4444; font-weight: 600;"),
-}
-_SIGNAL_ACCENT_COLS = {"Signal", "Pct_Change", "OI_Chg_Pct", "OI_Buildup"}
-
-
-def _style_scanner_df(display_df: pd.DataFrame, signals: pd.Series):
-    """Apply translucent green/red row highlights and text accents for Bullish/Bearish rows."""
-    sig_map = dict(zip(display_df.index, signals))
-    cols = list(display_df.columns)
-
-    def _row_styles(row: pd.Series) -> list[str]:
-        styles = _SIGNAL_ROW_CSS.get(sig_map.get(row.name))
-        if styles is None:
-            return [""] * len(cols)
-        bg_css, accent_css = styles
-        return [bg_css + (accent_css if col in _SIGNAL_ACCENT_COLS else "") for col in cols]
-
-    return display_df.style.apply(_row_styles, axis=1)
-
-
 def _filter_and_sort_results(
     raw_df: pd.DataFrame,
     min_ratio: float,
@@ -413,90 +289,22 @@ def _filter_and_sort_results(
     min_oi_chg_pct: float | None,
     oi_buildup_filter: tuple[str, ...],
     sort_by: str,
-) -> tuple[pd.DataFrame, bool, int, bool, int]:
-    """Apply volume, gap, OI threshold/buildup filters and sorting in memory."""
-    if raw_df.empty:
-        return raw_df, False, 0, False, 0
-
-    working_df = raw_df
-    if "Gap_Pct" not in working_df.columns and {"Day_Open", "Prev_Close"}.issubset(working_df.columns):
-        working_df = working_df.copy()
-        valid_prev = working_df["Prev_Close"].notna() & (working_df["Prev_Close"] > 0)
-        working_df["Gap_Pct"] = float("nan")
-        working_df.loc[valid_prev, "Gap_Pct"] = (
-            (working_df.loc[valid_prev, "Day_Open"] - working_df.loc[valid_prev, "Prev_Close"])
-            / working_df.loc[valid_prev, "Prev_Close"]
-        ) * 100
-
-    if include_oi and "OI_Buildup" not in working_df.columns and {"Pct_Change", "OI_Chg"}.issubset(working_df.columns):
-        if working_df is raw_df:
-            working_df = working_df.copy()
-        working_df["OI_Buildup"] = [
-            classify_oi_buildup(pct, oi_c)
-            for pct, oi_c in zip(working_df["Pct_Change"], working_df["OI_Chg"])
-        ]
-
-    if include_oi and "Signal" not in working_df.columns and {"Ratio", "OI_Chg_Pct", "Pct_Change"}.issubset(working_df.columns):
-        if working_df is raw_df:
-            working_df = working_df.copy()
-        working_df["Signal"] = [
-            classify_trade_signal(r, o, p)
-            for r, o, p in zip(working_df["Ratio"], working_df["OI_Chg_Pct"], working_df["Pct_Change"])
-        ]
-
-    base_mask = (working_df["Ratio"] >= min_ratio) & (working_df["Vol_Today"] >= int(min_volume))
-    mask = base_mask.copy()
-
-    gap_missing = False
-    gap_excluded_count = 0
-    if exclude_gap_up or exclude_gap_down:
-        if "Gap_Pct" not in working_df.columns:
-            gap_missing = True
-        else:
-            gap_vals = pd.to_numeric(working_df["Gap_Pct"], errors="coerce")
-            if exclude_gap_up:
-                mask &= gap_vals.isna() | (gap_vals <= gap_threshold)
-            if exclude_gap_down:
-                mask &= gap_vals.isna() | (gap_vals >= -gap_threshold)
-            gap_excluded_count = int(base_mask.sum() - mask.sum())
-
-    oi_missing = False
-    oi_excluded_count = 0
-    if include_oi and (min_oi_chg_pct is not None or oi_buildup_filter):
-        pre_oi_count = int(mask.sum())
-        if min_oi_chg_pct is not None:
-            if "OI_Chg_Pct" not in working_df.columns:
-                oi_missing = True
-            else:
-                oi_pct_vals = pd.to_numeric(working_df["OI_Chg_Pct"], errors="coerce")
-                mask &= oi_pct_vals.notna() & (oi_pct_vals >= float(min_oi_chg_pct))
-        if oi_buildup_filter:
-            if "OI_Buildup" not in working_df.columns:
-                oi_missing = True
-            else:
-                mask &= working_df["OI_Buildup"].isin(oi_buildup_filter)
-        if not oi_missing:
-            oi_excluded_count = pre_oi_count - int(mask.sum())
-
-    df = working_df[mask].copy()
-    sort_col, sort_asc, sort_abs = SORT_OPTIONS.get(sort_by, ("Ratio", False, False))
-    if sort_col in df.columns and not df.empty:
-        if sort_col == "Signal":
-            df = (
-                df.assign(_sig_rank=df["Signal"].map(_SIGNAL_RANK).fillna(2))
-                .sort_values(["_sig_rank", "Ratio"], ascending=[True, False], na_position="last")
-                .drop(columns=["_sig_rank"])
-            )
-        else:
-            df = df.sort_values(
-                sort_col,
-                ascending=sort_asc,
-                key=(lambda s: pd.to_numeric(s, errors="coerce").abs())
-                if sort_abs
-                else (lambda s: pd.to_numeric(s, errors="coerce")),
-                na_position="last",
-            )
-    return df.reset_index(drop=True), gap_missing, gap_excluded_count, oi_missing, oi_excluded_count
+    momentum_filter_state: tuple[bool, bool, int, float] | None = None,
+) -> tuple[pd.DataFrame, bool, int, bool, int, bool, int]:
+    return filter_and_sort_results(
+        raw_df=raw_df,
+        min_ratio=min_ratio,
+        min_volume=min_volume,
+        exclude_gap_up=exclude_gap_up,
+        exclude_gap_down=exclude_gap_down,
+        gap_threshold=gap_threshold,
+        include_oi=include_oi,
+        min_oi_chg_pct=min_oi_chg_pct,
+        oi_buildup_filter=oi_buildup_filter,
+        sort_by=sort_by,
+        sort_options=SORT_OPTIONS,
+        momentum_filter_state=momentum_filter_state,
+    )
 
 
 def render_scanner(
@@ -514,6 +322,7 @@ def render_scanner(
     min_oi_chg_pct: float | None = None,
     oi_buildup_filter: tuple[str, ...] = (),
     sort_by: str = "Ratio (High → Low)",
+    momentum_filter_state: tuple[bool, bool, int, float] | None = None,
 ):
     now = datetime.now(IST)
     holidays_set = get_holidays(background_refresh=True)
@@ -615,7 +424,7 @@ def render_scanner(
     raw_df = st.session_state.results_by_interval.get(interval, pd.DataFrame())
     raw_empty_dt = st.session_state._last_scan_empty_by_interval.get(interval)
     empty_scan_dt = raw_empty_dt if (raw_empty_dt is not None and raw_empty_dt.date() == now.date()) else None
-    df, gap_missing, gap_excluded_count, oi_missing, oi_excluded_count = _filter_and_sort_results(
+    df, gap_missing, gap_excluded_count, oi_missing, oi_excluded_count, momentum_missing, momentum_excluded_count = _filter_and_sort_results(
         raw_df=raw_df,
         min_ratio=min_ratio,
         min_volume=min_volume,
@@ -626,52 +435,12 @@ def render_scanner(
         min_oi_chg_pct=min_oi_chg_pct,
         oi_buildup_filter=oi_buildup_filter,
         sort_by=sort_by,
+        momentum_filter_state=momentum_filter_state,
     )
 
-    with status_slot:
-        if last_scan_dt is not None:
-            gap_note = ""
-            if (exclude_gap_up or exclude_gap_down) and not gap_missing:
-                gap_note = f" | Excluded by gap filter: **{gap_excluded_count}**"
-            oi_filter_note = ""
-            if include_oi and (min_oi_chg_pct is not None or oi_buildup_filter) and not oi_missing:
-                oi_filter_note = f" | Filtered by OI: **{oi_excluded_count}**"
-            oi_meta = raw_df.attrs.get("oi_meta") if include_oi else None
-            oi_note = ""
-            if isinstance(oi_meta, dict):
-                nse_ts = oi_meta.get("nse_timestamp")
-                if nse_ts:
-                    oi_note = f" | NSE OI @ {nse_ts.split(' ')[-1]}"
-            st.success(
-                f"Last scan: {last_scan_dt.strftime('%H:%M:%S IST')} "
-                f"({interval} bars) | "
-                f"Showing **{len(df)}** of **{len(raw_df)}** scanned stocks{gap_note}{oi_filter_note}{oi_note}"
-            )
-            if isinstance(oi_meta, dict) and oi_meta.get("error"):
-                cd = int(round(oi_meta.get("cooldown_seconds") or 0))
-                cd_note = f" (cooling down {cd}s)" if cd > 0 else ""
-                fallback_msg = "using last cached OI snapshot" if oi_meta.get("nse_timestamp") else "OI unavailable"
-                st.warning(f"NSE OI notice: {oi_meta['error']}{cd_note} — {fallback_msg}.")
-            if empty_scan_dt is not None and not raw_df.empty:
-                st.warning(
-                    f"Latest scan at {empty_scan_dt.strftime('%H:%M:%S IST')} returned no data — "
-                    "showing the previous snapshot."
-                )
-            if gap_missing:
-                st.warning(
-                    "Current results were scanned before Gap % data was added — click **Scan Now** once to apply the gap filter."
-                )
-            if oi_missing:
-                st.warning(
-                    "Current results were scanned without OI data — click **Scan Now** once to apply OI filters."
-                )
-        elif empty_scan_dt is not None:
-            st.warning(
-                f"Scan at {empty_scan_dt.strftime('%H:%M:%S IST')} returned no intraday data for today "
-                "(market may be pre-open, closed, or Yahoo Finance has no bars yet)."
-            )
-        elif st.session_state.results_by_interval:
-            st.info(f"No **{interval}** snapshot yet — click **Scan Now** to fetch {interval} bars.")
+    has_signals = include_oi and (not df.empty) and ("Signal" in df.columns)
+    table_df = df
+    sig_choice = "All"
 
     with results_slot:
         if df.empty:
@@ -680,9 +449,6 @@ def render_scanner(
             elif not raw_df.empty:
                 st.warning("No stocks matched the current filters. Try lowering the Minimum Ratio or Volume.")
         else:
-            has_signals = include_oi and ("Signal" in df.columns)
-            table_df = df
-            sig_choice = "All"
             if has_signals:
                 bullish_count = int((df["Signal"] == SIGNAL_BULLISH).sum())
                 bearish_count = int((df["Signal"] == SIGNAL_BEARISH).sum())
@@ -754,6 +520,65 @@ def render_scanner(
                         on_click="ignore",
                     )
 
+    with status_slot:
+        if last_scan_dt is not None:
+            gap_note = ""
+            if (exclude_gap_up or exclude_gap_down) and not gap_missing:
+                gap_note = f" | Excluded by gap filter: **{gap_excluded_count}**"
+            oi_filter_note = ""
+            if include_oi and (min_oi_chg_pct is not None or oi_buildup_filter) and not oi_missing:
+                oi_filter_note = f" | Filtered by OI: **{oi_excluded_count}**"
+            mom_filter_note = ""
+            if momentum_filter_state is not None and not momentum_missing:
+                mom_filter_note = f" | Filtered by momentum: **{momentum_excluded_count}**"
+            oi_meta = raw_df.attrs.get("oi_meta") if include_oi else None
+            oi_note = ""
+            if isinstance(oi_meta, dict):
+                nse_ts = oi_meta.get("nse_timestamp")
+                if nse_ts:
+                    oi_note = f" | NSE OI @ {nse_ts.split(' ')[-1]}"
+            if sig_choice in (SIGNAL_BULLISH, SIGNAL_BEARISH):
+                count_summary = (
+                    f"Showing **{len(table_df)}** {sig_choice} of **{len(df)}** matching "
+                    f"(**{len(raw_df)}** scanned)"
+                )
+            else:
+                count_summary = f"Showing **{len(df)}** of **{len(raw_df)}** scanned stocks"
+            st.success(
+                f"Last scan: {last_scan_dt.strftime('%H:%M:%S IST')} "
+                f"({interval} bars) | "
+                f"{count_summary}{gap_note}{oi_filter_note}{mom_filter_note}{oi_note}"
+            )
+            if isinstance(oi_meta, dict) and oi_meta.get("error"):
+                cd = int(round(oi_meta.get("cooldown_seconds") or 0))
+                cd_note = f" (cooling down {cd}s)" if cd > 0 else ""
+                fallback_msg = "using last cached OI snapshot" if oi_meta.get("nse_timestamp") else "OI unavailable"
+                st.warning(f"NSE OI notice: {oi_meta['error']}{cd_note} — {fallback_msg}.")
+            if empty_scan_dt is not None and not raw_df.empty:
+                st.warning(
+                    f"Latest scan at {empty_scan_dt.strftime('%H:%M:%S IST')} returned no data — "
+                    "showing the previous snapshot."
+                )
+            if gap_missing:
+                st.warning(
+                    "Current results were scanned before Gap % data was added — click **Scan Now** once to apply the gap filter."
+                )
+            if oi_missing:
+                st.warning(
+                    "Current results were scanned without OI data — click **Scan Now** once to apply OI filters."
+                )
+            if momentum_missing:
+                st.warning(
+                    "Current results were scanned before VWAP / 15m Vol Burst metrics were added — click **Scan Now** once to apply all momentum filters."
+                )
+        elif empty_scan_dt is not None:
+            st.warning(
+                f"Scan at {empty_scan_dt.strftime('%H:%M:%S IST')} returned no intraday data for today "
+                "(market may be pre-open, closed, or Yahoo Finance has no bars yet)."
+            )
+        elif st.session_state.results_by_interval:
+            st.info(f"No **{interval}** snapshot yet — click **Scan Now** to fetch {interval} bars.")
+
 
 # Bind fragment dynamically with run_every when auto_refresh is enabled
 scanner_fragment = st.fragment(
@@ -776,10 +601,11 @@ scanner_fragment(
     min_oi_chg_pct=None if min_oi_chg_pct is None else float(min_oi_chg_pct),
     oi_buildup_filter=tuple(oi_buildup_filter),
     sort_by=sort_by,
+    momentum_filter_state=momentum_filter_state,
 )
 
 st.markdown("---")
 st.caption(
-    "Data source: yfinance (Yahoo Finance). 1-minute data is limited and may have gaps. "
-    "This is for educational / research purposes only. Not investment advice."
+    "Data sources: Yahoo Finance (intraday OHLCV) & NSE India (F&O OI & holidays). "
+    "1-minute data is limited and may have gaps. For educational / research purposes only — not investment advice."
 )

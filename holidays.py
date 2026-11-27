@@ -11,9 +11,9 @@ from pathlib import Path
 import threading
 import time as pytime
 from typing import Any, Dict, Optional, Set, Tuple
-import pytz
 
-IST = pytz.timezone("Asia/Kolkata")
+from utils import IST, decode_json_response, fetch_nse_json, parse_nse_date as _parse_nse_date
+
 CACHE_FILE = Path(__file__).parent / ".cache" / "nse_holidays.json"
 
 # Built-in fallback NSE holidays 2025-2026
@@ -54,35 +54,18 @@ _HOLIDAY_REFRESH_INFLIGHT: bool = False
 _NSEI_SESSION: Any = None
 _NSEI_CACHE: Dict[str, Tuple[date, float, Optional[Set[date]]]] = {}
 
-try:
-    import orjson as _orjson
-except ImportError:  # pragma: no cover - optional faster JSON parser
-    _orjson = None
-
 _RETRY_COOLDOWN_SECONDS = 900.0  # 15 minutes
 _NSEI_TTL_SECONDS = 900.0
 _HOLIDAY_DISK_MAX_AGE_DAYS = 7
 
 
-def _parse_nse_date(raw: str) -> Optional[date]:
-    text = (raw or "").strip()
-    for fmt in ("%d-%b-%Y", "%d-%B-%Y", "%Y-%m-%d", "%d/%m/%Y"):
-        try:
-            return datetime.strptime(text, fmt).date()
-        except ValueError:
-            continue
-    return None
-
-
 def fetch_nse_holidays(timeout: int = 4) -> Set[date]:
     """Fetch official NSE trading holidays from NSE India API."""
-    from curl_cffi import requests
-
-    with requests.Session(impersonate="chrome") as session:
-        session.get("https://www.nseindia.com/resources/exchange-communication-holidays", timeout=timeout)
-        resp = session.get("https://www.nseindia.com/api/holiday-master?type=trading", timeout=timeout)
-        resp.raise_for_status()
-        payload = resp.json()
+    payload = fetch_nse_json(
+        warmup_url="https://www.nseindia.com/resources/exchange-communication-holidays",
+        api_url="https://www.nseindia.com/api/holiday-master?type=trading",
+        timeout=timeout,
+    )
     if not isinstance(payload, dict):
         raise ValueError("Unexpected NSE holiday-master payload type")
 
@@ -257,8 +240,7 @@ def _fetch_nsei_dates_direct(
             )
             if resp.status_code != 200:
                 return None
-            raw = getattr(resp, "content", None)
-            payload = _orjson.loads(raw) if (_orjson is not None and raw) else resp.json()
+            payload = decode_json_response(resp)
     except Exception:
         with _NSEI_HTTP_LOCK:
             if _NSEI_SESSION is not None:
