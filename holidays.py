@@ -10,10 +10,10 @@ import json
 from pathlib import Path
 import threading
 import time as pytime
-from typing import Dict, Optional, Set, Tuple
-import pytz
+from typing import Any, Dict, Optional, Set, Tuple
 
-IST = pytz.timezone("Asia/Kolkata")
+from utils import IST, decode_json_response, fetch_nse_json, parse_nse_date as _parse_nse_date
+
 CACHE_FILE = Path(__file__).parent / ".cache" / "nse_holidays.json"
 
 # Built-in fallback NSE holidays 2025-2026
@@ -47,8 +47,11 @@ HOLIDAYS: Set[date] = {
 }
 
 _STATE_LOCK = threading.Lock()
+_NSEI_HTTP_LOCK = threading.Lock()
 _HOLIDAYS_MEMORY: Optional[Tuple[date, Set[date]]] = None
 _NSE_HOLIDAY_COOLDOWN_UNTIL: float = 0.0
+_HOLIDAY_REFRESH_INFLIGHT: bool = False
+_NSEI_SESSION: Any = None
 _NSEI_CACHE: Dict[str, Tuple[date, float, Optional[Set[date]]]] = {}
 
 _RETRY_COOLDOWN_SECONDS = 900.0  # 15 minutes
@@ -56,25 +59,13 @@ _NSEI_TTL_SECONDS = 900.0
 _HOLIDAY_DISK_MAX_AGE_DAYS = 7
 
 
-def _parse_nse_date(raw: str) -> Optional[date]:
-    text = (raw or "").strip()
-    for fmt in ("%d-%b-%Y", "%d-%B-%Y", "%Y-%m-%d", "%d/%m/%Y"):
-        try:
-            return datetime.strptime(text, fmt).date()
-        except ValueError:
-            continue
-    return None
-
-
 def fetch_nse_holidays(timeout: int = 4) -> Set[date]:
     """Fetch official NSE trading holidays from NSE India API."""
-    from curl_cffi import requests
-
-    with requests.Session(impersonate="chrome") as session:
-        session.get("https://www.nseindia.com/resources/exchange-communication-holidays", timeout=timeout)
-        resp = session.get("https://www.nseindia.com/api/holiday-master?type=trading", timeout=timeout)
-        resp.raise_for_status()
-        payload = resp.json()
+    payload = fetch_nse_json(
+        warmup_url="https://www.nseindia.com/resources/exchange-communication-holidays",
+        api_url="https://www.nseindia.com/api/holiday-master?type=trading",
+        timeout=timeout,
+    )
     if not isinstance(payload, dict):
         raise ValueError("Unexpected NSE holiday-master payload type")
 
@@ -130,12 +121,53 @@ def _save_disk_holidays(synced_date: date, holidays_set: Set[date]) -> None:
         pass
 
 
-def get_holidays(force_refresh: bool = False) -> Set[date]:
+def _fetch_and_store_holidays(today: date) -> Optional[Set[date]]:
+    global _HOLIDAYS_MEMORY, _NSE_HOLIDAY_COOLDOWN_UNTIL
+    try:
+        live_set = fetch_nse_holidays()
+        # Keep built-in historical holidays from prior years while trusting NSE for fetched years
+        live_years = {d.year for d in live_set}
+        merged = live_set | {d for d in HOLIDAYS if d.year not in live_years}
+        _save_disk_holidays(today, merged)
+        with _STATE_LOCK:
+            _HOLIDAYS_MEMORY = (today, merged)
+            _NSE_HOLIDAY_COOLDOWN_UNTIL = 0.0
+        return merged
+    except Exception:
+        with _STATE_LOCK:
+            _NSE_HOLIDAY_COOLDOWN_UNTIL = pytime.monotonic() + _RETRY_COOLDOWN_SECONDS
+        return None
+
+
+def _spawn_holiday_refresh_async(today: date) -> None:
+    global _HOLIDAY_REFRESH_INFLIGHT
+    with _STATE_LOCK:
+        if _HOLIDAY_REFRESH_INFLIGHT:
+            return
+        _HOLIDAY_REFRESH_INFLIGHT = True
+
+    def _worker() -> None:
+        global _HOLIDAY_REFRESH_INFLIGHT
+        try:
+            _fetch_and_store_holidays(today)
+        finally:
+            with _STATE_LOCK:
+                _HOLIDAY_REFRESH_INFLIGHT = False
+
+    threading.Thread(target=_worker, name="nse_holiday_refresh", daemon=True).start()
+
+
+def get_holidays(
+    force_refresh: bool = False,
+    background_refresh: bool = False,
+) -> Set[date]:
     """
     Return NSE trading holidays combining cached/live NSE calendar with built-in fallback.
     Refreshes from NSE lazily when stale (>7 days) or missing the current year.
+    When background_refresh=True (and not force_refresh), returns cached/built-in data
+    immediately while refreshing stale holidays asynchronously in the background.
     """
-    global _HOLIDAYS_MEMORY, _NSE_HOLIDAY_COOLDOWN_UNTIL
+    global _HOLIDAYS_MEMORY
 
     today = datetime.now(IST).date()
     now_mono = pytime.monotonic()
@@ -146,7 +178,7 @@ def get_holidays(force_refresh: bool = False) -> Set[date]:
             is_fresh = (today - synced_date).days <= _HOLIDAY_DISK_MAX_AGE_DAYS and any(
                 d.year == today.year for d in cached_set
             )
-            if is_fresh or now_mono < _NSE_HOLIDAY_COOLDOWN_UNTIL:
+            if is_fresh or _HOLIDAY_REFRESH_INFLIGHT or now_mono < _NSE_HOLIDAY_COOLDOWN_UNTIL:
                 return set(cached_set)
 
         disk_loaded = _load_disk_holidays() if not force_refresh else None
@@ -159,22 +191,15 @@ def get_holidays(force_refresh: bool = False) -> Set[date]:
                 _HOLIDAYS_MEMORY = (synced_date, merged)
                 return set(merged)
 
-        should_fetch = force_refresh or (now_mono >= _NSE_HOLIDAY_COOLDOWN_UNTIL)
+        should_fetch = force_refresh or (not _HOLIDAY_REFRESH_INFLIGHT and now_mono >= _NSE_HOLIDAY_COOLDOWN_UNTIL)
 
     if should_fetch:
-        try:
-            live_set = fetch_nse_holidays()
-            # Keep built-in historical holidays from prior years while trusting NSE for fetched years
-            live_years = {d.year for d in live_set}
-            merged = live_set | {d for d in HOLIDAYS if d.year not in live_years}
-            _save_disk_holidays(today, merged)
-            with _STATE_LOCK:
-                _HOLIDAYS_MEMORY = (today, merged)
-                _NSE_HOLIDAY_COOLDOWN_UNTIL = 0.0
-            return set(merged)
-        except Exception:
-            with _STATE_LOCK:
-                _NSE_HOLIDAY_COOLDOWN_UNTIL = pytime.monotonic() + _RETRY_COOLDOWN_SECONDS
+        if background_refresh and not force_refresh:
+            _spawn_holiday_refresh_async(today)
+        else:
+            fetched = _fetch_and_store_holidays(today)
+            if fetched is not None:
+                return set(fetched)
 
     # Preserve original disk sync date so stale caches still retry after the cooldown window.
     if disk_loaded is None and force_refresh:
@@ -192,12 +217,69 @@ def get_holidays(force_refresh: bool = False) -> Set[date]:
     return set(HOLIDAYS)
 
 
+def _fetch_nsei_dates_direct(
+    period: str = "15d",
+    interval: str = "1d",
+    timeout: int = 3,
+) -> Optional[Set[date]]:
+    """Fast Yahoo Chart API path for ^NSEI trading dates without pandas/yfinance overhead."""
+    global _NSEI_SESSION
+    try:
+        from curl_cffi import requests as curl_requests
+    except ImportError:
+        return None
+
+    try:
+        with _NSEI_HTTP_LOCK:
+            if _NSEI_SESSION is None:
+                _NSEI_SESSION = curl_requests.Session(impersonate="chrome")
+            resp = _NSEI_SESSION.get(
+                "https://query1.finance.yahoo.com/v8/finance/chart/%5ENSEI",
+                params={"interval": interval, "range": period, "includePrePost": "false"},
+                timeout=timeout,
+            )
+            if resp.status_code != 200:
+                return None
+            payload = decode_json_response(resp)
+    except Exception:
+        with _NSEI_HTTP_LOCK:
+            if _NSEI_SESSION is not None:
+                try:
+                    _NSEI_SESSION.close()
+                except Exception:
+                    pass
+                _NSEI_SESSION = None
+        return None
+
+    try:
+        res0 = (payload or {}).get("chart", {}).get("result", [None])[0]
+        if not isinstance(res0, dict):
+            return None
+        timestamps = res0.get("timestamp") or []
+        quotes = res0.get("indicators", {}).get("quote") or []
+        closes = quotes[0].get("close") if quotes and isinstance(quotes[0], dict) else None
+        dates: Set[date] = set()
+        for idx, ts in enumerate(timestamps):
+            if ts is None:
+                continue
+            if closes is not None and idx < len(closes) and closes[idx] is None:
+                continue
+            dates.add(datetime.fromtimestamp(int(ts), IST).date())
+        return dates if dates else None
+    except Exception:
+        return None
+
+
 def _fetch_nsei_trading_dates(
     period: str = "15d",
     interval: str = "1d",
     timeout: int = 3,
 ) -> Optional[Set[date]]:
     """Fetch recent Nifty 50 (^NSEI) bar dates to detect actual trading sessions."""
+    direct_dates = _fetch_nsei_dates_direct(period=period, interval=interval, timeout=timeout)
+    if direct_dates:
+        return direct_dates
+
     try:
         import yfinance as yf
 
@@ -301,11 +383,11 @@ def get_previous_trading_day(
     return cal_prev
 
 
-def is_market_open(now: datetime | None = None) -> bool:
+def is_market_open(now: datetime | None = None, background_refresh: bool = False) -> bool:
     """Check whether NSE equity market is open: Mon-Fri (excluding holidays), 09:15 - 15:30 IST."""
     if now is None:
         now = datetime.now(IST)
-    holidays = get_holidays()
+    holidays = get_holidays(background_refresh=background_refresh)
     if now.weekday() >= 5 or now.date() in holidays:
         return False
     t = now.time()

@@ -4,15 +4,28 @@ Today's cumulative volume till now vs Previous day's volume till same time.
 """
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, time
+from datetime import datetime
 import streamlit as st
 import pandas as pd
 
 from universe import get_fno_universe
 from scanner import prune_cache, run_scan
 from holidays import get_holidays, is_market_open, get_previous_trading_day, IST
-
-MARKET_CLOSE_TIME = time(15, 30)
+from oi import OI_BUILDUP_OPTIONS, SIGNAL_BEARISH, SIGNAL_BULLISH
+from screener_filters import (
+    MARKET_CLOSE_TIME,
+    filter_and_sort_results,
+    should_auto_scan as _should_auto_scan,
+    style_scanner_df as _style_scanner_df,
+)
+from table_config import (
+    ALL_COLUMNS,
+    COLUMN_CONFIG,
+    COLUMN_GUIDE_MARKDOWN,
+    COLUMN_LABELS,
+    DEFAULT_COLUMNS,
+    SORT_OPTIONS,
+)
 
 st.set_page_config(
     page_title="F&O Relative Volume Scanner",
@@ -23,81 +36,15 @@ st.set_page_config(
 st.title("📈 F&O Relative Volume Scanner")
 st.caption("Today's volume till now vs Previous trading day volume till same clock time (IST)")
 
-DEFAULT_COLUMNS = [
-    "Symbol",
-    "LTP",
-    "Vol_Today",
-    "Vol_Prev_Same_Time",
-    "Ratio",
-    "Pct_Change",
-    "Last_Bar_Time",
-]
-
-ALL_COLUMNS = [
-    "Symbol",
-    "LTP",
-    "Vol_Today",
-    "Vol_Prev_Same_Time",
-    "Ratio",
-    "Pct_Change",
-    "Last_Bar_Time",
-    "Gap_Pct",
-    "Prev_Close",
-    "Day_Open",
-    "Day_High",
-    "Day_Low",
-    "Range_Pct",
-    "Vol_Diff",
-    "Prev_Full_Vol",
-    "Turnover_Cr",
-]
-
-COLUMN_LABELS = {
-    "Symbol": "Symbol",
-    "LTP": "LTP",
-    "Vol_Today": "Vol Today (till now)",
-    "Vol_Prev_Same_Time": "Vol Prev (same time)",
-    "Ratio": "Ratio",
-    "Pct_Change": "% Chg",
-    "Last_Bar_Time": "Last Bar (IST)",
-    "Gap_Pct": "Gap %",
-    "Prev_Close": "Prev Close",
-    "Day_Open": "Day Open",
-    "Day_High": "Day High",
-    "Day_Low": "Day Low",
-    "Range_Pct": "Day Range %",
-    "Vol_Diff": "Vol Diff",
-    "Prev_Full_Vol": "Prev Full Day Vol",
-    "Turnover_Cr": "Turnover (₹ Cr)",
-}
-
-COLUMN_CONFIG = {
-    "Symbol": st.column_config.TextColumn("Symbol", width="medium"),
-    "LTP": st.column_config.NumberColumn("LTP", format="%.2f"),
-    "Vol_Today": st.column_config.NumberColumn("Vol Today (till now)", format="localized"),
-    "Vol_Prev_Same_Time": st.column_config.NumberColumn("Vol Prev (same time)", format="localized"),
-    "Ratio": st.column_config.NumberColumn("Ratio", format="%.2f×"),
-    "Pct_Change": st.column_config.NumberColumn("% Chg", format="%+.2f%%"),
-    "Last_Bar_Time": st.column_config.TextColumn(
-        "Last Bar (IST)",
-        help="Latest regular-hours bar timestamp (IST) used for bar-aligned baseline lookup.",
-    ),
-    "Gap_Pct": st.column_config.NumberColumn("Gap %", format="%+.2f%%"),
-    "Prev_Close": st.column_config.NumberColumn("Prev Close", format="%.2f"),
-    "Day_Open": st.column_config.NumberColumn("Day Open", format="%.2f"),
-    "Day_High": st.column_config.NumberColumn("Day High", format="%.2f"),
-    "Day_Low": st.column_config.NumberColumn("Day Low", format="%.2f"),
-    "Range_Pct": st.column_config.NumberColumn("Day Range %", format="%.2f%%"),
-    "Vol_Diff": st.column_config.NumberColumn("Vol Diff", format="localized"),
-    "Prev_Full_Vol": st.column_config.NumberColumn("Prev Full Day Vol", format="localized"),
-    "Turnover_Cr": st.column_config.NumberColumn("Turnover (₹ Cr)", format="%.2f"),
-}
+with st.expander("📘 Column & Momentum Guide — How to Use", expanded=False):
+    st.markdown(COLUMN_GUIDE_MARKDOWN)
 
 
 @st.cache_resource
 def _run_startup_housekeeping() -> bool:
-    """Prune stale/legacy cache files once per Streamlit server lifecycle."""
+    """Prune stale/legacy cache files and warm holiday calendar asynchronously once per server lifecycle."""
     prune_cache()
+    get_holidays(background_refresh=True)
     return True
 
 
@@ -115,6 +62,10 @@ if "scan_times_by_interval" not in st.session_state:
     st.session_state.scan_times_by_interval = {}
 if "selected_columns" not in st.session_state:
     st.session_state.selected_columns = DEFAULT_COLUMNS.copy()
+else:
+    st.session_state.selected_columns = [
+        c for c in st.session_state.selected_columns if c in ALL_COLUMNS
+    ]
 if "_skip_auto_scan_once" not in st.session_state:
     st.session_state._skip_auto_scan_once = False
 if "_last_filter_state" not in st.session_state:
@@ -177,7 +128,91 @@ with st.sidebar:
             "though a forming 5m bar compares against the full previous-day 5m bar until that 5-minute window completes."
         ),
     )
-    max_workers = st.slider("Parallel download threads", 4, 16, 8)
+    max_workers = st.slider(
+        "Parallel download threads",
+        4,
+        16,
+        8,
+        help=(
+            "Fallback yfinance thread count (default 8). The primary HTTP/2 async chart fetcher "
+            "automatically runs 3× this value concurrently, capped at 28 (default 8 → 24 async streams)."
+        ),
+    )
+    include_oi = st.checkbox(
+        "Include NSE OI",
+        value=True,
+        help="Fetch aggregate F&O Open Interest & Day OI Change from NSE (1 rate-limited request every >=45s with backoff).",
+    )
+    min_oi_chg_pct = None
+    oi_buildup_filter: list[str] = []
+    if include_oi:
+        min_oi_chg_pct = st.number_input(
+            "Min OI Chg % (Day)",
+            min_value=-100.0,
+            max_value=1000.0,
+            value=None,
+            step=1.0,
+            placeholder="Any (e.g. 5.0)",
+            help="Show stocks with Day OI Chg % >= threshold (leave blank for all).",
+        )
+        oi_buildup_filter = st.multiselect(
+            "OI Buildup (Price Δ vs OI Δ)",
+            options=list(OI_BUILDUP_OPTIONS),
+            default=[],
+            placeholder="All patterns",
+            help="Filter by intraday Price Change vs Day OI Change pattern.",
+        )
+
+    available_sorts = [
+        label
+        for label, (col, _, _) in SORT_OPTIONS.items()
+        if include_oi or (not col.startswith("OI") and col != "Signal")
+    ]
+    sort_by = st.selectbox(
+        "Sort results by",
+        options=available_sorts,
+        index=0,
+        help="Sort scanned results immediately in memory.",
+    )
+
+    use_momentum_filter = st.checkbox(
+        "Momentum Quality Filters",
+        value=False,
+        help="Filter out faded spikes, weak day-range closes, red-candle gap-ups, and dead morning volume.",
+    )
+    momentum_filter_state = None
+    if use_momentum_filter:
+        require_vwap_aligned = st.checkbox(
+            "VWAP aligned (+ above / - below)",
+            value=True,
+            help="Require LTP > VWAP for gainers (% Chg > 0) and LTP < VWAP for losers (% Chg < 0).",
+        )
+        require_open_aligned = st.checkbox(
+            "Intraday candle aligned (From Open %)",
+            value=True,
+            help="Require LTP > Day Open for gainers and LTP < Day Open for losers (filters faded gap-ups/downs).",
+        )
+        range_edge_pct = st.slider(
+            "Hold within % of Day High/Low",
+            10,
+            50,
+            30,
+            help="Require Range Pos >= (100 - X)% for gainers or <= X% for losers (e.g. 30 = top/bottom 30%).",
+        )
+        min_vol_burst_15m = st.number_input(
+            "Min 15m Vol Burst (×)",
+            min_value=0.0,
+            max_value=20.0,
+            value=1.2,
+            step=0.1,
+            help="Require recent 15m volume pace >= X times today's average pace (0 disables).",
+        )
+        momentum_filter_state = (
+            bool(require_vwap_aligned),
+            bool(require_open_aligned),
+            int(range_edge_pct),
+            float(min_vol_burst_15m),
+        )
 
     st.markdown("---")
     auto_refresh = st.checkbox("Auto-refresh", value=False)
@@ -217,6 +252,11 @@ current_filter_state = (
     bool(exclude_gap_down),
     float(gap_threshold),
     int(max_workers),
+    bool(include_oi),
+    None if min_oi_chg_pct is None else float(min_oi_chg_pct),
+    tuple(oi_buildup_filter),
+    sort_by,
+    momentum_filter_state,
 )
 if (
     st.session_state._last_filter_state is not None
@@ -242,43 +282,33 @@ def _reset_default_columns() -> None:
     st.session_state._skip_auto_scan_once = True
 
 
-def _should_auto_scan(
-    now: datetime,
-    last_scan_dt: datetime | None,
-    refresh_seconds: int,
-    market_open: bool,
-    holidays_set: set,
-    skip_auto_scan: bool,
-    post_close_attempts: int = 0,
-    max_post_close_attempts: int = 2,
-    last_scan_started_dt: datetime | None = None,
-) -> bool:
-    """
-    Decide whether a scheduled auto-refresh scan should execute:
-    - Never run during pure UI/filter interactions.
-    - Poll every refresh_seconds while NSE is open.
-    - Allow a bounded post-close snapshot (up to max_post_close_attempts on empty data) after 15:30 IST.
-    - Stay idle pre-market, on weekends, and on holidays.
-    """
-    if skip_auto_scan:
-        return False
-
-    if market_open:
-        cadence_ref = last_scan_started_dt or last_scan_dt
-        if cadence_ref is None or cadence_ref.date() != now.date():
-            return True
-        elapsed = (now - cadence_ref).total_seconds()
-        return elapsed >= max(refresh_seconds - 1, 1)
-
-    is_trading_day = now.weekday() < 5 and now.date() not in holidays_set
-    if is_trading_day and now.time() > MARKET_CLOSE_TIME:
-        if post_close_attempts >= max_post_close_attempts:
-            return False
-        market_close_dt = now.replace(hour=15, minute=30, second=0, microsecond=0)
-        if last_scan_dt is None or last_scan_dt.date() < now.date() or last_scan_dt < market_close_dt:
-            return True
-
-    return False
+def _filter_and_sort_results(
+    raw_df: pd.DataFrame,
+    min_ratio: float,
+    min_volume: int,
+    exclude_gap_up: bool,
+    exclude_gap_down: bool,
+    gap_threshold: float,
+    include_oi: bool,
+    min_oi_chg_pct: float | None,
+    oi_buildup_filter: tuple[str, ...],
+    sort_by: str,
+    momentum_filter_state: tuple[bool, bool, int, float] | None = None,
+) -> tuple[pd.DataFrame, bool, int, bool, int, bool, int]:
+    return filter_and_sort_results(
+        raw_df=raw_df,
+        min_ratio=min_ratio,
+        min_volume=min_volume,
+        exclude_gap_up=exclude_gap_up,
+        exclude_gap_down=exclude_gap_down,
+        gap_threshold=gap_threshold,
+        include_oi=include_oi,
+        min_oi_chg_pct=min_oi_chg_pct,
+        oi_buildup_filter=oi_buildup_filter,
+        sort_by=sort_by,
+        sort_options=SORT_OPTIONS,
+        momentum_filter_state=momentum_filter_state,
+    )
 
 
 def render_scanner(
@@ -292,10 +322,15 @@ def render_scanner(
     max_workers: int,
     auto_refresh: bool,
     refresh_seconds: int,
+    include_oi: bool = True,
+    min_oi_chg_pct: float | None = None,
+    oi_buildup_filter: tuple[str, ...] = (),
+    sort_by: str = "Ratio (High → Low)",
+    momentum_filter_state: tuple[bool, bool, int, float] | None = None,
 ):
     now = datetime.now(IST)
-    holidays_set = get_holidays()
-    market_open = is_market_open(now)
+    holidays_set = get_holidays(background_refresh=True)
+    market_open = is_market_open(now, background_refresh=True)
 
     last_scan_dt = st.session_state.scan_times_by_interval.get(interval)
     last_scan_started_dt = st.session_state._scan_started_by_interval.get(interval)
@@ -361,6 +396,7 @@ def render_scanner(
                     interval=interval,
                     max_workers=max_workers,
                     prev_day=prev_day,
+                    include_oi=include_oi,
                 )
                 if not raw_df.empty:
                     st.session_state.results_by_interval[interval] = raw_df
@@ -380,7 +416,7 @@ def render_scanner(
 
     if auto_refresh:
         now_after = datetime.now(IST)
-        if is_market_open(now_after):
+        if is_market_open(now_after, background_refresh=True):
             info_slot.caption(
                 f"⏱️ **Auto-refresh active** (every {refresh_seconds}s). "
                 "Updating in the background without full-page reloads."
@@ -388,52 +424,143 @@ def render_scanner(
         else:
             info_slot.caption("⏸️ **Auto-refresh paused** (market closed). Manual **Scan Now** still works anytime.")
 
-    # Client-side filtering on the cached scan snapshot for the active interval
+    # Client-side filtering & sorting on the cached scan snapshot for the active interval
     raw_df = st.session_state.results_by_interval.get(interval, pd.DataFrame())
     raw_empty_dt = st.session_state._last_scan_empty_by_interval.get(interval)
     empty_scan_dt = raw_empty_dt if (raw_empty_dt is not None and raw_empty_dt.date() == now.date()) else None
-    gap_missing = False
-    gap_excluded_count = 0
+    df, gap_missing, gap_excluded_count, oi_missing, oi_excluded_count, momentum_missing, momentum_excluded_count = _filter_and_sort_results(
+        raw_df=raw_df,
+        min_ratio=min_ratio,
+        min_volume=min_volume,
+        exclude_gap_up=exclude_gap_up,
+        exclude_gap_down=exclude_gap_down,
+        gap_threshold=gap_threshold,
+        include_oi=include_oi,
+        min_oi_chg_pct=min_oi_chg_pct,
+        oi_buildup_filter=oi_buildup_filter,
+        sort_by=sort_by,
+        momentum_filter_state=momentum_filter_state,
+    )
 
-    if raw_df.empty:
-        df = raw_df
-    else:
-        working_df = raw_df
-        if "Gap_Pct" not in working_df.columns and {"Day_Open", "Prev_Close"}.issubset(working_df.columns):
-            working_df = working_df.copy()
-            valid_prev = working_df["Prev_Close"].notna() & (working_df["Prev_Close"] > 0)
-            working_df["Gap_Pct"] = float("nan")
-            working_df.loc[valid_prev, "Gap_Pct"] = (
-                (working_df.loc[valid_prev, "Day_Open"] - working_df.loc[valid_prev, "Prev_Close"])
-                / working_df.loc[valid_prev, "Prev_Close"]
-            ) * 100
+    has_signals = include_oi and (not df.empty) and ("Signal" in df.columns)
+    table_df = df
+    sig_choice = "All"
 
-        base_mask = (working_df["Ratio"] >= min_ratio) & (working_df["Vol_Today"] >= int(min_volume))
-        mask = base_mask.copy()
+    with results_slot:
+        if df.empty:
+            if last_scan_dt is None and empty_scan_dt is None:
+                st.info("Click **Scan Now** or enable **Auto-refresh** in the sidebar to run the scan.")
+            elif not raw_df.empty:
+                st.warning("No stocks matched the current filters. Try lowering the Minimum Ratio or Volume.")
+        else:
+            if has_signals:
+                bullish_count = int((df["Signal"] == SIGNAL_BULLISH).sum())
+                bearish_count = int((df["Signal"] == SIGNAL_BEARISH).sum())
+                total_count = len(df)
+                col_sig_summary, col_sig_pills = st.columns([3, 2], vertical_alignment="center")
+                with col_sig_summary:
+                    st.markdown(
+                        f"**Signals:** &nbsp;{SIGNAL_BULLISH}: **{bullish_count}** &nbsp;|&nbsp; "
+                        f"{SIGNAL_BEARISH}: **{bearish_count}** &nbsp;|&nbsp; **All:** {total_count}"
+                    )
+                    st.caption("Highlight rule: Ratio > 1.0×, OI Chg > +10%, % Chg > +1.5% / < -1.5%")
+                with col_sig_pills:
+                    sig_choice = (
+                        st.segmented_control(
+                            "Quick Signal Filter",
+                            options=["All", SIGNAL_BULLISH, SIGNAL_BEARISH],
+                            default="All",
+                            selection_mode="single",
+                            label_visibility="collapsed",
+                            key="quick_signal_filter",
+                            on_change=_mark_ui_interaction,
+                        )
+                        or "All"
+                    )
+                if sig_choice in (SIGNAL_BULLISH, SIGNAL_BEARISH):
+                    table_df = df[df["Signal"] == sig_choice].reset_index(drop=True)
 
-        if exclude_gap_up or exclude_gap_down:
-            if "Gap_Pct" not in working_df.columns:
-                gap_missing = True
+            if table_df.empty:
+                st.info(f"No **{sig_choice}** stocks matched the current scan and filters.")
             else:
-                gap_vals = pd.to_numeric(working_df["Gap_Pct"], errors="coerce")
-                if exclude_gap_up:
-                    mask &= gap_vals.isna() | (gap_vals <= gap_threshold)
-                if exclude_gap_down:
-                    mask &= gap_vals.isna() | (gap_vals >= -gap_threshold)
-                gap_excluded_count = int(base_mask.sum() - mask.sum())
+                st.session_state.selected_columns = [
+                    c for c in st.session_state.selected_columns if c in ALL_COLUMNS
+                ]
+                with st.popover("⚙️ Customize Columns"):
+                    st.multiselect(
+                        "Visible columns (add, remove, or reorder)",
+                        options=ALL_COLUMNS,
+                        format_func=lambda col: COLUMN_LABELS.get(col, col),
+                        key="selected_columns",
+                        on_change=_mark_ui_interaction,
+                    )
+                    st.button("Reset to Default", on_click=_reset_default_columns)
 
-        df = working_df[mask].reset_index(drop=True)
+                visible_cols = [c for c in st.session_state.selected_columns if c in table_df.columns]
+                if not visible_cols:
+                    st.warning("Select at least one column in **Customize Columns** to display results.")
+                else:
+                    display_df = table_df[visible_cols]
+                    active_config = {c: COLUMN_CONFIG[c] for c in visible_cols if c in COLUMN_CONFIG}
+                    table_data = (
+                        _style_scanner_df(display_df, table_df["Signal"])
+                        if has_signals
+                        else display_df
+                    )
+
+                    st.dataframe(
+                        table_data,
+                        width="stretch",
+                        hide_index=True,
+                        column_config=active_config,
+                        key="scanner_table",
+                    )
+
+                    csv = display_df.to_csv(index=False).encode("utf-8")
+                    csv_ts = (last_scan_dt or now).strftime("%Y%m%d_%H%M")
+                    st.download_button(
+                        "⬇️ Download CSV",
+                        data=csv,
+                        file_name=f"relative_volume_{interval}_{csv_ts}.csv",
+                        mime="text/csv",
+                        key=f"download_csv_{interval}",
+                        on_click="ignore",
+                    )
 
     with status_slot:
         if last_scan_dt is not None:
             gap_note = ""
             if (exclude_gap_up or exclude_gap_down) and not gap_missing:
                 gap_note = f" | Excluded by gap filter: **{gap_excluded_count}**"
+            oi_filter_note = ""
+            if include_oi and (min_oi_chg_pct is not None or oi_buildup_filter) and not oi_missing:
+                oi_filter_note = f" | Filtered by OI: **{oi_excluded_count}**"
+            mom_filter_note = ""
+            if momentum_filter_state is not None and not momentum_missing:
+                mom_filter_note = f" | Filtered by momentum: **{momentum_excluded_count}**"
+            oi_meta = raw_df.attrs.get("oi_meta") if include_oi else None
+            oi_note = ""
+            if isinstance(oi_meta, dict):
+                nse_ts = oi_meta.get("nse_timestamp")
+                if nse_ts:
+                    oi_note = f" | NSE OI @ {nse_ts.split(' ')[-1]}"
+            if sig_choice in (SIGNAL_BULLISH, SIGNAL_BEARISH):
+                count_summary = (
+                    f"Showing **{len(table_df)}** {sig_choice} of **{len(df)}** matching "
+                    f"(**{len(raw_df)}** scanned)"
+                )
+            else:
+                count_summary = f"Showing **{len(df)}** of **{len(raw_df)}** scanned stocks"
             st.success(
                 f"Last scan: {last_scan_dt.strftime('%H:%M:%S IST')} "
                 f"({interval} bars) | "
-                f"Showing **{len(df)}** of **{len(raw_df)}** scanned stocks{gap_note}"
+                f"{count_summary}{gap_note}{oi_filter_note}{mom_filter_note}{oi_note}"
             )
+            if isinstance(oi_meta, dict) and oi_meta.get("error"):
+                cd = int(round(oi_meta.get("cooldown_seconds") or 0))
+                cd_note = f" (cooling down {cd}s)" if cd > 0 else ""
+                fallback_msg = "using last cached OI snapshot" if oi_meta.get("nse_timestamp") else "OI unavailable"
+                st.warning(f"NSE OI notice: {oi_meta['error']}{cd_note} — {fallback_msg}.")
             if empty_scan_dt is not None and not raw_df.empty:
                 st.warning(
                     f"Latest scan at {empty_scan_dt.strftime('%H:%M:%S IST')} returned no data — "
@@ -443,6 +570,14 @@ def render_scanner(
                 st.warning(
                     "Current results were scanned before Gap % data was added — click **Scan Now** once to apply the gap filter."
                 )
+            if oi_missing:
+                st.warning(
+                    "Current results were scanned without OI data — click **Scan Now** once to apply OI filters."
+                )
+            if momentum_missing:
+                st.warning(
+                    "Current results were scanned before VWAP / 15m Vol Burst metrics were added — click **Scan Now** once to apply all momentum filters."
+                )
         elif empty_scan_dt is not None:
             st.warning(
                 f"Scan at {empty_scan_dt.strftime('%H:%M:%S IST')} returned no intraday data for today "
@@ -450,49 +585,6 @@ def render_scanner(
             )
         elif st.session_state.results_by_interval:
             st.info(f"No **{interval}** snapshot yet — click **Scan Now** to fetch {interval} bars.")
-
-    with results_slot:
-        if df.empty:
-            if last_scan_dt is None and empty_scan_dt is None:
-                st.info("Click **Scan Now** or enable **Auto-refresh** in the sidebar to run the scan.")
-            elif not raw_df.empty:
-                st.warning("No stocks matched the current filters. Try lowering the Minimum Ratio or Volume.")
-        else:
-            with st.popover("⚙️ Customize Columns"):
-                st.multiselect(
-                    "Visible columns (add, remove, or reorder)",
-                    options=ALL_COLUMNS,
-                    format_func=lambda col: COLUMN_LABELS.get(col, col),
-                    key="selected_columns",
-                    on_change=_mark_ui_interaction,
-                )
-                st.button("Reset to Default", on_click=_reset_default_columns)
-
-            visible_cols = [c for c in st.session_state.selected_columns if c in df.columns]
-            if not visible_cols:
-                st.warning("Select at least one column in **Customize Columns** to display results.")
-            else:
-                display_df = df[visible_cols]
-                active_config = {c: COLUMN_CONFIG[c] for c in visible_cols if c in COLUMN_CONFIG}
-
-                st.dataframe(
-                    display_df,
-                    width="stretch",
-                    hide_index=True,
-                    column_config=active_config,
-                    key="scanner_table",
-                )
-
-                csv = display_df.to_csv(index=False).encode("utf-8")
-                csv_ts = (last_scan_dt or now).strftime("%Y%m%d_%H%M")
-                st.download_button(
-                    "⬇️ Download CSV",
-                    data=csv,
-                    file_name=f"relative_volume_{interval}_{csv_ts}.csv",
-                    mime="text/csv",
-                    key=f"download_csv_{interval}",
-                    on_click="ignore",
-                )
 
 
 # Bind fragment dynamically with run_every when auto_refresh is enabled
@@ -512,10 +604,15 @@ scanner_fragment(
     max_workers=max_workers,
     auto_refresh=auto_refresh,
     refresh_seconds=refresh_seconds,
+    include_oi=include_oi,
+    min_oi_chg_pct=None if min_oi_chg_pct is None else float(min_oi_chg_pct),
+    oi_buildup_filter=tuple(oi_buildup_filter),
+    sort_by=sort_by,
+    momentum_filter_state=momentum_filter_state,
 )
 
 st.markdown("---")
 st.caption(
-    "Data source: yfinance (Yahoo Finance). 1-minute data is limited and may have gaps. "
-    "This is for educational / research purposes only. Not investment advice."
+    "Data sources: Yahoo Finance (intraday OHLCV) & NSE India (F&O OI & holidays). "
+    "1-minute data is limited and may have gaps. For educational / research purposes only — not investment advice."
 )
