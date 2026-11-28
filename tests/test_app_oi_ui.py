@@ -614,6 +614,12 @@ class AppOiUiTest(unittest.TestCase):
             self.assertTrue(
                 any("https://custom-cloud.streamlit.app" in c.value for c in at.caption)
             )
+            html_links = at.get("html")
+            self.assertTrue(html_links)
+            body = html_links[0].body
+            self.assertIn('id="upstox_same_tab_login"', body)
+            self.assertIn("https%3A%2F%2Fcustom-cloud.streamlit.app", body)
+            self.assertIn('setAttribute("target", "_top")', body)
 
 
 if __name__ == "__main__":

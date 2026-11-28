@@ -5,6 +5,7 @@ Today's cumulative volume till now vs Previous day's volume till same time.
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+import html
 import os
 from typing import Any
 import streamlit as st
@@ -423,6 +424,49 @@ def _oauth_tab_sync_poller(provider: str, nonce: str) -> None:
 _sync_oauth_tab_fragment = st.fragment(_oauth_tab_sync_poller, run_every=2)
 
 
+def _render_same_tab_login_link(label: str, url: str, link_id: str) -> None:
+    """Render a full-width button-styled link targeting _top so OAuth login stays in one tab."""
+    safe_id = html.escape(link_id, quote=True)
+    safe_url = html.escape(url, quote=True)
+    safe_label = html.escape(label, quote=False)
+    st.html(
+        f"""
+        <style>
+          #{safe_id} {{
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 100%;
+            box-sizing: border-box;
+            min-height: 2.4rem;
+            padding: 0.4rem 0.75rem;
+            border-radius: 0.5rem;
+            border: 1px solid rgba(128, 128, 128, 0.35);
+            color: inherit;
+            text-decoration: none;
+            font-size: 0.875rem;
+            font-weight: 400;
+            line-height: 1.4;
+            transition: border-color 0.15s ease, background-color 0.15s ease;
+          }}
+          #{safe_id}:hover {{
+            border-color: rgb(255, 75, 75);
+            color: rgb(255, 75, 75);
+            background-color: rgba(255, 75, 75, 0.06);
+          }}
+        </style>
+        <a id="{safe_id}" href="{safe_url}">{safe_label}</a>
+        <script>
+          (function() {{
+            var el = document.getElementById("{safe_id}");
+            if (el) {{ el.setAttribute("target", "_top"); }}
+          }})();
+        </script>
+        """,
+        unsafe_allow_javascript=True,
+    )
+
+
 def _render_local_persist_toggle() -> bool:
     """Render persistent storage toggle (auto-enabled on localhost/LAN, off on public cloud)."""
     if "_w_remember_local" not in st.session_state:
@@ -608,7 +652,9 @@ with st.sidebar:
                 st.session_state._u_oauth_nonce = u_state
                 login_url = build_upstox_login_url(u_cid, u_redir, state=u_state)
                 st.caption(f"Callback URL: `{u_redir}`")
-                st.link_button("1️⃣ Open Upstox Daily Login", login_url, width="stretch")
+                _render_same_tab_login_link(
+                    "1️⃣ Open Upstox Daily Login", login_url, "upstox_same_tab_login"
+                )
                 if not upstox_token:
                     _sync_oauth_tab_fragment("upstox", u_state)
             else:
@@ -638,9 +684,7 @@ with st.sidebar:
                         active_state = st.session_state.pop("_active_up_oauth_state", "")
                         if active_state:
                             store_completed_oauth_token(active_state, {"access_token": tok})
-                            notice_msg = "Upstox token saved! You can close this tab and switch back to your original tab, or continue scanning here."
-                        else:
-                            notice_msg = "Upstox token saved for today's session."
+                        notice_msg = "Upstox token saved for today's session — ready to scan."
                         if remember_local:
                             save_local_broker_auth(
                                 "upstox",
@@ -813,7 +857,9 @@ with st.sidebar:
                     st.session_state._fp_oauth_nonce = fp_state
                     fp_login_url = build_fivepaisa_login_url(fp_user_key, fp_redir, state=fp_state)
                     st.caption(f"Callback URL: `{fp_redir}`")
-                    st.link_button("1️⃣ Open 5paisa Daily Login", fp_login_url, width="stretch")
+                    _render_same_tab_login_link(
+                        "1️⃣ Open 5paisa Daily Login", fp_login_url, "fivepaisa_same_tab_login"
+                    )
                     if not fivepaisa_token:
                         _sync_oauth_tab_fragment("fivepaisa", fp_state)
                 else:
@@ -851,9 +897,7 @@ with st.sidebar:
                                     active_state,
                                     {"access_token": tok, "client_code": resolved_cc},
                                 )
-                                notice_msg = "5paisa token saved! You can close this tab and switch back to your original tab, or continue scanning here."
-                            else:
-                                notice_msg = "5paisa token saved for today's session."
+                            notice_msg = "5paisa token saved for today's session — ready to scan."
                             if remember_local:
                                 save_local_broker_auth(
                                     "fivepaisa",
