@@ -94,6 +94,43 @@ def is_local_host_request(headers: Any) -> bool:
         return False
 
 
+def detect_default_redirect_uri(
+    context_url: Any = None,
+    headers: Any = None,
+    fallback: str = "http://localhost:8501",
+) -> str:
+    """
+    Detect the active app root URL from st.context.url or HTTP Host headers so Streamlit Cloud
+    deployments default to https://<app>.streamlit.app instead of http://localhost:8501.
+    """
+    if isinstance(context_url, str) and context_url.strip():
+        parsed = urlparse(context_url.strip())
+        if parsed.scheme in ("http", "https") and parsed.netloc:
+            path = (parsed.path or "").rstrip("/")
+            return f"{parsed.scheme}://{parsed.netloc}{path}"
+
+    if headers and hasattr(headers, "get"):
+        try:
+            raw_host = headers.get("Host") or headers.get("host") or ""
+        except Exception:
+            raw_host = ""
+        if isinstance(raw_host, str) and raw_host.strip():
+            try:
+                raw_proto = headers.get("X-Forwarded-Proto") or headers.get("x-forwarded-proto") or ""
+            except Exception:
+                raw_proto = ""
+            proto = (
+                str(raw_proto).split(",")[0].strip().lower()
+                if isinstance(raw_proto, str)
+                else ""
+            )
+            if proto not in ("http", "https"):
+                proto = "http" if is_local_host_request(headers) else "https"
+            return f"{proto}://{raw_host.strip()}"
+
+    return fallback
+
+
 def _prune_handoffs_locked(now_mono: float) -> None:
     expired = [k for k, (exp, _) in _PENDING_OAUTH_HANDOFFS.items() if exp <= now_mono]
     for k in expired:

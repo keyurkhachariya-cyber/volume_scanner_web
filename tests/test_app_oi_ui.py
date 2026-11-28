@@ -559,6 +559,51 @@ class AppOiUiTest(unittest.TestCase):
                 self.assertEqual(cleared["access_token"], "")
                 self.assertEqual(cleared["client_id"], "CID_L")
 
+    def test_detect_default_redirect_uri_and_secrets_override_in_session(self):
+        import streamlit as st
+        import ui.auth_helpers as auth_helpers
+
+        self.assertEqual(
+            auth_helpers.detect_default_redirect_uri("https://fno-vol.streamlit.app/?code=123", {}),
+            "https://fno-vol.streamlit.app",
+        )
+        self.assertEqual(
+            auth_helpers.detect_default_redirect_uri("https://fno-vol.streamlit.app/", {}),
+            "https://fno-vol.streamlit.app",
+        )
+        self.assertEqual(
+            auth_helpers.detect_default_redirect_uri(None, {"Host": "fno-vol.streamlit.app", "X-Forwarded-Proto": "https"}),
+            "https://fno-vol.streamlit.app",
+        )
+        self.assertEqual(
+            auth_helpers.detect_default_redirect_uri(None, {"Host": "localhost:8501"}),
+            "http://localhost:8501",
+        )
+        self.assertEqual(auth_helpers.detect_default_redirect_uri(None, {}), "http://localhost:8501")
+
+        # Hosted app URL auto-populates Redirect URI and updated st.secrets overrides stale session default
+        at = AppTest.from_file(os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")), "app.py"), default_timeout=15)
+        with (
+            patch.object(universe, "get_fno_universe", return_value=(["RELIANCE.NS"], "Mock")),
+            patch.object(type(st.context), "url", new="https://hosted-scanner.streamlit.app/"),
+        ):
+            at.run()
+            [c for c in at.segmented_control if c.label == "Data Source"][0].set_value("Upstox v3").run()
+            self.assertEqual(
+                [t for t in at.text_input if t.label == "Redirect URI"][0].value,
+                "https://hosted-scanner.streamlit.app",
+            )
+            at.secrets["upstox"] = {
+                "client_id": "CID_CLOUD",
+                "client_secret": "CSEC_CLOUD",
+                "redirect_uri": "https://custom-cloud.streamlit.app",
+            }
+            at.run()
+            self.assertEqual(at.session_state._u_redirect_uri, "https://custom-cloud.streamlit.app")
+            self.assertTrue(
+                any("https://custom-cloud.streamlit.app" in c.value for c in at.caption)
+            )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

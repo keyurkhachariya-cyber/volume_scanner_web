@@ -27,6 +27,7 @@ from providers import (
 )
 from providers.common.stream_base import enforce_market_hours_shutdown
 from ui.auth_helpers import (
+    detect_default_redirect_uri,
     extract_oauth_param,
     inspect_fivepaisa_jwt,
     is_local_host_request,
@@ -120,6 +121,17 @@ def _detect_local_browser() -> bool:
         return False
 
 
+def _default_redirect_uri() -> str:
+    try:
+        ctx = st.context
+        return detect_default_redirect_uri(
+            context_url=getattr(ctx, "url", None),
+            headers=getattr(ctx, "headers", None),
+        )
+    except Exception:
+        return "http://localhost:8501"
+
+
 def _snapshot_key(interval: str, data_source: str) -> str:
     """Return isolated session snapshot cache key per interval and market data provider."""
     if data_source == "Upstox v3":
@@ -199,21 +211,32 @@ if "fivepaisa_client_code" not in st.session_state:
 if "data_source_choice" not in st.session_state:
     st.session_state.data_source_choice = "Yahoo Finance"
 
-for _sk, _sec, _fld, _dft, _loc in (
-    ("_u_client_id", "upstox", "client_id", "", _init_local_up),
-    ("_u_client_secret", "upstox", "client_secret", "", _init_local_up),
-    ("_u_redirect_uri", "upstox", "redirect_uri", "http://localhost:8501", _init_local_up),
-    ("_u_auth_code", "", "", "", None),
-    ("_fp_user_key", "fivepaisa", "user_key", "", _init_local_fp),
-    ("_fp_enc_key", "fivepaisa", "encryption_key", "", _init_local_fp),
-    ("_fp_user_id", "fivepaisa", "user_id", "", _init_local_fp),
-    ("_fp_redirect_uri", "fivepaisa", "redirect_uri", "http://localhost:8501", _init_local_fp),
-    ("_fp_totp_pin", "fivepaisa", "pin", "", None),
-    ("_fp_totp_secret", "fivepaisa", "totp_secret", "", None),
-    ("_fp_req_token", "", "", "", None),
+_detected_redirect_uri = _default_redirect_uri()
+
+for _sk, _wk, _sec, _fld, _dft, _loc in (
+    ("_u_client_id", "_w_u_client_id", "upstox", "client_id", "", _init_local_up),
+    ("_u_client_secret", "_w_u_client_secret", "upstox", "client_secret", "", _init_local_up),
+    ("_u_redirect_uri", "_w_u_redirect_uri", "upstox", "redirect_uri", _detected_redirect_uri, _init_local_up),
+    ("_u_auth_code", "_w_u_auth_code", "", "", "", None),
+    ("_fp_user_key", "_w_fp_user_key", "fivepaisa", "user_key", "", _init_local_fp),
+    ("_fp_enc_key", "_w_fp_enc_key", "fivepaisa", "encryption_key", "", _init_local_fp),
+    ("_fp_user_id", "_w_fp_user_id", "fivepaisa", "user_id", "", _init_local_fp),
+    ("_fp_redirect_uri", "_w_fp_redirect_uri", "fivepaisa", "redirect_uri", _detected_redirect_uri, _init_local_fp),
+    ("_fp_totp_pin", "_w_fp_totp_pin", "fivepaisa", "pin", "", None),
+    ("_fp_totp_secret", "_w_fp_totp_secret", "fivepaisa", "totp_secret", "", None),
+    ("_fp_req_token", "_w_fp_req_token", "", "", "", None),
 ):
+    _explicit_sec = _get_broker_secret(_sec, _fld, "") if _sec else ""
+    _snap_key = f"_secret_snap_{_sk}"
     if _sk not in st.session_state:
-        st.session_state[_sk] = _get_broker_secret(_sec, _fld, _dft, local_auth=_loc) if _sec else _dft
+        st.session_state[_snap_key] = _explicit_sec
+        st.session_state[_sk] = _explicit_sec or (
+            _get_broker_secret(_sec, _fld, _dft, local_auth=_loc) if _sec else _dft
+        )
+    elif _sec and _explicit_sec and _explicit_sec != st.session_state.get(_snap_key, ""):
+        st.session_state[_snap_key] = _explicit_sec
+        st.session_state[_sk] = _explicit_sec
+        st.session_state[_wk] = _explicit_sec
 
 
 def _apply_pending_auth_updates() -> None:
@@ -410,6 +433,33 @@ def _render_token_input_with_clear(
     return val
 
 
+def _render_redirect_uri_with_apply(
+    label: str,
+    state_key: str,
+    widget_key: str,
+    apply_key: str,
+) -> str:
+    """Render Redirect/Response URI input paired with a commit button so link URLs update immediately."""
+    if widget_key not in st.session_state:
+        st.session_state[widget_key] = st.session_state.get(state_key, "")
+    col_url, col_apply = st.columns([4.2, 1.0], vertical_alignment="bottom")
+    with col_url:
+        val = st.text_input(
+            label,
+            key=widget_key,
+            help="Press Enter or click ✓ after editing to refresh the login link below.",
+        ).strip()
+    with col_apply:
+        st.button(
+            "✓",
+            key=apply_key,
+            help="Apply edited Redirect URI and refresh login link",
+            width="stretch",
+        )
+    st.session_state[state_key] = val
+    return val
+
+
 _apply_pending_auth_updates()
 _capture_oauth_redirect_params()
 
@@ -488,11 +538,13 @@ with st.sidebar:
                 u_csec = _sync_text_field(
                     "API Secret", "_u_client_secret", "_w_u_client_secret", type="password"
                 )
-                u_redir = _sync_text_field("Redirect URI", "_u_redirect_uri", "_w_u_redirect_uri")
+                u_redir = _render_redirect_uri_with_apply(
+                    "Redirect URI", "_u_redirect_uri", "_w_u_redirect_uri", "_apply_u_redir_btn"
+                )
             else:
                 u_cid = st.session_state.get("_u_client_id", "").strip()
                 u_csec = st.session_state.get("_u_client_secret", "").strip()
-                u_redir = st.session_state.get("_u_redirect_uri", "http://localhost:8501").strip()
+                u_redir = st.session_state.get("_u_redirect_uri", _detected_redirect_uri).strip()
                 st.caption("✅ API Key, Secret & Redirect URI loaded")
 
             remember_local = _render_local_persist_toggle()
@@ -514,6 +566,7 @@ with st.sidebar:
                 )
                 st.session_state._u_oauth_nonce = u_state
                 login_url = build_upstox_login_url(u_cid, u_redir, state=u_state)
+                st.caption(f"Callback URL: `{u_redir}`")
                 st.link_button("1️⃣ Open Upstox Daily Login", login_url, width="stretch")
             else:
                 st.caption("Fill API Key and Redirect URI to generate login link.")
@@ -693,7 +746,9 @@ with st.sidebar:
                         else:
                             st.error(err or "5paisa TOTP login failed.")
             with tab_oauth:
-                fp_redir = _sync_text_field("Response URL", "_fp_redirect_uri", "_w_fp_redirect_uri")
+                fp_redir = _render_redirect_uri_with_apply(
+                    "Response URL", "_fp_redirect_uri", "_w_fp_redirect_uri", "_apply_fp_redir_btn"
+                )
                 if remember_local:
                     save_local_broker_auth("fivepaisa", {"redirect_uri": fp_redir})
                 if fp_user_key and fp_redir:
@@ -708,6 +763,7 @@ with st.sidebar:
                     )
                     st.session_state._fp_oauth_nonce = fp_state
                     fp_login_url = build_fivepaisa_login_url(fp_user_key, fp_redir, state=fp_state)
+                    st.caption(f"Callback URL: `{fp_redir}`")
                     st.link_button("1️⃣ Open 5paisa Daily Login", fp_login_url, width="stretch")
                 else:
                     st.caption("Fill User Key and Response URL to generate login link.")
