@@ -621,6 +621,31 @@ class AppOiUiTest(unittest.TestCase):
             self.assertIn("https%3A%2F%2Fcustom-cloud.streamlit.app", body)
             self.assertIn('setAttribute("target", "_top")', body)
 
+    def test_memoized_filter_and_csv_on_pure_ui_reruns(self):
+        import ui.screener_filters as screener_filters
+
+        sample_df = _build_sample_df(include_buildup=True)
+        at = AppTest.from_file(os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")), "app.py"), default_timeout=15)
+        with (
+            patch.object(universe, "get_fno_universe", return_value=(["RELIANCE.NS", "HDFCBANK.NS"], "Mock")),
+            patch.object(scanner, "run_scan", return_value=sample_df),
+            patch.object(
+                screener_filters,
+                "filter_and_sort_results",
+                wraps=screener_filters.filter_and_sort_results,
+            ) as mock_filter,
+        ):
+            at.run()
+            [b for b in at.button if "Scan Now" in b.label][0].click().run()
+            calls_after_scan = mock_filter.call_count
+            self.assertGreaterEqual(calls_after_scan, 1)
+
+            # Toggling signal pills or visible columns reuses memoized filter result without recomputing
+            [c for c in at.segmented_control if c.label == "Quick Signal Filter"][0].set_value("🔴 Bearish").run()
+            [m for m in at.multiselect if m.label.startswith("Visible columns")][0].set_value(["Symbol", "Ratio"]).run()
+            self.assertEqual(mock_filter.call_count, calls_after_scan)
+            self.assertEqual(list(at.dataframe[0].value.columns), ["Symbol", "Ratio"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

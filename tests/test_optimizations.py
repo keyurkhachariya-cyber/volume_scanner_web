@@ -364,6 +364,44 @@ class OptimizationFixesTest(unittest.TestCase):
         mock_prev.assert_not_called()
         mock_commit.assert_not_called()
 
+    def test_pack_baseline_store_numpy_ffill_and_cache_hit_fast_path(self):
+        prev_day = date(2026, 11, 24)
+        entries = {
+            "AAA.NS": {
+                "times_sec": bc.np.array([33300, 33360, 33420], dtype=bc.np.int32),
+                "cumvol": bc.np.array([100.0, 220.0, 350.0], dtype=bc.np.float64),
+                "prev_close": 500.0,
+            },
+            "BBB.NS": {
+                "times_sec": bc.np.array([33360], dtype=bc.np.int32),
+                "cumvol": bc.np.array([50.0], dtype=bc.np.float64),
+                "prev_close": 250.0,
+            },
+        }
+        packed = bc._pack_baseline_store(entries, prev_day, "1m")
+        self.assertEqual(packed["cumvol"].shape, (3, 2))
+        self.assertTrue(bc.np.isnan(packed["cumvol"][0, 1]))  # leading NaN preserved
+        self.assertEqual(packed["cumvol"][1, 1], 50.0)
+        self.assertEqual(packed["cumvol"][2, 1], 50.0)       # trailing gap forward-filled
+
+        cache_key = bc.make_cache_key(prev_day, "1m", "fast_ns")
+        with bc._CACHE_LOCK:
+            bc._PREV_DAY_MEMORY_CACHE[cache_key] = packed
+        try:
+            with (
+                patch.object(bc, "_get_neg_cached") as mock_neg,
+                patch.object(bc, "_commit_baseline_updates") as mock_commit,
+            ):
+                hit = bc.get_previous_day_data(
+                    ["AAA.NS", "BBB.NS"], prev_day, interval="1m", cache_namespace="fast_ns"
+                )
+            self.assertIs(hit, packed)
+            mock_neg.assert_not_called()
+            mock_commit.assert_not_called()
+        finally:
+            with bc._CACHE_LOCK:
+                bc._PREV_DAY_MEMORY_CACHE.pop(cache_key, None)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

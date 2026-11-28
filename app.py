@@ -176,14 +176,31 @@ if "_upstox_cleared_explicitly" not in st.session_state:
 if "_fivepaisa_cleared_explicitly" not in st.session_state:
     st.session_state._fivepaisa_cleared_explicitly = False
 
+_need_local_auth_init = (
+    st.session_state._local_persist_enabled
+    and (
+        "upstox_access_token" not in st.session_state
+        or "fivepaisa_access_token" not in st.session_state
+        or (
+            st.session_state.get("data_source_choice") == "Upstox v3"
+            and not st.session_state.get("upstox_access_token")
+            and not st.session_state._upstox_cleared_explicitly
+        )
+        or (
+            st.session_state.get("data_source_choice") == "5paisa Xstream"
+            and not st.session_state.get("fivepaisa_access_token")
+            and not st.session_state._fivepaisa_cleared_explicitly
+        )
+    )
+)
 _init_local_up = (
     load_local_broker_auth("upstox")
-    if (st.session_state._local_persist_enabled and not st.session_state._upstox_cleared_explicitly)
+    if (_need_local_auth_init and not st.session_state._upstox_cleared_explicitly)
     else {}
 )
 _init_local_fp = (
     load_local_broker_auth("fivepaisa")
-    if (st.session_state._local_persist_enabled and not st.session_state._fivepaisa_cleared_explicitly)
+    if (_need_local_auth_init and not st.session_state._fivepaisa_cleared_explicitly)
     else {}
 )
 
@@ -253,11 +270,35 @@ def _consume_origin_tab_oauth(provider: str, nonce: str) -> bool:
         st.session_state._pending_upstox_token = done["access_token"]
         st.session_state._upstox_login_notice = "Upstox token synced automatically from browser login."
         st.session_state.pop("_u_oauth_nonce", None)
+        st.session_state.pop("_u_oauth_snap", None)
     else:
         st.session_state._pending_fivepaisa_auth = (done["access_token"], done.get("client_code", ""))
         st.session_state._fivepaisa_login_notice = "5paisa token synced automatically from browser login."
         st.session_state.pop("_fp_oauth_nonce", None)
+        st.session_state.pop("_fp_oauth_snap", None)
     return True
+
+
+def _save_local_if_changed(provider: str, payload: dict[str, str]) -> None:
+    """Persist local broker fields only when their trimmed values differ from last synced state."""
+    snap_key = f"_local_save_snap_{provider}"
+    frozen = tuple(sorted((k, str(v or "").strip()) for k, v in payload.items()))
+    if st.session_state.get(snap_key) == frozen:
+        return
+    save_local_broker_auth(provider, payload)
+    st.session_state[snap_key] = frozen
+
+
+def _ensure_oauth_link_state(payload: dict[str, str], nonce_key: str, snap_key: str) -> str:
+    """Reuse existing OAuth handoff nonce while credentials remain unchanged to avoid lock churn."""
+    cur_nonce = st.session_state.get(nonce_key, "")
+    frozen = tuple(sorted((k, str(v or "").strip()) for k, v in payload.items()))
+    if cur_nonce and st.session_state.get(snap_key) == frozen:
+        return cur_nonce
+    new_nonce = register_oauth_handoff(payload, nonce=cur_nonce)
+    st.session_state[nonce_key] = new_nonce
+    st.session_state[snap_key] = frozen
+    return new_nonce
 
 
 def _apply_pending_auth_updates() -> None:
@@ -396,6 +437,8 @@ def _clear_upstox_token() -> None:
     st.session_state._upstox_cleared_explicitly = True
     st.session_state.pop("_upstox_login_notice", None)
     st.session_state.pop("_u_oauth_nonce", None)
+    st.session_state.pop("_u_oauth_snap", None)
+    st.session_state.pop("_local_save_snap_upstox", None)
     if st.session_state.get("_local_persist_enabled"):
         save_local_broker_auth("upstox", {}, clear_token=True)
 
@@ -410,6 +453,8 @@ def _clear_fivepaisa_token() -> None:
     st.session_state._fivepaisa_cleared_explicitly = True
     st.session_state.pop("_fivepaisa_login_notice", None)
     st.session_state.pop("_fp_oauth_nonce", None)
+    st.session_state.pop("_fp_oauth_snap", None)
+    st.session_state.pop("_local_save_snap_fivepaisa", None)
     if st.session_state.get("_local_persist_enabled"):
         save_local_broker_auth("fivepaisa", {}, clear_token=True)
 
@@ -598,7 +643,7 @@ def _render_upstox_sidebar_auth(wss_window_open: bool, detected_redirect_uri: st
 
         remember_local = _render_local_persist_toggle()
         if remember_local:
-            save_local_broker_auth(
+            _save_local_if_changed(
                 "upstox",
                 {
                     "access_token": upstox_token,
@@ -609,11 +654,11 @@ def _render_upstox_sidebar_auth(wss_window_open: bool, detected_redirect_uri: st
             )
 
         if u_cid and u_redir:
-            u_state = register_oauth_handoff(
+            u_state = _ensure_oauth_link_state(
                 {"client_id": u_cid, "client_secret": u_csec, "redirect_uri": u_redir},
-                nonce=st.session_state.get("_u_oauth_nonce", ""),
+                "_u_oauth_nonce",
+                "_u_oauth_snap",
             )
-            st.session_state._u_oauth_nonce = u_state
             login_url = build_upstox_login_url(u_cid, u_redir, state=u_state)
             st.caption(f"Callback URL: `{u_redir}`")
             _render_same_tab_login_link(
@@ -749,7 +794,7 @@ def _render_fivepaisa_sidebar_auth(wss_window_open: bool) -> tuple[str, str, boo
 
         remember_local = _render_local_persist_toggle()
         if remember_local:
-            save_local_broker_auth(
+            _save_local_if_changed(
                 "fivepaisa",
                 {
                     "access_token": fivepaisa_token,
@@ -809,18 +854,28 @@ def _render_fivepaisa_sidebar_auth(wss_window_open: bool) -> tuple[str, str, boo
                 "Response URL", "_fp_redirect_uri", "_w_fp_redirect_uri", "_apply_fp_redir_btn"
             )
             if remember_local:
-                save_local_broker_auth("fivepaisa", {"redirect_uri": fp_redir})
+                _save_local_if_changed(
+                    "fivepaisa",
+                    {
+                        "access_token": fivepaisa_token,
+                        "client_code": fivepaisa_client_code,
+                        "user_key": fp_user_key,
+                        "encryption_key": fp_enc_key,
+                        "user_id": fp_user_id,
+                        "redirect_uri": fp_redir,
+                    },
+                )
             if fp_user_key and fp_redir:
-                fp_state = register_oauth_handoff(
+                fp_state = _ensure_oauth_link_state(
                     {
                         "user_key": fp_user_key,
                         "encryption_key": fp_enc_key,
                         "user_id": fp_user_id,
                         "redirect_uri": fp_redir,
                     },
-                    nonce=st.session_state.get("_fp_oauth_nonce", ""),
+                    "_fp_oauth_nonce",
+                    "_fp_oauth_snap",
                 )
-                st.session_state._fp_oauth_nonce = fp_state
                 fp_login_url = build_fivepaisa_login_url(fp_user_key, fp_redir, state=fp_state)
                 st.caption(f"Callback URL: `{fp_redir}`")
                 _render_same_tab_login_link(
@@ -1304,19 +1359,40 @@ def render_scanner(
     raw_df = st.session_state.results_by_interval.get(snapshot_key, pd.DataFrame())
     raw_empty_dt = st.session_state._last_scan_empty_by_interval.get(snapshot_key)
     empty_scan_dt = raw_empty_dt if (raw_empty_dt is not None and raw_empty_dt.date() == now.date()) else None
-    df, gap_missing, gap_excluded_count, oi_missing, oi_excluded_count, momentum_missing, momentum_excluded_count = _filter_and_sort_results(
-        raw_df=raw_df,
-        min_ratio=min_ratio,
-        min_volume=min_volume,
-        exclude_gap_up=exclude_gap_up,
-        exclude_gap_down=exclude_gap_down,
-        gap_threshold=gap_threshold,
-        include_oi=include_oi,
-        min_oi_chg_pct=min_oi_chg_pct,
-        oi_buildup_filter=oi_buildup_filter,
-        sort_by=sort_by,
-        momentum_filter_state=momentum_filter_state,
+    filter_cache_key = (
+        snapshot_key,
+        id(raw_df),
+        last_scan_dt,
+        float(min_ratio),
+        int(min_volume),
+        bool(exclude_gap_up),
+        bool(exclude_gap_down),
+        float(gap_threshold),
+        bool(include_oi),
+        None if min_oi_chg_pct is None else float(min_oi_chg_pct),
+        tuple(oi_buildup_filter),
+        sort_by,
+        momentum_filter_state,
     )
+    cached_filter = st.session_state.get("_filtered_scan_cache")
+    if cached_filter is not None and cached_filter[0] == filter_cache_key:
+        filter_result = cached_filter[1]
+    else:
+        filter_result = _filter_and_sort_results(
+            raw_df=raw_df,
+            min_ratio=min_ratio,
+            min_volume=min_volume,
+            exclude_gap_up=exclude_gap_up,
+            exclude_gap_down=exclude_gap_down,
+            gap_threshold=gap_threshold,
+            include_oi=include_oi,
+            min_oi_chg_pct=min_oi_chg_pct,
+            oi_buildup_filter=oi_buildup_filter,
+            sort_by=sort_by,
+            momentum_filter_state=momentum_filter_state,
+        )
+        st.session_state._filtered_scan_cache = (filter_cache_key, filter_result)
+    df, gap_missing, gap_excluded_count, oi_missing, oi_excluded_count, momentum_missing, momentum_excluded_count = filter_result
 
     has_signals = include_oi and (not df.empty) and ("Signal" in df.columns)
     table_df = df
@@ -1399,7 +1475,13 @@ def render_scanner(
             csv_ts = (last_scan_dt or now).strftime("%Y%m%d_%H%M")
             if not table_df.empty and visible_cols:
                 display_df = table_df[visible_cols]
-                csv_data = display_df.to_csv(index=False).encode("utf-8")
+                csv_cache_key = (filter_cache_key, sig_choice, tuple(visible_cols))
+                cached_csv = st.session_state.get("_csv_export_cache")
+                if cached_csv is not None and cached_csv[0] == csv_cache_key:
+                    csv_data = cached_csv[1]
+                else:
+                    csv_data = display_df.to_csv(index=False).encode("utf-8")
+                    st.session_state._csv_export_cache = (csv_cache_key, csv_data)
             with col_csv_btn:
                 st.download_button(
                     "⬇️ CSV",

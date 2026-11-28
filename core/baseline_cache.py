@@ -15,7 +15,6 @@ import time as pytime
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 import numpy as np
-import pandas as pd
 
 from core.utils import CACHE_DIR as DEFAULT_CACHE_DIR, IST, ist_epoch_sec, time_to_sec
 import providers.yahoo.client as yahoo_client
@@ -202,8 +201,10 @@ def _pack_baseline_store(
         if entry["prev_close"] is not None:
             prev_close_arr[col_idx] = entry["prev_close"]
 
-    # Forward-fill cumulative volume across missing timestamps (leading NaNs stay NaN for exact .asof() parity)
-    mat = pd.DataFrame(mat).ffill().to_numpy(dtype=np.float64, copy=False)
+    # Pure NumPy forward-fill across missing timestamps (leading NaNs remain NaN since row 0 is NaN when idx < 0)
+    idx = np.where(~np.isnan(mat), np.arange(num_t, dtype=np.int32)[:, None], -1)
+    np.maximum.accumulate(idx, axis=0, out=idx)
+    mat = np.take_along_axis(mat, np.maximum(idx, 0), axis=0)
     prev_full_vol = np.nan_to_num(mat[-1, :], nan=0.0)
 
     return {
@@ -388,47 +389,48 @@ def get_previous_day_data(
     cache_key = make_cache_key(prev_day, interval, cache_namespace)
     store = _get_or_load_store(cache_key, prev_day, interval, cache_namespace=cache_namespace)
 
-    known_set = set(store["symbols"]) | _get_neg_cached(cache_key)
-    missing = [sym for sym in symbols if sym not in known_set]
-
-    if missing:
-        _prune_old_cache()
-        start_str = prev_day.strftime("%Y-%m-%d")
-        end_str = (prev_day + timedelta(days=1)).strftime("%Y-%m-%d")
-        fetcher = yahoo_client._fetch_market_data if fetch_fn is None else fetch_fn
-
-        fetched, failed = fetcher(
-            ((sym, None) for sym in missing),
-            interval=interval,
-            max_workers=max_workers,
-            start=start_str,
-            end=end_str,
-            chunk_size=chunk_size,
-        )
-
-        new_entries: Dict[str, Optional[Dict[str, Any]]] = {}
-        neg_syms: List[str] = []
-        for sym in missing:
-            if sym in failed:
-                continue
-            bundle = fetched.get(sym)
-            baseline = (
-                _build_prev_day_baseline_from_arrays(
-                    bundle["ts_sec"], bundle["close"], bundle["volume"], target_date=prev_day
-                )
-                if bundle is not None
-                else None
-            )
-            if baseline is not None:
-                new_entries[sym] = baseline
-            else:
-                neg_syms.append(sym)
-
-        store = _commit_baseline_updates(
-            cache_key, prev_day, interval, new_entries, neg_syms, cache_namespace=cache_namespace
-        )
+    sym_to_idx = store["symbol_to_idx"]
+    missing_in_store = [sym for sym in symbols if sym not in sym_to_idx]
+    if not missing_in_store:
         return store
 
+    neg_set = _get_neg_cached(cache_key)
+    missing = [sym for sym in missing_in_store if sym not in neg_set]
+    if not missing:
+        return store
+
+    _prune_old_cache()
+    start_str = prev_day.strftime("%Y-%m-%d")
+    end_str = (prev_day + timedelta(days=1)).strftime("%Y-%m-%d")
+    fetcher = yahoo_client._fetch_market_data if fetch_fn is None else fetch_fn
+
+    fetched, failed = fetcher(
+        ((sym, None) for sym in missing),
+        interval=interval,
+        max_workers=max_workers,
+        start=start_str,
+        end=end_str,
+        chunk_size=chunk_size,
+    )
+
+    new_entries: Dict[str, Optional[Dict[str, Any]]] = {}
+    neg_syms: List[str] = []
+    for sym in missing:
+        if sym in failed:
+            continue
+        bundle = fetched.get(sym)
+        baseline = (
+            _build_prev_day_baseline_from_arrays(
+                bundle["ts_sec"], bundle["close"], bundle["volume"], target_date=prev_day
+            )
+            if bundle is not None
+            else None
+        )
+        if baseline is not None:
+            new_entries[sym] = baseline
+        else:
+            neg_syms.append(sym)
+
     return _commit_baseline_updates(
-        cache_key, prev_day, interval, {}, [], cache_namespace=cache_namespace
+        cache_key, prev_day, interval, new_entries, neg_syms, cache_namespace=cache_namespace
     )
