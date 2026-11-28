@@ -65,19 +65,17 @@ python -m unittest discover -s tests -v
 - **5paisa Xstream:** Switch **Data Source** to **5paisa Xstream**, paste today's JWT **Access Token** + **Client Code** (or use **Daily Login Helper (TOTP / OAuth)** for one-click TOTP+PIN headless login / `st.secrets["fivepaisa"]`), and leave **Stream Live WSS (`MarketFeedV3`)** checked.
 
 ## Project Structure
-- `app.py` — Streamlit UI layout, sidebar controls, and auto-refresh fragment
-- `table_config.py` — Column schemas, labels, sort options, pinned columns, and column guide
-- `screener_filters.py` — Pure filtering, sorting, row styling, and auto-refresh schedule logic
-- `scanner.py` — Intraday bar summarization (`VWAP`, `Vol_Burst_15m`) and scan orchestration
-- `providers/` — Pluggable `MarketDataProvider` adapters (`yahoo_provider.py`, `upstox_*.py`, `fivepaisa_*.py`, `stream_base.py`)
-- `baseline_cache.py` — Vectorized v2 NumPy previous-day volume matrix and `.cache/` persistence
-- `yahoo_client.py` — Async HTTP/2 Yahoo Chart API client and `yfinance` thread-pool fallback
-- `oi.py` — Rate-limited NSE aggregate F&O Open Interest fetcher and Signal/Buildup classifiers
-- `holidays.py` — Live NSE holiday sync (`.cache/nse_holidays.json`) and empirical `^NSEI` session detection
-- `universe.py` — NSE F&O underlying symbol list with live sync and built-in fallback
-- `utils.py` — Shared IST timezone, `orjson` JSON decoding, date parsing, and NSE session helpers
+- `app.py` — Streamlit web entrypoint (`streamlit run app.py`)
+- `core/` — Core scanner engine (`scanner.py`, `baseline_cache.py`, `holidays.py`, `oi.py`, `universe.py`, `utils.py`)
+- `ui/` — UI column schemas, filters, sorting, and row styling (`table_config.py`, `screener_filters.py`)
+- `providers/` — Pluggable `MarketDataProvider` adapters organized by vendor:
+  - `base.py` — `MarketDataProvider` protocol & shared type aliases
+  - `common/` — Shared persistent HTTP/2 runtime (`http_runtime.py`) & live stream state (`stream_base.py`)
+  - `yahoo/` — HTTP/2 Yahoo Chart client (`client.py`) & zero-login `YahooProvider` (`provider.py`)
+  - `upstox/` — `UpstoxProvider` v3 REST/Batch Quote (`provider.py`), `MarketDataStreamerV3` (`stream.py`), & `NSE.json.gz` resolver (`instruments.py`)
+  - `fivepaisa/` — `FivePaisaProvider` TOTP/OAuth & V2 REST (`provider.py`), `MarketFeedV3` (`stream.py`), & ScripMaster resolver (`instruments.py`)
+- `docs/` — Deployment & cloud hosting guides (`ORACLE_CLOUD_SETUP.md`)
 - `tests/` — Unit and Streamlit `AppTest` UI tests
-- `ORACLE_CLOUD_SETUP.md` — Always Free Oracle Cloud (Mumbai/Hyderabad ARM64) hosting guide
 
 ## Notes & Limitations
 - Yahoo Finance 1-minute data covers roughly the last 7 days and can occasionally contain placeholder `NaN` bars near market close; `15m Vol Burst` evaluates trailing active bars to stay robust across minor feed gaps.

@@ -20,18 +20,18 @@ from urllib.parse import urlencode
 
 import numpy as np
 
-from holidays import is_market_open
+from core.holidays import is_market_open
+from core.utils import IST, decode_json_response, localize_ist
 from providers.base import ArrayBundle, TodaySummary
-from providers.fivepaisa_instruments import resolve_scrip_codes
-from providers.fivepaisa_stream import (
+from providers.common.http_runtime import fetch_json_urls_async
+from providers.common.stream_base import secret_fingerprint
+from providers.fivepaisa.instruments import resolve_scrip_codes
+from providers.fivepaisa.stream import (
     extract_client_code_from_jwt,
     get_or_start_fivepaisa_stream,
     stop_fivepaisa_stream,
 )
-from providers.http_runtime import fetch_json_urls_async
-from providers.stream_base import secret_fingerprint
-from utils import IST, decode_json_response, localize_ist
-import yahoo_client
+import providers.yahoo.client as yahoo_client
 
 _FIVEPAISA_VENDOR_BASE = "https://Openapi.5paisa.com/VendorsAPI/Service1.svc"
 _FIVEPAISA_OAUTH_URL = "https://dev-openapi.5paisa.com/WebVendorLogin/VLogin/Index"

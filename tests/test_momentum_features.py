@@ -9,10 +9,10 @@ import pandas as pd
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-import baseline_cache as bc
-import holidays as h
-import scanner as s
-import yahoo_client as yc
+import core.baseline_cache as bc
+import core.holidays as h
+import core.scanner as s
+import providers.yahoo.client as yc
 
 
 class MomentumFeaturesTest(unittest.TestCase):

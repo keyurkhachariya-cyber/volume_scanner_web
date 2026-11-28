@@ -3,8 +3,12 @@ Shared timezone, JSON decoding, NSE date parsing, and HTTP helpers.
 """
 
 from datetime import date, datetime, time
+from pathlib import Path
 from typing import Any, Optional
 import pytz
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+CACHE_DIR = PROJECT_ROOT / ".cache"
 
 IST = pytz.timezone("Asia/Kolkata")
 

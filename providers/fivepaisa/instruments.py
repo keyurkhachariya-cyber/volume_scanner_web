@@ -13,7 +13,7 @@ from pathlib import Path
 import threading
 from typing import Dict, Iterable, Optional, Tuple
 
-from utils import IST
+from core.utils import CACHE_DIR, IST
 
 try:
     import orjson as _orjson
@@ -25,7 +25,7 @@ FIVEPAISA_SCRIPMASTER_URLS = (
     "https://Openapi.5paisa.com/VendorsAPI/Service1.svc/ScripMaster/segment/All",
     "https://images.5paisa.com/website/scripmaster-csv-format.csv",
 )
-INSTRUMENTS_CACHE_FILE = Path(__file__).resolve().parent.parent / ".cache" / "fivepaisa_nse_instruments.json"
+INSTRUMENTS_CACHE_FILE = CACHE_DIR / "fivepaisa_nse_instruments.json"
 
 # Fallback symbol aliases when static ScripMaster snapshots still carry pre-rename NSE tickers
 _LEGACY_SYMBOL_ALIASES: Dict[str, str] = {

@@ -15,12 +15,12 @@ import threading
 import time as pytime
 from typing import Any, Dict, List, Optional, Sequence
 
-from providers.stream_base import (
+from core.utils import IST, ist_epoch_sec, localize_ist
+from providers.common.stream_base import (
     BaseMarketStream,
     secret_fingerprint,
     to_float,
 )
-from utils import IST, ist_epoch_sec, localize_ist
 
 try:
     import orjson as _orjson

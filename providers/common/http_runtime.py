@@ -12,9 +12,9 @@ import threading
 import time as pytime
 from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple
 
+from core.utils import decode_json_response
 from providers.base import ArrayBundle
-from utils import decode_json_response
-import yahoo_client
+import providers.yahoo.client as yahoo_client
 
 _STATE_LOCK = threading.Lock()
 _BROKER_ASYNC_SESSION: Any = None

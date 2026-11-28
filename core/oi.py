@@ -15,8 +15,8 @@ import threading
 import time as pytime
 from typing import Any, Dict, Optional, Tuple
 
-from holidays import is_market_open
-from utils import (
+from core.holidays import is_market_open
+from core.utils import (
     IST,
     _orjson,
     decode_json_response,

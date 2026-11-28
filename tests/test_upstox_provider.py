@@ -13,13 +13,13 @@ import numpy as np
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-import baseline_cache as bc
-import holidays as h
-import providers.http_runtime as hr_mod
-import providers.upstox_instruments as ui_mod
-import providers.upstox_provider as up_mod
-import providers.upstox_stream as us_mod
-import scanner
+import core.baseline_cache as bc
+import core.holidays as h
+import providers.common.http_runtime as hr_mod
+import providers.upstox.instruments as ui_mod
+import providers.upstox.provider as up_mod
+import providers.upstox.stream as us_mod
+import core.scanner as scanner
 
 
 class UpstoxProviderTest(unittest.TestCase):

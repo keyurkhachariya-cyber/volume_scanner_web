@@ -17,17 +17,17 @@ from urllib.parse import quote as _url_quote, urlencode
 
 import numpy as np
 
-from holidays import is_market_open
+from core.holidays import is_market_open
+from core.utils import IST, decode_json_response, localize_ist, time_to_sec
 from providers.base import ArrayBundle, TodaySummary
-from providers.http_runtime import fetch_json_urls_async
-from providers.stream_base import secret_fingerprint, to_float
-from providers.upstox_instruments import resolve_instrument_keys
-from providers.upstox_stream import (
+from providers.common.http_runtime import fetch_json_urls_async
+from providers.common.stream_base import secret_fingerprint, to_float
+from providers.upstox.instruments import resolve_instrument_keys
+from providers.upstox.stream import (
     get_or_start_upstox_stream,
     stop_upstox_stream,
 )
-from utils import IST, decode_json_response, localize_ist, time_to_sec
-import yahoo_client
+import providers.yahoo.client as yahoo_client
 
 _UPSTOX_API_BASE = "https://api.upstox.com"
 _UPSTOX_MAX_CONCURRENCY = 24
@@ -333,7 +333,7 @@ class UpstoxProvider:
         if not keys:
             return [], True
 
-        from providers.http_runtime import _acquire_session
+        from providers.common.http_runtime import _acquire_session
 
         headers = {
             "Accept": "application/json",

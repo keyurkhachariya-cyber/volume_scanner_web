@@ -12,13 +12,13 @@ import threading
 import time as pytime
 from typing import Any, Dict, List, Optional, Tuple
 
-from providers.stream_base import (
+from core.utils import IST
+from providers.common.stream_base import (
     BaseMarketStream,
     compute_burst_from_minute_buckets as _compute_burst_from_minute_buckets,
     secret_fingerprint as _token_fingerprint,
     to_float as _to_float,
 )
-from utils import IST
 
 _STREAM_LOCK = threading.Lock()
 _ACTIVE_STREAMS: Dict[str, "UpstoxMarketStream"] = {}

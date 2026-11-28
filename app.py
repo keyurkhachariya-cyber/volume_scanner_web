@@ -9,10 +9,10 @@ import os
 import streamlit as st
 import pandas as pd
 
-from universe import get_fno_universe
-from scanner import prune_cache, run_scan
-from holidays import get_holidays, is_market_open, get_previous_trading_day, IST
-from oi import OI_BUILDUP_OPTIONS, SIGNAL_BEARISH, SIGNAL_BULLISH
+from core.holidays import get_holidays, is_market_open, get_previous_trading_day, IST
+from core.oi import OI_BUILDUP_OPTIONS, SIGNAL_BEARISH, SIGNAL_BULLISH
+from core.scanner import prune_cache, run_scan
+from core.universe import get_fno_universe
 from providers import (
     FivePaisaProvider,
     UpstoxProvider,
@@ -22,16 +22,16 @@ from providers import (
     exchange_fivepaisa_request_token,
     exchange_upstox_auth_code,
     login_fivepaisa_totp,
+    stop_fivepaisa_stream,
+    stop_upstox_stream,
 )
-from providers.fivepaisa_stream import stop_fivepaisa_stream
-from providers.upstox_stream import stop_upstox_stream
-from screener_filters import (
+from ui.screener_filters import (
     MARKET_CLOSE_TIME,
     filter_and_sort_results,
     should_auto_scan as _should_auto_scan,
     style_scanner_df as _style_scanner_df,
 )
-from table_config import (
+from ui.table_config import (
     ALL_COLUMNS,
     COLUMN_CONFIG,
     COLUMN_GUIDE_MARKDOWN,

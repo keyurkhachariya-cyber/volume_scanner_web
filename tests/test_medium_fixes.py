@@ -47,10 +47,10 @@ if "yfinance" not in sys.modules:
     sys.modules["yfinance.data"] = yf_data_stub
     sys.modules["yfinance.multi"] = yf_multi_stub
 
-import baseline_cache as bc
-import holidays as h
-import universe as u
-import yahoo_client as yc
+import core.baseline_cache as bc
+import core.holidays as h
+import core.universe as u
+import providers.yahoo.client as yc
 
 
 class FakeCurlSession:

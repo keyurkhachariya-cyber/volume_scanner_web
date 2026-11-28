@@ -10,7 +10,7 @@ from pathlib import Path
 import threading
 from typing import Dict, Iterable, Optional
 
-from utils import IST
+from core.utils import CACHE_DIR, IST
 
 try:
     import orjson as _orjson
@@ -18,7 +18,7 @@ except ImportError:  # pragma: no cover - optional faster JSON parser
     _orjson = None
 
 UPSTOX_NSE_INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
-INSTRUMENTS_CACHE_FILE = Path(__file__).resolve().parent.parent / ".cache" / "upstox_nse_instruments.json"
+INSTRUMENTS_CACHE_FILE = CACHE_DIR / "upstox_nse_instruments.json"
 
 _LOCK = threading.Lock()
 _MEM_CACHE: Optional[Dict[str, str]] = None

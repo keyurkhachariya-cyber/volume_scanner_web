@@ -17,12 +17,12 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 import numpy as np
 import pandas as pd
 
-from utils import IST, ist_epoch_sec, time_to_sec
-import yahoo_client
+from core.utils import CACHE_DIR as DEFAULT_CACHE_DIR, IST, ist_epoch_sec, time_to_sec
+import providers.yahoo.client as yahoo_client
 
 _MARKET_OPEN_SEC = 9 * 3600 + 15 * 60
 _NAT_INT64 = np.iinfo(np.int64).min
-CACHE_DIR = Path(__file__).parent / ".cache"
+CACHE_DIR = DEFAULT_CACHE_DIR
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_RETENTION_DAYS = 7
 MEMORY_CACHE_MAX_ENTRIES = 4

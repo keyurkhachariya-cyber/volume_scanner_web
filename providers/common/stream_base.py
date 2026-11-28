@@ -14,8 +14,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
+from core.utils import ist_epoch_sec, time_to_sec
 from providers.base import ArrayBundle, TodaySummary
-from utils import ist_epoch_sec, time_to_sec
 
 MARKET_OPEN_SEC = 9 * 3600 + 15 * 60
 

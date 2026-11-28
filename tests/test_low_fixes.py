@@ -43,9 +43,9 @@ if "yfinance" not in sys.modules:
     sys.modules["yfinance.data"] = yf_data_stub
     sys.modules["yfinance.multi"] = yf_multi_stub
 
-import baseline_cache as bc
-import holidays as h
-import scanner as s
+import core.baseline_cache as bc
+import core.holidays as h
+import core.scanner as s
 
 
 class LowFixesTest(unittest.TestCase):

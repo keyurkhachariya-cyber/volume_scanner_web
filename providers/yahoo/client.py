@@ -26,7 +26,7 @@ try:
 except ImportError:  # pragma: no cover - fallback for older yfinance versions
     _yf_new_session = None
 
-from utils import IST, decode_json_response, ist_epoch_sec
+from core.utils import IST, decode_json_response, ist_epoch_sec
 
 _NAT_INT64 = np.iinfo(np.int64).min
 _CHART_HOSTS = ("query1.finance.yahoo.com", "query2.finance.yahoo.com")

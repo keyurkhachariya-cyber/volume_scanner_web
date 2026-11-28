@@ -8,10 +8,10 @@ import json
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from holidays import IST
-from utils import fetch_nse_json
+from core.holidays import IST
+from core.utils import CACHE_DIR, fetch_nse_json
 
-CACHE_FILE = Path(__file__).parent / ".cache" / "fno_universe.json"
+CACHE_FILE = CACHE_DIR / "fno_universe.json"
 
 FNO_STOCKS = [
     "360ONE.NS", "ABB.NS", "ABCAPITAL.NS", "ACUTAAS.NS", "ADANIENSOL.NS",

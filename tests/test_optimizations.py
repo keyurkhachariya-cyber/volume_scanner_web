@@ -84,11 +84,11 @@ if "yfinance" not in sys.modules:
     sys.modules["yfinance.data"] = yf_data_stub
     sys.modules["yfinance.multi"] = yf_multi_stub
 
-import baseline_cache as bc
-import holidays as h
-import scanner as s
-import utils as u
-import yahoo_client as yc
+import core.baseline_cache as bc
+import core.holidays as h
+import core.scanner as s
+import core.utils as u
+import providers.yahoo.client as yc
 
 
 class FakeIndex:

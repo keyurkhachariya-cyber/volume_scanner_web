@@ -12,9 +12,9 @@ import threading
 import time as pytime
 from typing import Any, Dict, Optional, Set, Tuple
 
-from utils import IST, decode_json_response, fetch_nse_json, parse_nse_date as _parse_nse_date
+from core.utils import CACHE_DIR, IST, decode_json_response, fetch_nse_json, parse_nse_date as _parse_nse_date
 
-CACHE_FILE = Path(__file__).parent / ".cache" / "nse_holidays.json"
+CACHE_FILE = CACHE_DIR / "nse_holidays.json"
 
 # Built-in fallback NSE holidays 2025-2026
 HOLIDAYS: Set[date] = {

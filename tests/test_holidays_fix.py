@@ -14,7 +14,7 @@ if "pytz" not in sys.modules:
     pytz_stub.timezone = lambda name: IST_TZ
     sys.modules["pytz"] = pytz_stub
 
-import holidays as h
+import core.holidays as h
 
 
 class HolidaysFixesTest(unittest.TestCase):

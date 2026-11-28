@@ -107,10 +107,10 @@ if "yfinance" not in sys.modules:
     sys.modules["yfinance.data"] = yf_data_stub
     sys.modules["yfinance.multi"] = yf_multi_stub
 
-import baseline_cache
-import oi
-import scanner
-import yahoo_client
+import core.baseline_cache as baseline_cache
+import core.oi as oi
+import core.scanner as scanner
+import providers.yahoo.client as yahoo_client
 
 
 def _make_payload(ts_str: str, curr_date: str, items):

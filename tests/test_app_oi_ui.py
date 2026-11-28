@@ -8,8 +8,8 @@ from streamlit.testing.v1 import AppTest
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-import scanner
-import universe
+import core.scanner as scanner
+import core.universe as universe
 
 
 def _build_sample_df(include_buildup: bool = True) -> pd.DataFrame:
@@ -227,7 +227,7 @@ class AppOiUiTest(unittest.TestCase):
                     "OI_Buildup",
                 ],
             )
-            import table_config
+            import ui.table_config as table_config
 
             for hidden_col in ("Vol_Today", "Vol_Prev_Same_Time", "OI", "OI_Chg", "Last_Bar_Time"):
                 self.assertNotIn(hidden_col, rendered_df.columns)
@@ -290,8 +290,8 @@ class AppOiUiTest(unittest.TestCase):
             self.assertFalse(any(n.label == "Min OI Chg % (Day)" for n in at.number_input))
 
     def test_momentum_filter_allows_flat_prev_close_with_intraday_recovery(self):
-        from screener_filters import filter_and_sort_results
-        from table_config import SORT_OPTIONS
+        from ui.screener_filters import filter_and_sort_results
+        from ui.table_config import SORT_OPTIONS
 
         df = pd.DataFrame(
             [

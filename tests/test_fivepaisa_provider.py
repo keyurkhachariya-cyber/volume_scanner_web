@@ -12,12 +12,12 @@ import numpy as np
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-import baseline_cache as bc
-import holidays as h
-import providers.fivepaisa_instruments as fi_mod
-import providers.fivepaisa_provider as fp_mod
-import providers.fivepaisa_stream as fs_mod
-import scanner
+import core.baseline_cache as bc
+import core.holidays as h
+import providers.fivepaisa.instruments as fi_mod
+import providers.fivepaisa.provider as fp_mod
+import providers.fivepaisa.stream as fs_mod
+import core.scanner as scanner
 
 
 def _make_fake_jwt(claims: dict) -> str:

@@ -7,7 +7,7 @@ from typing import Dict, Tuple
 
 import pandas as pd
 
-from oi import (
+from core.oi import (
     SIGNAL_BEARISH,
     SIGNAL_BULLISH,
     classify_oi_buildup,

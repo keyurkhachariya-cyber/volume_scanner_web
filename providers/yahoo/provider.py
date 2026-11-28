@@ -5,8 +5,8 @@ Yahoo Finance MarketDataProvider wrapping yahoo_client.
 from datetime import date, time
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
-import yahoo_client
 from providers.base import ArrayBundle, TodaySummary
+from providers.yahoo import client as yahoo_client
 
 
 class YahooProvider:
