@@ -6,7 +6,7 @@ import tempfile
 import threading
 import types
 import unittest
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 

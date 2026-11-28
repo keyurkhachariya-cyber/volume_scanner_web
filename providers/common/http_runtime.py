@@ -1,6 +1,6 @@
 """
 Shared persistent HTTP/2 AsyncSession runtime and sliding-window rate limiter for broker providers.
-Mirrors yahoo_client.py's persistent event-loop + connection-reuse pattern to eliminate per-scan TLS setup.
+Mirrors providers/yahoo/client.py's persistent event-loop + connection-reuse pattern to eliminate per-scan TLS setup.
 """
 
 from __future__ import annotations

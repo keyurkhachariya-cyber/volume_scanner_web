@@ -16,7 +16,6 @@ from core.universe import get_fno_universe
 from providers import (
     FivePaisaProvider,
     UpstoxProvider,
-    YahooProvider,
     build_fivepaisa_login_url,
     build_upstox_login_url,
     exchange_fivepaisa_request_token,
@@ -48,7 +47,15 @@ st.set_page_config(
 )
 
 st.markdown(
-    "<style>.block-container {padding-top: 1.4rem; padding-bottom: 1rem;}</style>",
+    """
+    <style>
+        [data-testid="stMainBlockContainer"] { padding-top: 2.2rem; padding-bottom: 1rem; }
+        [data-testid="stSidebarUserContent"] { padding-top: 1.25rem; }
+        [data-testid="stMetricLabel"] { margin-bottom: 0.1rem; }
+        [data-testid="stMetricValue"] { font-size: 1.45rem; line-height: 1.2; }
+        [data-testid="stSidebar"] [data-testid="stButtonGroup"] { flex-wrap: wrap; gap: 0.25rem; }
+    </style>
+    """,
     unsafe_allow_html=True,
 )
 st.title("📈 F&O Relative Volume Scanner")
@@ -479,7 +486,7 @@ with st.sidebar:
             format_func=lambda s: f"{s} seconds" if s < 60 else f"{s // 60} minute{'s' if s > 60 else ''}",
             help="Interval between automated background updates while NSE is open.",
         )
-    st.markdown("---")
+    st.divider()
     if st.button("🔄 Sync NSE F&O List", width="stretch"):
         with st.spinner("Fetching latest F&O list and trading calendar from NSE..."):
             with ThreadPoolExecutor(max_workers=2) as pool:
@@ -619,7 +626,7 @@ def render_scanner(
             last_scan_started_dt=last_scan_started_dt,
         )
 
-    col1, col2, col3, col_btn = st.columns([1.2, 1.0, 0.9, 1.1], vertical_alignment="bottom")
+    col1, col2, col3, col_btn = st.columns([1.4, 1.05, 0.95, 1.05], vertical_alignment="bottom")
     col1.metric("Current IST", now.strftime("%Y-%m-%d %H:%M:%S"))
     prev_day_slot = col2.empty()
     col3.metric("Market Status", "🟢 OPEN" if market_open else "🔴 CLOSED")
@@ -758,7 +765,7 @@ def render_scanner(
                 bearish_count = int((df["Signal"] == SIGNAL_BEARISH).sum())
                 total_count = len(df)
                 col_sig_summary, col_sig_pills, col_cols_btn, col_csv_btn = st.columns(
-                    [2.4, 2.1, 1.3, 1.1], vertical_alignment="center"
+                    [2.5, 2.0, 1.0, 0.85], vertical_alignment="center"
                 )
                 with col_sig_summary:
                     st.markdown(
@@ -782,7 +789,11 @@ def render_scanner(
                 if sig_choice in (SIGNAL_BULLISH, SIGNAL_BEARISH):
                     table_df = df[df["Signal"] == sig_choice].reset_index(drop=True)
             else:
-                col_cols_btn, col_csv_btn, _ = st.columns([1.3, 1.1, 4.6], vertical_alignment="center")
+                col_plain_summary, col_cols_btn, col_csv_btn = st.columns(
+                    [4.5, 1.0, 0.85], vertical_alignment="center"
+                )
+                with col_plain_summary:
+                    st.caption(f"Showing **{len(table_df)}** stocks · NSE OI disabled")
 
             if not table_df.empty and "Chart" in st.session_state.selected_columns and "Symbol" in table_df.columns:
                 table_df = table_df.assign(
@@ -790,7 +801,7 @@ def render_scanner(
                 )
 
             with col_cols_btn:
-                with st.popover("⚙️ Customize Columns", width="stretch"):
+                with st.popover("⚙️ Columns", width="stretch", help="Add, remove, or reorder visible columns."):
                     st.multiselect(
                         "Visible columns (add, remove, or reorder)",
                         options=ALL_COLUMNS,
@@ -821,7 +832,7 @@ def render_scanner(
             if table_df.empty:
                 st.info(f"No **{sig_choice}** stocks matched the current scan and filters.")
             elif not visible_cols:
-                st.warning("Select at least one column in **Customize Columns** to display results.")
+                st.warning("Select at least one column in **⚙️ Columns** to display results.")
             else:
                 active_config = {c: COLUMN_CONFIG[c] for c in visible_cols if c in COLUMN_CONFIG}
                 table_data = (
@@ -837,6 +848,7 @@ def render_scanner(
                     height=table_height,
                     hide_index=True,
                     column_config=active_config,
+                    placeholder="—",
                     key="scanner_table",
                 )
 
@@ -956,7 +968,7 @@ scanner_fragment(
     fivepaisa_live_ws=fivepaisa_live_ws,
 )
 
-st.markdown("---")
+st.divider()
 with st.expander("📘 Column & Momentum Guide — How to Use", expanded=False):
     st.markdown(COLUMN_GUIDE_MARKDOWN)
 st.caption(

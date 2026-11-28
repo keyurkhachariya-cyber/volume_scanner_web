@@ -6,7 +6,6 @@ Maps scanner symbols (e.g. 'RELIANCE.NS' / 'M&M.NS') -> Upstox instrument_key ('
 from datetime import datetime
 import gzip
 import json
-from pathlib import Path
 import threading
 from typing import Dict, Iterable, Optional
 

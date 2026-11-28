@@ -5,7 +5,6 @@ Includes optional live sync from NSE India with local cache and built-in fallbac
 
 from datetime import datetime
 import json
-from pathlib import Path
 from typing import List, Optional, Tuple
 
 from core.holidays import IST

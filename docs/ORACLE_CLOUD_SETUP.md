@@ -153,5 +153,5 @@ If you want direct access without Cloudflare (requires opening ports `80` and `4
   Oracle may stop/reclaim Always Free instances if **over 7 consecutive days**, 95th-percentile **CPU < 20%**, **Network < 20%**, AND (on `A1` Arm) **Memory < 20%** are *all* true at the same time. Sizing your `A1.Flex` VM sensibly (e.g., `2 OCPU / 4 GB` instead of `12 GB`) keeps active Python/Streamlit/cache memory cleanly above that 20% memory floor without needing artificial load.
 * **NSE India (`core/oi.py`) on datacenter IPs:**
   OCI Mumbai/Hyderabad gives low latency to Indian markets, though NSE's Akamai WAF may still occasionally rate-limit datacenter IPs. When throttled, `core/oi.py` backs off safely (`60s → 600s`) and price/volume scanning continues uninterrupted.
-* **Future Indian Broker API / WebSocket Integration:**
-  Store broker API keys in `~/.streamlit/secrets.toml` (keep out of git, `chmod 600`), or pass via `EnvironmentFile=` in `fno-scanner.service`. Avoid committing `.cache/` or `secrets.toml`.
+* **Indian Broker API / WebSocket Secrets (Upstox v3 & 5paisa Xstream):**
+  Store broker API keys and credentials in `~/.streamlit/secrets.toml` (or `.streamlit/secrets.toml`, keep out of git, `chmod 600`), or pass via `EnvironmentFile=` in `fno-scanner.service`. Never commit `.cache/` or `secrets.toml`.

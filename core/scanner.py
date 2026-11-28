@@ -1,7 +1,7 @@
 """
 Core intraday relative-volume scanner:
 - Summarizes today's regular-hours volume, OHLC, VWAP, and 15m volume burst from NumPy arrays.
-- Orchestrates concurrent baseline + today data fetching via yahoo_client and baseline_cache.
+- Orchestrates concurrent baseline + today data fetching via MarketDataProvider and baseline_cache.
 - Aligns per-ticker lookup to previous trading day's volume till the same bar time and enriches with NSE OI.
 """
 

@@ -15,7 +15,6 @@ from typing import Any, Dict, List, Optional, Tuple
 from core.utils import IST
 from providers.common.stream_base import (
     BaseMarketStream,
-    compute_burst_from_minute_buckets as _compute_burst_from_minute_buckets,
     register_stream_stopper,
     secret_fingerprint as _token_fingerprint,
     to_float as _to_float,
