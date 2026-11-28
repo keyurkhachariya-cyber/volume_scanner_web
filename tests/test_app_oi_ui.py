@@ -1,3 +1,5 @@
+import base64
+import json
 import os
 import sys
 import unittest
@@ -389,6 +391,108 @@ class AppOiUiTest(unittest.TestCase):
             rendered = at.dataframe[0].value
             self.assertEqual(list(rendered.columns), ["Symbol", "Chart", "Range_Pos_Pct"])
             self.assertTrue(all(str(u).startswith("https://in.tradingview.com/chart/?symbol=NSE%3A") for u in rendered["Chart"]))
+
+    def test_auth_helpers_extract_oauth_param_and_jwt_status(self):
+        from ui.auth_helpers import extract_oauth_param, inspect_fivepaisa_jwt
+
+        self.assertEqual(
+            extract_oauth_param("https://my-app.streamlit.app/?code=AUTH123&state=xyz", ("code",)),
+            "AUTH123",
+        )
+        self.assertEqual(
+            extract_oauth_param("?requesttoken=REQ999&clientcode=500111", ("RequestToken", "requesttoken")),
+            "REQ999",
+        )
+        self.assertEqual(extract_oauth_param("  BARE_CODE  ", ("code",)), "BARE_CODE")
+
+        def _make_jwt(claims: dict) -> str:
+            hdr = base64.urlsafe_b64encode(b'{"alg":"HS256"}').decode("ascii").rstrip("=")
+            body = base64.urlsafe_b64encode(json.dumps(claims).encode("utf-8")).decode("ascii").rstrip("=")
+            return f"{hdr}.{body}.sig"
+
+        valid_jwt = _make_jwt({"ClientCode": "50011110", "exp": 2000000000})
+        valid_info = inspect_fivepaisa_jwt(valid_jwt, now_ts=1900000000.0)
+        self.assertTrue(valid_info["is_jwt"])
+        self.assertEqual(valid_info["client_code"], "50011110")
+        self.assertFalse(valid_info["is_expired"])
+        self.assertTrue(valid_info["exp_label"].endswith("IST"))
+
+        expired_info = inspect_fivepaisa_jwt(valid_jwt, now_ts=2100000000.0)
+        self.assertTrue(expired_info["is_expired"])
+
+        plain_info = inspect_fivepaisa_jwt("opaque-token")
+        self.assertFalse(plain_info["is_jwt"])
+        self.assertFalse(plain_info["is_expired"])
+        self.assertEqual(plain_info["client_code"], "")
+
+    def test_sidebar_token_url_paste_clear_jwt_expiry_and_query_params(self):
+        import providers
+
+        def _make_jwt(claims: dict) -> str:
+            hdr = base64.urlsafe_b64encode(b'{"alg":"HS256"}').decode("ascii").rstrip("=")
+            body = base64.urlsafe_b64encode(json.dumps(claims).encode("utf-8")).decode("ascii").rstrip("=")
+            return f"{hdr}.{body}.sig"
+
+        at = AppTest.from_file(os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")), "app.py"), default_timeout=15)
+        with (
+            patch.object(universe, "get_fno_universe", return_value=(["RELIANCE.NS"], "Mock")),
+            patch.object(providers, "exchange_upstox_auth_code", return_value=("UP_TOK_NEW", None)) as mock_exch,
+        ):
+            at.run()
+            [c for c in at.segmented_control if c.label == "Data Source"][0].set_value("Upstox v3").run()
+            self.assertTrue(any("Access token required" in c.value for c in at.caption))
+
+            [t for t in at.text_input if t.label == "API Key (client_id)"][0].set_value("CID1").run()
+            [t for t in at.text_input if t.label == "API Secret"][0].set_value("CSEC1").run()
+            [t for t in at.text_input if t.label == "2️⃣ Auth Code or Full Redirect URL"][0].set_value(
+                "http://localhost:8501/?code=AUTH_XYZ&state=ok"
+            ).run()
+            [b for b in at.button if b.label == "Exchange Code for Token"][0].click().run()
+
+            mock_exch.assert_called_once_with("AUTH_XYZ", "CID1", "CSEC1", "http://localhost:8501")
+            self.assertEqual(list(at.exception), [])
+            self.assertEqual(at.session_state.upstox_access_token, "UP_TOK_NEW")
+            self.assertEqual(
+                [t for t in at.text_input if t.label == "Upstox Access Token (Daily)"][0].value,
+                "UP_TOK_NEW",
+            )
+            self.assertTrue(any("Upstox token saved" in s.value for s in at.success))
+
+            # Clear button resets token cleanly without stale widget text
+            with patch.object(providers, "stop_upstox_stream"):
+                [b for b in at.button if b.label == "✕"][0].click().run()
+            self.assertEqual(at.session_state.upstox_access_token, "")
+            self.assertEqual(
+                [t for t in at.text_input if t.label == "Upstox Access Token (Daily)"][0].value,
+                "",
+            )
+
+            # Switch to 5paisa Xstream: test auto ClientCode extraction & expired JWT warning
+            [c for c in at.segmented_control if c.label == "Data Source"][0].set_value("5paisa Xstream").run()
+            valid_jwt = _make_jwt({"ClientCode": "55667788", "exp": 4102444800})
+            [t for t in at.text_input if t.label == "5paisa Access Token (Daily)"][0].set_value(valid_jwt).run()
+            self.assertEqual(
+                [t for t in at.text_input if t.label == "5paisa Client Code"][0].value,
+                "55667788",
+            )
+            self.assertTrue(any("JWT loaded · valid until" in c.value for c in at.caption))
+
+            expired_jwt = _make_jwt({"ClientCode": "55667788", "exp": 1700000000})
+            [t for t in at.text_input if t.label == "5paisa Access Token (Daily)"][0].set_value(expired_jwt).run()
+            self.assertTrue(any("5paisa JWT expired" in w.value for w in at.warning))
+
+        # Verify ?code=... OAuth callback query parameter auto-switches to Upstox v3 & captures code
+        at_qp = AppTest.from_file(os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")), "app.py"), default_timeout=15)
+        at_qp.query_params["code"] = "AUTO_CODE_77"
+        with patch.object(universe, "get_fno_universe", return_value=(["RELIANCE.NS"], "Mock")):
+            at_qp.run()
+        self.assertEqual(list(at_qp.exception), [])
+        self.assertEqual(at_qp.session_state.data_source_choice, "Upstox v3")
+        self.assertEqual(
+            [t for t in at_qp.text_input if t.label == "2️⃣ Auth Code or Full Redirect URL"][0].value,
+            "AUTO_CODE_77",
+        )
+        self.assertNotIn("code", at_qp.query_params)
 
 
 if __name__ == "__main__":
