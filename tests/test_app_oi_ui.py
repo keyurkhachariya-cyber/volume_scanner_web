@@ -530,6 +530,17 @@ class AppOiUiTest(unittest.TestCase):
         self.assertEqual(at_b.session_state.upstox_access_token, "TOK_CROSS_TAB")
         self.assertIsNone(auth_helpers.pop_oauth_handoff(state_nonce))
 
+        # Original tab (at_a) automatically picks up TOK_CROSS_TAB via completed handoff nonce
+        with patch.object(universe, "get_fno_universe", return_value=(["RELIANCE.NS"], "Mock")):
+            at_a.run()
+        self.assertEqual(at_a.session_state.upstox_access_token, "TOK_CROSS_TAB")
+        self.assertEqual(
+            [t for t in at_a.text_input if t.label == "Upstox Access Token (Daily)"][0].value,
+            "TOK_CROSS_TAB",
+        )
+        self.assertTrue(any("synced automatically" in s.value for s in at_a.success))
+        self.assertIsNone(auth_helpers.pop_completed_oauth_token(state_nonce))
+
         # 2. Local token/key store preserves today's token, expires yesterday's token, and checks localhost host
         self.assertTrue(auth_helpers.is_local_host_request({"Host": "localhost:8501"}))
         self.assertTrue(auth_helpers.is_local_host_request({"Host": "127.0.0.1:8501"}))

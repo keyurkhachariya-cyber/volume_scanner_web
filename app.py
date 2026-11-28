@@ -32,9 +32,11 @@ from ui.auth_helpers import (
     inspect_fivepaisa_jwt,
     is_local_host_request,
     load_local_broker_auth,
+    pop_completed_oauth_token,
     pop_oauth_handoff,
     register_oauth_handoff,
     save_local_broker_auth,
+    store_completed_oauth_token,
 )
 from ui.screener_filters import (
     MARKET_CLOSE_TIME,
@@ -239,8 +241,31 @@ for _sk, _wk, _sec, _fld, _dft, _loc in (
         st.session_state[_wk] = _explicit_sec
 
 
+def _consume_origin_tab_oauth(provider: str, nonce: str) -> bool:
+    """Pull a completed cross-tab OAuth token into pending session updates if ready."""
+    if not nonce:
+        return False
+    done = pop_completed_oauth_token(nonce)
+    if not done or not done.get("access_token"):
+        return False
+    if provider == "upstox":
+        st.session_state._pending_upstox_token = done["access_token"]
+        st.session_state._upstox_login_notice = "Upstox token synced automatically from browser login."
+        st.session_state.pop("_u_oauth_nonce", None)
+    else:
+        st.session_state._pending_fivepaisa_auth = (done["access_token"], done.get("client_code", ""))
+        st.session_state._fivepaisa_login_notice = "5paisa token synced automatically from browser login."
+        st.session_state.pop("_fp_oauth_nonce", None)
+    return True
+
+
 def _apply_pending_auth_updates() -> None:
-    """Apply token/code updates from previous button clicks before sidebar widgets mount."""
+    """Apply token/code updates from previous button clicks or cross-tab OAuth sync before sidebar widgets mount."""
+    if not st.session_state.get("upstox_access_token") and st.session_state.get("_u_oauth_nonce"):
+        _consume_origin_tab_oauth("upstox", st.session_state["_u_oauth_nonce"])
+    if not st.session_state.get("fivepaisa_access_token") and st.session_state.get("_fp_oauth_nonce"):
+        _consume_origin_tab_oauth("fivepaisa", st.session_state["_fp_oauth_nonce"])
+
     if "_pending_upstox_token" in st.session_state:
         tok_val = str(st.session_state.pop("_pending_upstox_token") or "").strip()
         st.session_state.upstox_access_token = tok_val
@@ -297,6 +322,8 @@ def _capture_oauth_redirect_params() -> None:
     up_code = _pop_qp("code")
     if up_code:
         oauth_state = _pop_qp("state")
+        if oauth_state:
+            st.session_state._active_up_oauth_state = oauth_state
         handoff = pop_oauth_handoff(oauth_state)
         if handoff:
             for dst_state, dst_widget, src_key in (
@@ -319,6 +346,8 @@ def _capture_oauth_redirect_params() -> None:
     fp_req = _pop_qp("RequestToken", "request_token", "requesttoken")
     if fp_req:
         oauth_state = _pop_qp("state")
+        if oauth_state:
+            st.session_state._active_fp_oauth_state = oauth_state
         handoff = pop_oauth_handoff(oauth_state)
         if handoff:
             for dst_state, dst_widget, src_key in (
@@ -365,6 +394,7 @@ def _clear_upstox_token() -> None:
     st.session_state._w_upstox_token = ""
     st.session_state._upstox_cleared_explicitly = True
     st.session_state.pop("_upstox_login_notice", None)
+    st.session_state.pop("_u_oauth_nonce", None)
     if st.session_state.get("_local_persist_enabled"):
         save_local_broker_auth("upstox", {}, clear_token=True)
 
@@ -378,8 +408,19 @@ def _clear_fivepaisa_token() -> None:
     st.session_state._w_fivepaisa_token = ""
     st.session_state._fivepaisa_cleared_explicitly = True
     st.session_state.pop("_fivepaisa_login_notice", None)
+    st.session_state.pop("_fp_oauth_nonce", None)
     if st.session_state.get("_local_persist_enabled"):
         save_local_broker_auth("fivepaisa", {}, clear_token=True)
+
+
+def _oauth_tab_sync_poller(provider: str, nonce: str) -> None:
+    """Poll silently every 2s inside origin tab until the OAuth redirect tab completes login."""
+    if _consume_origin_tab_oauth(provider, nonce):
+        st.rerun()
+    st.caption("⏳ Waiting for login tab to complete (auto-syncs when ready)...")
+
+
+_sync_oauth_tab_fragment = st.fragment(_oauth_tab_sync_poller, run_every=2)
 
 
 def _render_local_persist_toggle() -> bool:
@@ -568,6 +609,8 @@ with st.sidebar:
                 login_url = build_upstox_login_url(u_cid, u_redir, state=u_state)
                 st.caption(f"Callback URL: `{u_redir}`")
                 st.link_button("1️⃣ Open Upstox Daily Login", login_url, width="stretch")
+                if not upstox_token:
+                    _sync_oauth_tab_fragment("upstox", u_state)
             else:
                 st.caption("Fill API Key and Redirect URI to generate login link.")
 
@@ -592,6 +635,12 @@ with st.sidebar:
                     with st.spinner("Exchanging Upstox authorization code..."):
                         tok, err = exchange_upstox_auth_code(u_code, u_cid, u_csec, u_redir)
                     if tok:
+                        active_state = st.session_state.pop("_active_up_oauth_state", "")
+                        if active_state:
+                            store_completed_oauth_token(active_state, {"access_token": tok})
+                            notice_msg = "Upstox token saved! You can close this tab and switch back to your original tab, or continue scanning here."
+                        else:
+                            notice_msg = "Upstox token saved for today's session."
                         if remember_local:
                             save_local_broker_auth(
                                 "upstox",
@@ -603,7 +652,7 @@ with st.sidebar:
                                 },
                             )
                         st.session_state._pending_upstox_token = tok
-                        st.session_state._upstox_login_notice = "Upstox token saved for today's session."
+                        st.session_state._upstox_login_notice = notice_msg
                         st.rerun()
                     else:
                         st.error(err or "Upstox token exchange failed.")
@@ -765,6 +814,8 @@ with st.sidebar:
                     fp_login_url = build_fivepaisa_login_url(fp_user_key, fp_redir, state=fp_state)
                     st.caption(f"Callback URL: `{fp_redir}`")
                     st.link_button("1️⃣ Open 5paisa Daily Login", fp_login_url, width="stretch")
+                    if not fivepaisa_token:
+                        _sync_oauth_tab_fragment("fivepaisa", fp_state)
                 else:
                     st.caption("Fill User Key and Response URL to generate login link.")
 
@@ -794,6 +845,15 @@ with st.sidebar:
                             )
                         if tok:
                             resolved_cc = ccode or fivepaisa_client_code
+                            active_state = st.session_state.pop("_active_fp_oauth_state", "")
+                            if active_state:
+                                store_completed_oauth_token(
+                                    active_state,
+                                    {"access_token": tok, "client_code": resolved_cc},
+                                )
+                                notice_msg = "5paisa token saved! You can close this tab and switch back to your original tab, or continue scanning here."
+                            else:
+                                notice_msg = "5paisa token saved for today's session."
                             if remember_local:
                                 save_local_broker_auth(
                                     "fivepaisa",
@@ -807,7 +867,7 @@ with st.sidebar:
                                     },
                                 )
                             st.session_state._pending_fivepaisa_auth = (tok, ccode or "")
-                            st.session_state._fivepaisa_login_notice = "5paisa token saved for today's session."
+                            st.session_state._fivepaisa_login_notice = notice_msg
                             st.rerun()
                         else:
                             st.error(err or "5paisa RequestToken exchange failed.")

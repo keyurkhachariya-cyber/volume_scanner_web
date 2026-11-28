@@ -27,6 +27,7 @@ LOCAL_TOKENS_FILE: Path = CACHE_DIR / "broker_tokens.json"
 
 _HANDOFF_LOCK = threading.Lock()
 _PENDING_OAUTH_HANDOFFS: Dict[str, Tuple[float, Dict[str, str]]] = {}
+_COMPLETED_OAUTH_TOKENS: Dict[str, Tuple[float, Dict[str, str]]] = {}
 _MAX_PENDING_HANDOFFS = 64
 
 _LOCAL_STORE_LOCK = threading.Lock()
@@ -131,13 +132,16 @@ def detect_default_redirect_uri(
     return fallback
 
 
-def _prune_handoffs_locked(now_mono: float) -> None:
-    expired = [k for k, (exp, _) in _PENDING_OAUTH_HANDOFFS.items() if exp <= now_mono]
+def _prune_expiring_locked(
+    store: Dict[str, Tuple[float, Dict[str, str]]],
+    now_mono: float,
+) -> None:
+    expired = [k for k, (exp, _) in store.items() if exp <= now_mono]
     for k in expired:
-        _PENDING_OAUTH_HANDOFFS.pop(k, None)
-    while len(_PENDING_OAUTH_HANDOFFS) >= _MAX_PENDING_HANDOFFS:
-        oldest_key = min(_PENDING_OAUTH_HANDOFFS, key=lambda k: _PENDING_OAUTH_HANDOFFS[k][0])
-        _PENDING_OAUTH_HANDOFFS.pop(oldest_key, None)
+        store.pop(k, None)
+    while len(store) >= _MAX_PENDING_HANDOFFS:
+        oldest_key = min(store, key=lambda k: store[k][0])
+        store.pop(oldest_key, None)
 
 
 def register_oauth_handoff(
@@ -150,7 +154,7 @@ def register_oauth_handoff(
     clean_payload = {str(k): str(v or "").strip() for k, v in payload.items()}
     now_mono = pytime.monotonic()
     with _HANDOFF_LOCK:
-        _prune_handoffs_locked(now_mono)
+        _prune_expiring_locked(_PENDING_OAUTH_HANDOFFS, now_mono)
         _PENDING_OAUTH_HANDOFFS[clean_nonce] = (now_mono + max(1.0, float(ttl_seconds)), clean_payload)
     return clean_nonce
 
@@ -163,7 +167,38 @@ def pop_oauth_handoff(nonce: str) -> Optional[Dict[str, str]]:
     now_mono = pytime.monotonic()
     with _HANDOFF_LOCK:
         entry = _PENDING_OAUTH_HANDOFFS.pop(clean_nonce, None)
-        _prune_handoffs_locked(now_mono)
+        _prune_expiring_locked(_PENDING_OAUTH_HANDOFFS, now_mono)
+    if entry is None:
+        return None
+    exp_mono, payload = entry
+    return dict(payload) if exp_mono > now_mono else None
+
+
+def store_completed_oauth_token(
+    nonce: str,
+    token_payload: Dict[str, str],
+    ttl_seconds: float = 300.0,
+) -> None:
+    """Store exchanged OAuth token keyed by origin tab's secret state nonce for auto-sync."""
+    clean_nonce = (nonce or "").strip()
+    if not clean_nonce:
+        return
+    clean_payload = {str(k): str(v or "").strip() for k, v in token_payload.items()}
+    now_mono = pytime.monotonic()
+    with _HANDOFF_LOCK:
+        _prune_expiring_locked(_COMPLETED_OAUTH_TOKENS, now_mono)
+        _COMPLETED_OAUTH_TOKENS[clean_nonce] = (now_mono + max(1.0, float(ttl_seconds)), clean_payload)
+
+
+def pop_completed_oauth_token(nonce: str) -> Optional[Dict[str, str]]:
+    """Pop completed OAuth token for the originating tab if ready and unexpired."""
+    clean_nonce = (nonce or "").strip()
+    if not clean_nonce:
+        return None
+    now_mono = pytime.monotonic()
+    with _HANDOFF_LOCK:
+        entry = _COMPLETED_OAUTH_TOKENS.pop(clean_nonce, None)
+        _prune_expiring_locked(_COMPLETED_OAUTH_TOKENS, now_mono)
     if entry is None:
         return None
     exp_mono, payload = entry
