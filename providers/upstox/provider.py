@@ -18,10 +18,15 @@ from urllib.parse import quote as _url_quote, urlencode
 import numpy as np
 
 from core.holidays import is_market_open, is_wss_active_window
-from core.utils import IST, decode_json_response, localize_ist, time_to_sec
+from core.utils import IST, decode_json_response, localize_ist
 from providers.base import ArrayBundle, TodaySummary
 from providers.common.http_runtime import fetch_json_urls_async
-from providers.common.stream_base import secret_fingerprint, to_float
+from providers.common.stream_base import (
+    parse_quote_ts_sec,
+    secret_fingerprint,
+    snapshots_to_summaries,
+    to_float,
+)
 from providers.upstox.instruments import resolve_instrument_keys
 from providers.upstox.stream import (
     get_or_start_upstox_stream,
@@ -153,21 +158,6 @@ def _parse_upstox_candles(payload: Any) -> Tuple[Optional[ArrayBundle], bool]:
     }, True
 
 
-def _parse_quote_ts_sec(raw_ts: Any) -> Optional[int]:
-    if raw_ts is None or raw_ts == "":
-        return None
-    num = to_float(raw_ts)
-    if num is not None and num > 1e8:
-        return int(num // 1000) if num > 1e11 else int(num)
-    try:
-        dt = datetime.fromisoformat(str(raw_ts).strip().replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = localize_ist(dt)
-        return int(dt.timestamp())
-    except ValueError:
-        return None
-
-
 def _parse_upstox_batch_quotes(
     payload: Any,
     key_to_sym: Dict[str, str],
@@ -203,9 +193,9 @@ def _parse_upstox_batch_quotes(
             continue
 
         # Prefer actual exchange last_trade_time over wrapper server timestamp
-        tick_sec = _parse_quote_ts_sec(entry.get("last_trade_time"))
+        tick_sec = parse_quote_ts_sec(entry.get("last_trade_time"))
         if tick_sec is None:
-            tick_sec = _parse_quote_ts_sec(entry.get("timestamp"))
+            tick_sec = parse_quote_ts_sec(entry.get("timestamp"))
         if tick_sec is None:
             continue
 
@@ -239,33 +229,6 @@ def _parse_upstox_batch_quotes(
         )
 
     return snapshots
-
-
-def _snapshots_to_summaries(
-    snapshots: List[Dict[str, Any]], cutoff: time
-) -> Dict[str, TodaySummary]:
-    """Convert normalized quote snapshots into TodaySummary 8-tuples bounded by cutoff."""
-    out: Dict[str, TodaySummary] = {}
-    cutoff_sec = time_to_sec(cutoff)
-    for snap in snapshots:
-        sym = snap.get("sym")
-        vtt = snap.get("vtt")
-        tick_sec = snap.get("tick_sec")
-        if not sym or vtt is None or vtt <= 0.0 or tick_sec is None:
-            continue
-        t_ist = datetime.fromtimestamp(tick_sec, IST).time()
-        last_bar_time = t_ist if time_to_sec(t_ist) <= cutoff_sec else cutoff
-        out[sym] = (
-            float(vtt),
-            snap.get("ltp"),
-            snap.get("day_open"),
-            snap.get("day_high"),
-            snap.get("day_low"),
-            last_bar_time,
-            snap.get("atp"),
-            None,
-        )
-    return out
 
 
 class UpstoxProvider:
@@ -525,7 +488,7 @@ class UpstoxProvider:
                 meta["error"] = self.get_last_error()
                 return {}, meta
             if snapshots:
-                return _snapshots_to_summaries(snapshots, cutoff), meta
+                return snapshots_to_summaries(snapshots, cutoff), meta
             if ok and not market_open_now:
                 with _SEED_LOCK:
                     _EMPTY_TODAY_UNTIL[cooldown_key] = pytime.monotonic() + _EMPTY_TODAY_COOLDOWN_SEC

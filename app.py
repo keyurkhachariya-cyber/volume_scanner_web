@@ -710,7 +710,7 @@ def _render_upstox_sidebar_auth(wss_window_open: bool, detected_redirect_uri: st
     return upstox_token, upstox_live_ws
 
 
-def _render_fivepaisa_sidebar_auth(wss_window_open: bool) -> tuple[str, str, bool]:
+def _render_fivepaisa_sidebar_auth(wss_window_open: bool) -> tuple[str, str, str, bool]:
     """Render 5paisa Xstream JWT input, WSS toggle, and TOTP/OAuth daily login helper in sidebar."""
     fivepaisa_token = _render_token_input_with_clear(
         label="5paisa Access Token (Daily)",
@@ -778,19 +778,35 @@ def _render_fivepaisa_sidebar_auth(wss_window_open: bool) -> tuple[str, str, boo
             "Edit API keys",
             value=False,
             key="_w_edit_fp_creds",
-            help="User Key, Encryption Key, and User ID are loaded — check to view or modify them.",
+            help="API Key, Encryption Key, and User ID are loaded — check to view or modify them.",
         )
         if edit_fp_creds:
-            fp_user_key = _sync_text_field("User Key (VendorKey)", "_fp_user_key", "_w_fp_user_key")
-            fp_enc_key = _sync_text_field(
-                "Encryption Key", "_fp_enc_key", "_w_fp_enc_key", type="password"
+            st.caption("From **xstream.5paisa.com → My App** (`App Source` & `User Password` are not needed).")
+            fp_user_key = _sync_text_field(
+                "API Key (User Key / VendorKey)",
+                "_fp_user_key",
+                "_w_fp_user_key",
+                placeholder="API Key from Xstream My App card",
+                help="Labeled 'API Key' on the 5paisa Xstream My App card (called User Key / VendorKey in API docs).",
             )
-            fp_user_id = _sync_text_field("User ID", "_fp_user_id", "_w_fp_user_id")
+            fp_enc_key = _sync_text_field(
+                "Encryption Key",
+                "_fp_enc_key",
+                "_w_fp_enc_key",
+                type="password",
+                placeholder="Encryption Key from Xstream dashboard",
+            )
+            fp_user_id = _sync_text_field(
+                "User ID",
+                "_fp_user_id",
+                "_w_fp_user_id",
+                placeholder="User ID from Xstream dashboard",
+            )
         else:
             fp_user_key = st.session_state.get("_fp_user_key", "").strip()
             fp_enc_key = st.session_state.get("_fp_enc_key", "").strip()
             fp_user_id = st.session_state.get("_fp_user_id", "").strip()
-            st.caption("✅ User Key, Encryption Key & User ID loaded")
+            st.caption("✅ API Key, Encryption Key & User ID loaded")
 
         remember_local = _render_local_persist_toggle()
         if remember_local:
@@ -811,7 +827,12 @@ def _render_fivepaisa_sidebar_auth(wss_window_open: bool) -> tuple[str, str, boo
                 st.session_state._w_fp_totp_cc = (
                     fivepaisa_client_code or _get_broker_secret("fivepaisa", "client_code")
                 )
-            fp_cc = st.text_input("Client Code", key="_w_fp_totp_cc").strip()
+            fp_cc = st.text_input(
+                "Client Code",
+                key="_w_fp_totp_cc",
+                placeholder="e.g. 50764390 (your 5paisa login ID)",
+                help="Your numeric 5paisa trading Client Code (without any '5P' app-name prefix).",
+            ).strip()
             fp_pin = _sync_text_field("Trading PIN", "_fp_totp_pin", "_w_fp_totp_pin", type="password")
             fp_totp_val = _sync_text_field(
                 "TOTP (6-digit code or Base32 Secret)",
@@ -823,7 +844,7 @@ def _render_fivepaisa_sidebar_auth(wss_window_open: bool) -> tuple[str, str, boo
                 st.caption("✅ TOTP/PIN ready — click below to generate today's token")
             if st.button("Login via TOTP & Save Token", width="stretch"):
                 if not (fp_cc and fp_pin and fp_totp_val and fp_user_key and fp_enc_key and fp_user_id):
-                    st.warning("Fill User Key, Encryption Key, User ID, Client Code, PIN, and TOTP.")
+                    st.warning("Fill API Key, Encryption Key, User ID, Client Code, PIN, and TOTP.")
                 else:
                     with st.spinner("Logging in to 5paisa via TOTP..."):
                         tok, ccode, err = login_fivepaisa_totp(
@@ -882,7 +903,7 @@ def _render_fivepaisa_sidebar_auth(wss_window_open: bool) -> tuple[str, str, boo
                     "1️⃣ Open 5paisa Daily Login", fp_login_url, "fivepaisa_same_tab_login"
                 )
             else:
-                st.caption("Fill User Key and Response URL to generate login link.")
+                st.caption("Fill API Key and Response URL to generate login link.")
 
             fp_req_raw = _sync_text_field(
                 "2️⃣ RequestToken or Full Redirect URL",
@@ -893,7 +914,7 @@ def _render_fivepaisa_sidebar_auth(wss_window_open: bool) -> tuple[str, str, boo
             )
             auto_fp_exchange = bool(st.session_state.pop("_auto_exchange_fivepaisa", False))
             if auto_fp_exchange and not (fp_req_raw and fp_user_key and fp_enc_key and fp_user_id):
-                st.info("RequestToken captured from redirect URL — enter API keys and click **Exchange RequestToken**.")
+                st.info("RequestToken captured from redirect URL — enter API Key, Encryption Key, and User ID, then click **Exchange RequestToken**.")
 
             if st.button("Exchange RequestToken", width="stretch") or (
                 auto_fp_exchange and fp_req_raw and fp_user_key and fp_enc_key and fp_user_id
@@ -902,7 +923,7 @@ def _render_fivepaisa_sidebar_auth(wss_window_open: bool) -> tuple[str, str, boo
                     fp_req_raw, ("RequestToken", "requesttoken", "request_token")
                 )
                 if not (fp_req_tok and fp_user_key and fp_enc_key and fp_user_id):
-                    st.warning("Fill User Key, Encryption Key, User ID, and RequestToken.")
+                    st.warning("Fill API Key, Encryption Key, User ID, and RequestToken.")
                 else:
                     with st.spinner("Exchanging 5paisa RequestToken..."):
                         tok, ccode, err = exchange_fivepaisa_request_token(
@@ -934,7 +955,7 @@ def _render_fivepaisa_sidebar_auth(wss_window_open: bool) -> tuple[str, str, boo
                     else:
                         st.error(err or "5paisa RequestToken exchange failed.")
 
-    return fivepaisa_token, fivepaisa_client_code, fivepaisa_live_ws
+    return fivepaisa_token, fivepaisa_client_code, fp_user_key, fivepaisa_live_ws
 
 
 _apply_pending_auth_updates()
@@ -963,13 +984,14 @@ with st.sidebar:
     upstox_live_ws = True
     fivepaisa_token = ""
     fivepaisa_client_code = ""
+    fivepaisa_user_key = ""
     fivepaisa_live_ws = True
     if use_upstox:
         upstox_token, upstox_live_ws = _render_upstox_sidebar_auth(
             wss_window_open, _detected_redirect_uri
         )
     elif use_fivepaisa:
-        fivepaisa_token, fivepaisa_client_code, fivepaisa_live_ws = _render_fivepaisa_sidebar_auth(
+        fivepaisa_token, fivepaisa_client_code, fivepaisa_user_key, fivepaisa_live_ws = _render_fivepaisa_sidebar_auth(
             wss_window_open
         )
 
@@ -1235,6 +1257,7 @@ def render_scanner(
     upstox_live_ws: bool = True,
     fivepaisa_token: str = "",
     fivepaisa_client_code: str = "",
+    fivepaisa_user_key: str = "",
     fivepaisa_live_ws: bool = True,
 ):
     now = datetime.now(IST)
@@ -1312,6 +1335,7 @@ def render_scanner(
                         access_token=fivepaisa_token,
                         client_code=fivepaisa_client_code,
                         use_live_ws=fivepaisa_live_ws,
+                        user_key=fivepaisa_user_key,
                     )
                 raw_df = run_scan(**scan_kwargs)
                 if not raw_df.empty:
@@ -1630,6 +1654,7 @@ scanner_fragment(
     upstox_live_ws=upstox_live_ws,
     fivepaisa_token=fivepaisa_token,
     fivepaisa_client_code=fivepaisa_client_code,
+    fivepaisa_user_key=fivepaisa_user_key,
     fivepaisa_live_ws=fivepaisa_live_ws,
 )
 

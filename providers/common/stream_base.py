@@ -6,9 +6,10 @@ intraday REST seeding, and TodaySummary builder used by broker stream adapters.
 from __future__ import annotations
 
 import atexit
-from datetime import date, time
+from datetime import date, datetime, time
 import hashlib
 import math
+import re
 import threading
 import time as pytime
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
@@ -16,10 +17,11 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 
 from core.holidays import is_wss_active_window
-from core.utils import ist_epoch_sec, time_to_sec
+from core.utils import IST, ist_epoch_sec, localize_ist, time_to_sec
 from providers.base import ArrayBundle, TodaySummary
 
 MARKET_OPEN_SEC = 9 * 3600 + 15 * 60
+_ASPNET_DATE_RE = re.compile(r"/Date\((-?\d+)")
 _GUARD_INTERVAL_SEC = 30.0
 _GUARD_LOCK = threading.Lock()
 _GUARD_STOPPERS: Dict[str, Callable[[], None]] = {}
@@ -36,6 +38,61 @@ def to_float(val: Any) -> Optional[float]:
         return None if math.isnan(num) else num
     except (TypeError, ValueError):
         return None
+
+
+def parse_quote_ts_sec(raw_ts: Any) -> Optional[int]:
+    """Parse epoch sec/ms, ISO string, or ASP.NET /Date(ms+offset)/ into positive UTC epoch seconds."""
+    if raw_ts is None or raw_ts == "":
+        return None
+    num = to_float(raw_ts)
+    if num is not None:
+        if num <= 1e8:
+            return None
+        return int(num // 1000) if num > 1e11 else int(num)
+    raw_str = str(raw_ts).strip()
+    m = _ASPNET_DATE_RE.search(raw_str)
+    if m:
+        try:
+            ms = int(m.group(1))
+            sec = ms // 1000 if abs(ms) > 10**11 else ms
+            return sec if sec > 1e8 else None
+        except ValueError:
+            return None
+    try:
+        dt = datetime.fromisoformat(raw_str.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = localize_ist(dt)
+        sec = int(dt.timestamp())
+        return sec if sec > 1e8 else None
+    except ValueError:
+        return None
+
+
+def snapshots_to_summaries(
+    snapshots: List[Dict[str, Any]], cutoff: time
+) -> Dict[str, TodaySummary]:
+    """Convert normalized quote snapshots into TodaySummary 8-tuples bounded by cutoff."""
+    out: Dict[str, TodaySummary] = {}
+    cutoff_sec = time_to_sec(cutoff)
+    for snap in snapshots:
+        sym = snap.get("sym")
+        vtt = snap.get("vtt")
+        tick_sec = snap.get("tick_sec")
+        if not sym or vtt is None or vtt <= 0.0 or tick_sec is None:
+            continue
+        t_ist = datetime.fromtimestamp(tick_sec, IST).time()
+        last_bar_time = t_ist if time_to_sec(t_ist) <= cutoff_sec else cutoff
+        out[sym] = (
+            float(vtt),
+            snap.get("ltp"),
+            snap.get("day_open"),
+            snap.get("day_high"),
+            snap.get("day_low"),
+            last_bar_time,
+            snap.get("atp"),
+            None,
+        )
+    return out
 
 
 def secret_fingerprint(*parts: str) -> str:

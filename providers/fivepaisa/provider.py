@@ -7,8 +7,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 import hashlib
 import hmac
 import re
@@ -20,13 +21,19 @@ from urllib.parse import urlencode
 
 import numpy as np
 
-from core.holidays import is_market_open, is_wss_active_window
+from core.holidays import get_holidays, is_market_open, is_wss_active_window
 from core.utils import IST, decode_json_response, localize_ist
 from providers.base import ArrayBundle, TodaySummary
 from providers.common.http_runtime import fetch_json_urls_async
-from providers.common.stream_base import secret_fingerprint
+from providers.common.stream_base import (
+    parse_quote_ts_sec,
+    secret_fingerprint,
+    snapshots_to_summaries,
+    to_float,
+)
 from providers.fivepaisa.instruments import resolve_scrip_codes
 from providers.fivepaisa.stream import (
+    decode_jwt_claims,
     extract_client_code_from_jwt,
     get_or_start_fivepaisa_stream,
     stop_fivepaisa_stream,
@@ -34,13 +41,17 @@ from providers.fivepaisa.stream import (
 import providers.yahoo.client as yahoo_client
 
 _FIVEPAISA_VENDOR_BASE = "https://Openapi.5paisa.com/VendorsAPI/Service1.svc"
+_FIVEPAISA_BATCH_FEED_URL = f"{_FIVEPAISA_VENDOR_BASE}/V1/MarketFeed"
 _FIVEPAISA_OAUTH_URL = "https://dev-openapi.5paisa.com/WebVendorLogin/VLogin/Index"
 _FIVEPAISA_HISTORICAL_BASE = "https://openapi.5paisa.com/V2/historical"
 _FIVEPAISA_SUBSCRIPTION_KEY = "c89fab8d895a426d9e00db380b433027"
 _FIVEPAISA_MAX_CONCURRENCY = 16
-_FIVEPAISA_MAX_PER_SEC = 22    # 5paisa limit: 25 req/sec
-_FIVEPAISA_MAX_PER_MIN = 1200  # 5paisa limit: 1,500 req/min
-_SEED_STABLE_WAIT_SECONDS = 1.0
+_FIVEPAISA_MAX_PER_SEC = 22    # 5paisa historical limit: 25 req/sec
+_FIVEPAISA_MAX_PER_MIN = 1200  # 5paisa historical limit: 1,500 req/min
+_FIVEPAISA_BATCH_FEED_MAX = 50         # 5paisa V1/MarketFeed safe chunk size (vs Upstox 500)
+_FIVEPAISA_BATCH_FEED_CONCURRENCY = 5  # ~218 F&O stocks fit into 5 concurrent POST calls
+_FIVEPAISA_BATCH_FEED_PER_SEC = 10
+_FIVEPAISA_BATCH_FEED_PER_MIN = 45     # 5paisa non-order data feed limit (~50 req/min)
 _MARKET_OPEN_WALL = time(9, 15)
 _MARKET_CLOSE_WALL = time(15, 30)
 _PRE_SEED_SKIP_CUTOFF = time(9, 20)
@@ -248,8 +259,134 @@ def _parse_fivepaisa_candles(payload: Any) -> Tuple[Optional[ArrayBundle], bool]
     }, True
 
 
+def _extract_user_key_from_jwt(access_token: str) -> str:
+    """Best-effort extraction of 5paisa UserKey/AppKey from JWT claims if omitted."""
+    claims = decode_jwt_claims(access_token)
+    for key in ("UserKey", "userkey", "user_key", "AppKey", "appkey", "app_key"):
+        val = str(claims.get(key) or "").strip()
+        if val:
+            return val
+    return ""
+
+
+def _parse_fivepaisa_market_feed(
+    payload: Any,
+    code_to_sym: Dict[str, str],
+    today: date,
+) -> Tuple[List[Dict[str, Any]], bool]:
+    """
+    Parse POST /V1/MarketFeed JSON into normalized quote snapshots for `today`.
+    Returns (snapshots, succeeded) where succeeded=False suppresses empty-day caching on API errors.
+    """
+    if not isinstance(payload, dict):
+        return [], False
+    head = payload.get("head")
+    if isinstance(head, dict) and head.get("status") not in (0, "0", None):
+        return [], False
+    body = payload.get("body")
+    if not isinstance(body, dict):
+        return [], False
+    if body.get("Status") not in (0, "0", None):
+        return [], False
+
+    raw_items = body.get("Data")
+    if not isinstance(raw_items, list):
+        raw_items = body.get("MarketFeedData") if raw_items is None else raw_items
+    if raw_items is None:
+        return [], True
+    if not isinstance(raw_items, list) or not raw_items:
+        return [], True
+
+    sym_by_base = {
+        sym.removesuffix(".NS").removesuffix(".BO").strip().upper(): sym
+        for sym in code_to_sym.values()
+    }
+    snapshots: List[Dict[str, Any]] = []
+
+    for entry in raw_items:
+        if not isinstance(entry, dict):
+            continue
+        raw_code = (
+            entry.get("Token")
+            if entry.get("Token") not in (None, "")
+            else entry.get("ScripCode", entry.get("Scripcode"))
+        )
+        sym = code_to_sym.get(str(raw_code).strip()) if raw_code not in (None, "") else None
+        if sym is None:
+            tsym = str(entry.get("Symbol") or "").strip().upper()
+            sym = sym_by_base.get(tsym)
+        if sym is None:
+            continue
+
+        # Require dated exchange tick timestamp (LastTradedTime / TickDt) to avoid prior-day leakage
+        tick_sec = None
+        for ts_key in ("LastTradedTime", "LastTradeTime", "TickDt"):
+            tick_sec = parse_quote_ts_sec(entry.get(ts_key))
+            if tick_sec is not None:
+                break
+        if tick_sec is None:
+            continue
+
+        tick_dt = datetime.fromtimestamp(tick_sec, IST)
+        if tick_dt.date() != today or tick_dt.time() < _MARKET_OPEN_WALL:
+            continue
+
+        vtt = to_float(entry.get("TotalQty") if entry.get("TotalQty") is not None else entry.get("Volume"))
+        if vtt is None or vtt <= 0.0:
+            continue
+
+        ltp = to_float(entry.get("LastRate") if entry.get("LastRate") is not None else entry.get("LTP"))
+        atp = to_float(
+            entry.get("AverageRate")
+            if entry.get("AverageRate") is not None
+            else (entry.get("AvgRate") if entry.get("AvgRate") is not None else entry.get("ATP"))
+        )
+        day_open = to_float(entry.get("OpenRate") if entry.get("OpenRate") is not None else entry.get("Open")) or ltp
+        day_high = to_float(entry.get("High")) or ltp
+        day_low = to_float(entry.get("Low")) or ltp
+
+        snapshots.append(
+            {
+                "sym": sym,
+                "feed_date": today,
+                "tick_sec": tick_sec,
+                "ltp": ltp,
+                "day_open": day_open,
+                "day_high": day_high,
+                "day_low": day_low,
+                "atp": atp,
+                "vtt": vtt,
+            }
+        )
+
+    return snapshots, True
+
+
+def _resolve_market_windows(today: date, cutoff: time) -> Tuple[bool, bool]:
+    """Return (market_open_now, wss_active_now) for a given IST date and time."""
+    now_ist = datetime.combine(today, cutoff, tzinfo=IST)
+    market_open_now = is_market_open(now_ist, background_refresh=True)
+    if _MARKET_OPEN_WALL <= cutoff <= _MARKET_CLOSE_WALL:
+        wss_active_now = market_open_now
+    else:
+        wss_active_now = is_wss_active_window(now_ist, background_refresh=True)
+    return market_open_now, wss_active_now
+
+
+def _allow_batch_quote_today(today: date, cutoff: time, market_open_now: bool) -> bool:
+    """
+    Skip V1/MarketFeed on pre-open (<09:15) or closed weekends/holidays because
+    5paisa stamps prior-session closing quotes with today's TickDt when closed.
+    """
+    if market_open_now:
+        return cutoff >= _MARKET_OPEN_WALL
+    if cutoff < _MARKET_OPEN_WALL:
+        return False
+    return today.weekday() < 5 and today not in get_holidays(background_refresh=True)
+
+
 class FivePaisaProvider:
-    """5paisa Xstream V2 Historical REST + live MarketFeedV3 WebSocket provider."""
+    """5paisa Xstream V2 Historical REST + 50-scrip V1/MarketFeed Batch Quote + MarketFeedV3 WSS provider."""
 
     provider_id: str = "fivepaisa"
     display_name: str = "5paisa Xstream"
@@ -262,9 +399,11 @@ class FivePaisaProvider:
         client_code: str = "",
         use_live_ws: bool = True,
         eq_map: Optional[Dict[str, str]] = None,
+        user_key: str = "",
     ) -> None:
         self.access_token = (access_token or "").strip()
         self.client_code = (client_code or "").strip() or extract_client_code_from_jwt(self.access_token)
+        self.user_key = (user_key or "").strip() or _extract_user_key_from_jwt(self.access_token)
         self.use_live_ws = bool(use_live_ws)
         self._eq_map_override = eq_map
         self._lock = threading.Lock()
@@ -296,10 +435,9 @@ class FivePaisaProvider:
         if from_date and to_date:
             from_dt = date.fromisoformat(from_date)
             to_dt = date.fromisoformat(to_date)
-            if (to_dt - from_dt).days == 1:
-                from_str = to_str = from_dt.isoformat()
-            else:
-                from_str, to_str = from_dt.isoformat(), to_dt.isoformat()
+            # Callers pass exclusive end dates (day + 1); 5paisa V2 historical end= is inclusive.
+            inc_end = to_dt - timedelta(days=1) if to_dt > from_dt else from_dt
+            from_str, to_str = from_dt.isoformat(), inc_end.isoformat()
         elif from_date:
             from_str = to_str = date.fromisoformat(from_date).isoformat()
         else:
@@ -328,6 +466,145 @@ class FivePaisaProvider:
                     _INFLIGHT_SEEDS.discard(seed_key)
 
         threading.Thread(target=_worker, name="fivepaisa_1m_seed", daemon=True).start()
+
+    def _seed_stream_sync(
+        self,
+        stream: Any,
+        symbols: Iterable[str],
+        today: date,
+        meta: Dict[str, Any],
+    ) -> Tuple[Dict[str, ArrayBundle], Set[str], bool]:
+        """Fetch today's 1m candles once and seed stream state; returns (bundles, failed, auth_failed)."""
+        seeded_bundles, failed = self.fetch_bars(((sym, "1d") for sym in symbols), interval="1m")
+        if self._is_auth_failed():
+            meta["error"] = self.get_last_error()
+            return seeded_bundles, failed, True
+        if seeded_bundles:
+            stream.seed_from_intraday_bundles(today, seeded_bundles)
+            meta["mode"] = "rest_seed"
+        return seeded_bundles, failed, False
+
+    def _fetch_batch_quotes_sync(
+        self,
+        sym_to_code: Dict[str, str],
+        code_to_sym: Dict[str, str],
+        today: date,
+        timeout: int = 10,
+    ) -> Tuple[List[Dict[str, Any]], bool]:
+        """
+        Fetch POST /V1/MarketFeed in 50-scrip chunks concurrently (5 POSTs for ~218 F&O stocks)
+        on the shared persistent HTTP/2 session, matching Upstox Batch Quote speed (~0.25s)
+        within 5paisa's 50-scrip and rate-limit constraints.
+        """
+        codes = [str(c).strip() for c in sym_to_code.values() if str(c).strip()]
+        if not codes:
+            return [], True
+        if not (self.access_token and self.client_code and self.user_key):
+            return [], False
+
+        from providers.common.http_runtime import _acquire_session, _get_limiter
+
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": f"bearer {self.access_token}",
+        }
+        chunks = [
+            codes[i : i + _FIVEPAISA_BATCH_FEED_MAX]
+            for i in range(0, len(codes), _FIVEPAISA_BATCH_FEED_MAX)
+        ]
+        limiter_key = f"fivepaisa_mf:{secret_fingerprint(self.user_key, self.client_code, self.access_token)}"
+
+        async def _run() -> Tuple[List[Dict[str, Any]], bool]:
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
+            persistent = yahoo_client._ASYNC_LOOP is not None and running_loop is yahoo_client._ASYNC_LOOP
+            limiter = _get_limiter(
+                limiter_key,
+                running_loop,
+                persistent,
+                _FIVEPAISA_BATCH_FEED_PER_SEC,
+                _FIVEPAISA_BATCH_FEED_PER_MIN,
+            )
+            sess, close_ephemeral = await _acquire_session()
+            sem = asyncio.Semaphore(_FIVEPAISA_BATCH_FEED_CONCURRENCY)
+
+            async def _post_chunk(chunk_idx: int) -> Tuple[int, List[Dict[str, Any]], bool, bool]:
+                async with sem:
+                    if self._is_auth_failed():
+                        return chunk_idx, [], False, False
+                    await limiter.acquire()
+                    if self._is_auth_failed():
+                        return chunk_idx, [], False, False
+                    payload = {
+                        "head": {"Key": self.user_key},
+                        "body": {
+                            "ClientCode": self.client_code,
+                            "MarketFeedData": [
+                                {"Exch": "N", "ExchType": "C", "ScripCode": code, "ScripData": ""}
+                                for code in chunks[chunk_idx]
+                            ],
+                            "LastRequestTime": "/Date(0)/",
+                            "RefreshRate": "H",
+                        },
+                    }
+                    try:
+                        resp = await sess.post(_FIVEPAISA_BATCH_FEED_URL, headers=headers, json=payload, timeout=timeout)
+                        code = int(resp.status_code)
+                        if code in (401, 403):
+                            self._set_error(
+                                "5paisa access token expired or invalid (HTTP 401/403). Run TOTP/OAuth login again.",
+                                auth_failed=True,
+                            )
+                            return chunk_idx, [], False, False
+                        if code == 429:
+                            self._set_error("5paisa API rate limit hit (HTTP 429); retrying briefly.")
+                            return chunk_idx, [], False, True
+                        if code != 200:
+                            return chunk_idx, [], False, code >= 500
+                        snaps, ok = _parse_fivepaisa_market_feed(decode_json_response(resp), code_to_sym, today)
+                        return chunk_idx, snaps, ok, False
+                    except Exception:
+                        return chunk_idx, [], False, True
+
+            snapshots: List[Dict[str, Any]] = []
+            retry_indices: List[int] = []
+            ok_all = True
+            try:
+                wave1 = await asyncio.gather(*(_post_chunk(i) for i in range(len(chunks))))
+                for idx, chunk_snaps, ok, retryable in wave1:
+                    if ok:
+                        snapshots.extend(chunk_snaps)
+                    elif self._is_auth_failed():
+                        return [], False
+                    else:
+                        ok_all = False
+                        if retryable:
+                            retry_indices.append(idx)
+
+                if retry_indices and not self._is_auth_failed():
+                    await asyncio.sleep(0.5)
+                    wave2 = await asyncio.gather(*(_post_chunk(i) for i in retry_indices))
+                    retried_ok = True
+                    for _, chunk_snaps, ok, _ in wave2:
+                        if ok:
+                            snapshots.extend(chunk_snaps)
+                        else:
+                            retried_ok = False
+                    # Only clear wave1 failure if every failed chunk was retried and succeeded cleanly
+                    ok_all = retried_ok and (len(retry_indices) == sum(1 for _, _, ok, _ in wave1 if not ok))
+
+                return snapshots, (ok_all and not self._is_auth_failed())
+            finally:
+                if close_ephemeral:
+                    await sess.__aexit__(None, None, None)
+
+        try:
+            return yahoo_client._run_coro_sync(_run)
+        except Exception:
+            return [], False
 
     def fetch_bars(
         self,
@@ -373,7 +650,7 @@ class FivePaisaProvider:
         limiter_key = f"fivepaisa:{secret_fingerprint(self.client_code, self.access_token)}"
 
         try:
-            return yahoo_client._run_coro_sync(
+            results, failed = yahoo_client._run_coro_sync(
                 lambda: fetch_json_urls_async(
                     sym_urls=sym_urls,
                     headers=headers,
@@ -392,6 +669,9 @@ class FivePaisaProvider:
                     should_abort=self._is_auth_failed,
                 )
             )
+            if self._is_auth_failed():
+                failed |= {sym for sym, _ in sym_urls if sym not in results}
+            return results, failed
         except Exception as exc:
             self._set_error(f"5paisa candle fetch error: {exc}")
             return {}, {sym for sym, _ in sym_urls}
@@ -405,26 +685,28 @@ class FivePaisaProvider:
         max_workers: int = 8,
     ) -> Tuple[Optional[Dict[str, TodaySummary]], Dict[str, Any]]:
         """
-        Serve live TodaySummary records cleanly without duplicate 218-call fallback loops:
-        - Live WSS: starts MarketFeedV3, seeds 1m Vol_Burst_15m in background when WS ticks exist,
-          or fetches once and serves directly from seeded state if WS has 0 ticks yet.
-        - Off-hours / weekends: avoids sleep delays and caches empty today checks cleanly.
+        Serve live TodaySummary records matching Upstox's fast path within 5paisa API limits:
+        - Live WSS mode: serves in-memory ticks immediately; uses 50-scrip chunked V1/MarketFeed
+          Batch Quote (~0.25s, 5 POSTs) when WS has 0 summaries yet and backfills 1m Vol_Burst_15m
+          non-blockingly in the background. Falls back cleanly to 1m REST seed if UserKey is absent.
+        - REST mode: uses 50-scrip Batch MarketFeed (~0.25s) instead of 218 per-scrip GETs when UserKey is set.
+        - Off-hours / weekends: avoids duplicate empty bursts via short empty-day cooldown.
         """
-        meta: Dict[str, Any] = {"provider": self.provider_id, "mode": "wss" if self.use_live_ws else "rest"}
+        can_batch_feed = bool(self.user_key and self.client_code)
+        meta: Dict[str, Any] = {
+            "provider": self.provider_id,
+            "mode": "wss" if self.use_live_ws else ("batch_quote" if can_batch_feed else "rest"),
+        }
         if not self.access_token:
             msg = "5paisa access token is missing — login via TOTP/OAuth or paste token."
             self._set_error(msg, auth_failed=True)
             meta["error"] = msg
             return {}, meta
 
-        now_ist = datetime.combine(today, cutoff, tzinfo=IST)
-        market_open_now = is_market_open(now_ist, background_refresh=True)
-        if _MARKET_OPEN_WALL <= cutoff <= _MARKET_CLOSE_WALL:
-            wss_active_now = market_open_now
-        else:
-            wss_active_now = is_wss_active_window(now_ist, background_refresh=True)
+        market_open_now, wss_active_now = _resolve_market_windows(today, cutoff)
         cooldown_key = (secret_fingerprint(self.client_code, self.access_token), today)
 
+        # Pure REST mode: fast 5-call V1/MarketFeed batch quote (~0.25s vs 218 candle GETs) when UserKey is available
         if not self.use_live_ws:
             stop_fivepaisa_stream(self.access_token, self.client_code)
             if not market_open_now:
@@ -432,6 +714,34 @@ class FivePaisaProvider:
                     if pytime.monotonic() < _EMPTY_TODAY_UNTIL.get(cooldown_key, 0.0):
                         meta["mode"] = "closed_cached"
                         return {}, meta
+            if can_batch_feed:
+                if not _allow_batch_quote_today(today, cutoff, market_open_now):
+                    with _SEED_LOCK:
+                        _EMPTY_TODAY_UNTIL[cooldown_key] = pytime.monotonic() + _EMPTY_TODAY_COOLDOWN_SEC
+                    meta["mode"] = "closed_cached"
+                    return {}, meta
+                try:
+                    sym_to_code, code_to_sym = resolve_scrip_codes(symbols, eq_map=self._eq_map_override)
+                except Exception as exc:
+                    msg = f"Failed loading 5paisa ScripMaster: {exc}"
+                    self._set_error(msg)
+                    meta["error"] = msg
+                    meta["mode"] = "rest_fallback"
+                    return None, meta
+                meta["mapped"] = len(sym_to_code)
+                meta["unmapped"] = len(symbols) - len(sym_to_code)
+                snapshots, ok = self._fetch_batch_quotes_sync(sym_to_code, code_to_sym, today)
+                if self._is_auth_failed():
+                    meta["error"] = self.get_last_error()
+                    return {}, meta
+                if snapshots:
+                    return snapshots_to_summaries(snapshots, cutoff), meta
+                if ok and not market_open_now:
+                    with _SEED_LOCK:
+                        _EMPTY_TODAY_UNTIL[cooldown_key] = pytime.monotonic() + _EMPTY_TODAY_COOLDOWN_SEC
+                    meta["mode"] = "closed_cached"
+                    return {}, meta
+            meta["mode"] = "rest_fallback"
             return None, meta
 
         if not self.client_code:
@@ -460,56 +770,76 @@ class FivePaisaProvider:
             return None, meta
 
         bar_interval_sec = 300 if interval == "5m" else 60
-        seeded_bundles: Dict[str, ArrayBundle] = {}
+        summaries = stream.get_today_summaries(symbols, today, cutoff, bar_interval_sec=bar_interval_sec)
+        fetched_today_once = False
 
-        if market_open_now:
-            if stream.get_status().get("ticks", 0) == 0:
-                deadline = pytime.monotonic() + _SEED_STABLE_WAIT_SECONDS
-                while pytime.monotonic() < deadline and stream.get_status().get("ticks", 0) == 0:
-                    if stream.get_status().get("error"):
-                        break
-                    pytime.sleep(0.1)
-
-            if stream.needs_intraday_seed(today):
+        if summaries:
+            if market_open_now and stream.needs_intraday_seed(today):
                 if cutoff < _PRE_SEED_SKIP_CUTOFF:
                     stream.mark_seeded_date(today)
-                elif stream.get_status().get("ticks", 0) > 0:
-                    self._start_background_intraday_seed(stream, list(sym_to_code.keys()), today)
                 else:
-                    seeded_bundles, failed = self.fetch_bars(((sym, "1d") for sym in sym_to_code.keys()), interval="1m")
-                    if self._is_auth_failed():
-                        meta["error"] = self.get_last_error()
-                        return {}, meta
-                    if seeded_bundles:
-                        stream.seed_from_intraday_bundles(today, seeded_bundles)
-                        meta["mode"] = "rest_seed"
-                    elif not failed:
-                        stream.mark_seeded_date(today)
+                    self._start_background_intraday_seed(stream, list(sym_to_code.keys()), today)
         else:
-            # Closed market: avoid 1s WS wait and duplicate empty fallback burst
-            with _SEED_LOCK:
-                in_cooldown = pytime.monotonic() < _EMPTY_TODAY_UNTIL.get(cooldown_key, 0.0)
+            in_cooldown = False
+            if not market_open_now:
+                with _SEED_LOCK:
+                    in_cooldown = pytime.monotonic() < _EMPTY_TODAY_UNTIL.get(cooldown_key, 0.0)
             if in_cooldown:
                 meta.update(stream.get_status())
                 meta["mode"] = "closed_cached"
                 return {}, meta
 
-            if stream.needs_intraday_seed(today):
-                seeded_bundles, failed = self.fetch_bars(((sym, "1d") for sym in sym_to_code.keys()), interval="1m")
+            batch_ok = False
+            if can_batch_feed:
+                if not _allow_batch_quote_today(today, cutoff, market_open_now):
+                    with _SEED_LOCK:
+                        _EMPTY_TODAY_UNTIL[cooldown_key] = pytime.monotonic() + _EMPTY_TODAY_COOLDOWN_SEC
+                    meta.update(stream.get_status())
+                    meta["mode"] = "closed_cached"
+                    return {}, meta
+                snapshots, batch_ok = self._fetch_batch_quotes_sync(sym_to_code, code_to_sym, today)
                 if self._is_auth_failed():
                     meta["error"] = self.get_last_error()
                     return {}, meta
-                if seeded_bundles:
-                    stream.seed_from_intraday_bundles(today, seeded_bundles)
-                    meta["mode"] = "rest_seed"
-                elif not failed:
+                if snapshots:
+                    stream.ingest_quote_snapshots(snapshots)
+                    summaries = stream.get_today_summaries(symbols, today, cutoff, bar_interval_sec=bar_interval_sec)
+                    if stream.needs_intraday_seed(today):
+                        if market_open_now and cutoff < _PRE_SEED_SKIP_CUTOFF:
+                            stream.mark_seeded_date(today)
+                        else:
+                            # Non-blocking background 1m VWAP & Vol_Burst_15m backfill (mirrors Upstox)
+                            self._start_background_intraday_seed(stream, list(sym_to_code.keys()), today)
+                    meta["mode"] = "batch_quote"
+                elif batch_ok and not market_open_now:
                     with _SEED_LOCK:
                         _EMPTY_TODAY_UNTIL[cooldown_key] = pytime.monotonic() + _EMPTY_TODAY_COOLDOWN_SEC
                     meta.update(stream.get_status())
                     meta["mode"] = "closed_cached"
                     return {}, meta
 
-        summaries = stream.get_today_summaries(symbols, today, cutoff, bar_interval_sec=bar_interval_sec)
+            # Fallback to single-pass 1m historical REST seed if Batch Feed is unavailable or rejected
+            if not summaries and not batch_ok and stream.needs_intraday_seed(today):
+                if market_open_now and cutoff < _PRE_SEED_SKIP_CUTOFF:
+                    stream.mark_seeded_date(today)
+                else:
+                    fetched_today_once = True
+                    seeded_bundles, failed, auth_err = self._seed_stream_sync(
+                        stream, sym_to_code.keys(), today, meta
+                    )
+                    if auth_err:
+                        return {}, meta
+                    if not seeded_bundles and not failed:
+                        if market_open_now:
+                            stream.mark_seeded_date(today)
+                        else:
+                            with _SEED_LOCK:
+                                _EMPTY_TODAY_UNTIL[cooldown_key] = pytime.monotonic() + _EMPTY_TODAY_COOLDOWN_SEC
+                            meta.update(stream.get_status())
+                            meta["mode"] = "closed_cached"
+                            return {}, meta
+                    summaries = stream.get_today_summaries(symbols, today, cutoff, bar_interval_sec=bar_interval_sec)
+
         status = stream.get_status()
         meta.update(status)
         if status.get("error"):
@@ -520,8 +850,8 @@ class FivePaisaProvider:
                 meta["mode"] = "post_close_cached"
             return summaries, meta
 
-        # If we already fetched today's bars cleanly and got nothing valid for today, skip duplicate fetch_bars
-        if seeded_bundles or not market_open_now:
+        # If we already fetched today's bars (or market is closed), skip duplicate fetch_bars in scanner
+        if fetched_today_once or not market_open_now:
             return {}, meta
 
         meta["mode"] = "rest_fallback"

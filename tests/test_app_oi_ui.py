@@ -646,6 +646,36 @@ class AppOiUiTest(unittest.TestCase):
             self.assertEqual(mock_filter.call_count, calls_after_scan)
             self.assertEqual(list(at.dataframe[0].value.columns), ["Symbol", "Ratio"])
 
+    def test_fivepaisa_user_key_wired_to_provider_in_app(self):
+        sample_df = _build_sample_df(include_buildup=True)
+        captured = {}
+
+        def _fake_run_scan(*args, **kwargs):
+            captured["provider"] = kwargs.get("provider")
+            return sample_df
+
+        at = AppTest.from_file(os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")), "app.py"), default_timeout=15)
+        at.secrets["fivepaisa"] = {
+            "user_key": "UKEY_SECRET_5P",
+            "encryption_key": "EKEY_5P",
+            "user_id": "UID_5P",
+            "client_code": "50011110",
+        }
+        with (
+            patch.object(universe, "get_fno_universe", return_value=(["RELIANCE.NS"], "Mock")),
+            patch.object(scanner, "run_scan", side_effect=_fake_run_scan),
+        ):
+            at.run()
+            [c for c in at.segmented_control if c.label == "Data Source"][0].set_value("5paisa Xstream").run()
+            [t for t in at.text_input if t.label == "5paisa Access Token (Daily)"][0].set_value("JWT_TOK_5P").run()
+            [b for b in at.button if "Scan Now" in b.label][0].click().run()
+
+        self.assertEqual(list(at.exception), [])
+        prov = captured.get("provider")
+        self.assertIsNotNone(prov)
+        self.assertEqual(prov.user_key, "UKEY_SECRET_5P")
+        self.assertEqual(prov.client_code, "50011110")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

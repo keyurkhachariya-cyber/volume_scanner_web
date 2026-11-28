@@ -10,6 +10,7 @@ from datetime import datetime
 import io
 import json
 import threading
+import time as pytime
 from typing import Dict, Iterable, Optional, Tuple
 
 from core.utils import CACHE_DIR, IST
@@ -25,6 +26,7 @@ FIVEPAISA_SCRIPMASTER_URLS = (
     "https://images.5paisa.com/website/scripmaster-csv-format.csv",
 )
 INSTRUMENTS_CACHE_FILE = CACHE_DIR / "fivepaisa_nse_instruments.json"
+_FALLBACK_COOLDOWN_SEC = 1800.0
 
 # Fallback symbol aliases when static ScripMaster snapshots still carry pre-rename NSE tickers
 _LEGACY_SYMBOL_ALIASES: Dict[str, str] = {
@@ -38,6 +40,7 @@ _LEGACY_SYMBOL_ALIASES: Dict[str, str] = {
 _LOCK = threading.Lock()
 _MEM_CACHE: Optional[Dict[str, str]] = None
 _MEM_CACHE_DATE: Optional[str] = None
+_FALLBACK_RETRY_AT: float = 0.0
 
 
 def _parse_scripmaster_csv(csv_text: str) -> Dict[str, str]:
@@ -75,12 +78,12 @@ def _parse_scripmaster_csv(csv_text: str) -> Dict[str, str]:
     return eq_map
 
 
-def fetch_fivepaisa_nse_eq_map(timeout: int = 30) -> Dict[str, str]:
-    """Download 5paisa ScripMaster CSV from live API route or official fallback snapshot."""
+def _fetch_scripmaster_with_source(timeout: int = 30) -> Tuple[Dict[str, str], str]:
+    """Download 5paisa ScripMaster CSV and tag whether it came from live API or static fallback."""
     import requests
 
     last_exc: Optional[Exception] = None
-    for url in FIVEPAISA_SCRIPMASTER_URLS:
+    for idx, url in enumerate(FIVEPAISA_SCRIPMASTER_URLS):
         try:
             resp = requests.get(url, timeout=timeout)
             resp.raise_for_status()
@@ -90,32 +93,40 @@ def fetch_fivepaisa_nse_eq_map(timeout: int = 30) -> Dict[str, str]:
             eq_map = _parse_scripmaster_csv(text)
             if not eq_map:
                 raise ValueError(f"No NSE cash equity scrips parsed from {url}")
-            return eq_map
+            source = "fallback" if idx == len(FIVEPAISA_SCRIPMASTER_URLS) - 1 else "live"
+            return eq_map, source
         except Exception as exc:
             last_exc = exc
             continue
     raise ValueError(f"All 5paisa ScripMaster URLs failed ({last_exc})")
 
 
-def _load_disk_map() -> Optional[Tuple[str, Dict[str, str]]]:
+def fetch_fivepaisa_nse_eq_map(timeout: int = 30) -> Dict[str, str]:
+    """Download 5paisa ScripMaster CSV from live API route or official fallback snapshot."""
+    eq_map, _ = _fetch_scripmaster_with_source(timeout=timeout)
+    return eq_map
+
+
+def _load_disk_map() -> Optional[Tuple[str, Dict[str, str], str]]:
     if not INSTRUMENTS_CACHE_FILE.exists():
         return None
     try:
         raw = INSTRUMENTS_CACHE_FILE.read_bytes()
         payload = _orjson.loads(raw) if _orjson is not None else json.loads(raw.decode("utf-8"))
         cached_date = str(payload.get("date") or "")
+        source = str(payload.get("source") or "")
         mapping = payload.get("eq_by_symbol")
         if isinstance(mapping, dict) and mapping:
-            return cached_date, {str(k): str(v) for k, v in mapping.items()}
+            return cached_date, {str(k): str(v) for k, v in mapping.items()}, source
     except Exception:
         pass
     return None
 
 
-def _save_disk_map(date_str: str, mapping: Dict[str, str]) -> None:
+def _save_disk_map(date_str: str, mapping: Dict[str, str], source: str = "live") -> None:
     try:
         INSTRUMENTS_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"date": date_str, "eq_by_symbol": mapping}
+        payload = {"date": date_str, "source": source, "eq_by_symbol": mapping}
         if _orjson is not None:
             INSTRUMENTS_CACHE_FILE.write_bytes(_orjson.dumps(payload))
         else:
@@ -126,25 +137,30 @@ def _save_disk_map(date_str: str, mapping: Dict[str, str]) -> None:
 
 def get_fivepaisa_nse_eq_map(force_refresh: bool = False) -> Dict[str, str]:
     """Return cached or freshly downloaded {SYMBOL: scrip_code} map for today (IST)."""
-    global _MEM_CACHE, _MEM_CACHE_DATE
+    global _MEM_CACHE, _MEM_CACHE_DATE, _FALLBACK_RETRY_AT
     today_str = datetime.now(IST).date().isoformat()
+    now_mono = pytime.monotonic()
 
     with _LOCK:
         if not force_refresh and _MEM_CACHE is not None and _MEM_CACHE_DATE == today_str:
             return dict(_MEM_CACHE)
+        retry_at = _FALLBACK_RETRY_AT
 
     if not force_refresh:
         disk = _load_disk_map()
         if disk is not None and disk[0] == today_str:
-            with _LOCK:
-                _MEM_CACHE_DATE, _MEM_CACHE = disk[0], disk[1]
-            return dict(disk[1])
+            disk_source = disk[2]
+            if disk_source == "live" or (disk_source == "fallback" and now_mono < retry_at):
+                with _LOCK:
+                    _MEM_CACHE_DATE, _MEM_CACHE = disk[0], disk[1]
+                return dict(disk[1])
 
     try:
-        fresh = fetch_fivepaisa_nse_eq_map()
-        _save_disk_map(today_str, fresh)
+        fresh, source = _fetch_scripmaster_with_source()
+        _save_disk_map(today_str, fresh, source=source)
         with _LOCK:
             _MEM_CACHE_DATE, _MEM_CACHE = today_str, fresh
+            _FALLBACK_RETRY_AT = (pytime.monotonic() + _FALLBACK_COOLDOWN_SEC) if source == "fallback" else 0.0
         return dict(fresh)
     except Exception:
         disk = _load_disk_map()
