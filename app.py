@@ -801,9 +801,14 @@ def render_scanner(
             prov_id = prov_meta.get("provider") if isinstance(prov_meta, dict) else None
             if prov_id in prov_labels:
                 p_name = prov_labels[prov_id]
-                if prov_meta.get("mode") == "wss":
+                mode = prov_meta.get("mode")
+                if mode == "wss":
                     ws_badge = "🟢 WSS" if prov_meta.get("ws_connected") else "🟡 WSS"
                     prov_note = f" | {p_name} {ws_badge} ({prov_meta.get('ticks', 0)} ticks)"
+                elif mode == "batch_quote":
+                    prov_note = f" | {p_name} ⚡ Batch Quote"
+                elif mode == "rest_seed":
+                    prov_note = f" | {p_name} Seeded REST"
                 else:
                     prov_note = f" | {p_name} REST"
             if sig_choice in (SIGNAL_BULLISH, SIGNAL_BEARISH):

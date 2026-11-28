@@ -1,3 +1,4 @@
+import asyncio
 import gzip
 import json
 import os
@@ -14,6 +15,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 import baseline_cache as bc
 import holidays as h
+import providers.http_runtime as hr_mod
 import providers.upstox_instruments as ui_mod
 import providers.upstox_provider as up_mod
 import providers.upstox_stream as us_mod
@@ -25,9 +27,15 @@ class UpstoxProviderTest(unittest.TestCase):
         with ui_mod._LOCK:
             ui_mod._MEM_CACHE = None
             ui_mod._MEM_CACHE_DATE = None
+        with up_mod._SEED_LOCK:
+            up_mod._INFLIGHT_SEEDS.clear()
+            up_mod._EMPTY_TODAY_UNTIL.clear()
         us_mod.stop_upstox_stream()
 
     def tearDown(self):
+        with up_mod._SEED_LOCK:
+            up_mod._INFLIGHT_SEEDS.clear()
+            up_mod._EMPTY_TODAY_UNTIL.clear()
         us_mod.stop_upstox_stream()
 
     def test_instrument_parser_prefers_eq_over_debt_series(self):
@@ -236,6 +244,120 @@ class UpstoxProviderTest(unittest.TestCase):
         self.assertEqual(df.iloc[0]["Ratio"], 2.5)
         self.assertEqual(df.attrs["provider_meta"]["mode"], "wss")
         self.assertTrue(df.attrs["provider_meta"]["ws_connected"])
+
+    def test_batch_quotes_parser_and_rest_mode_plus_closed_cooldown(self):
+        today = date(2026, 11, 27)
+        live_ms = int(h.IST.localize(datetime(2026, 11, 27, 10, 15, 0)).timestamp() * 1000)
+        stale_ms = int(h.IST.localize(datetime(2026, 11, 26, 15, 29, 0)).timestamp() * 1000)
+        key_to_sym = {"NSE_EQ|1": "RELIANCE.NS", "NSE_EQ|2": "TCS.NS"}
+
+        payload = {
+            "status": "success",
+            "data": {
+                "NSE_EQ:RELIANCE": {
+                    "instrument_token": "NSE_EQ|1",
+                    "symbol": "RELIANCE",
+                    "last_price": 1525.5,
+                    "volume": 90000,
+                    "average_price": 1518.2,
+                    "ohlc": {"open": 1500.0, "high": 1530.0, "low": 1495.0, "close": 1525.5},
+                    "timestamp": "2026-11-27T10:15:02+05:30",
+                    "last_trade_time": str(live_ms),
+                },
+                # Even though server timestamp is today morning, last_trade_time is yesterday -> reject
+                "NSE_EQ:TCS": {
+                    "instrument_token": "NSE_EQ|2",
+                    "symbol": "TCS",
+                    "last_price": 4000.0,
+                    "volume": 50000,
+                    "average_price": 3995.0,
+                    "ohlc": {"open": 3990.0, "high": 4010.0, "low": 3980.0, "close": 4000.0},
+                    "timestamp": "2026-11-27T09:05:00+05:30",
+                    "last_trade_time": str(stale_ms),
+                },
+            },
+        }
+        snaps = up_mod._parse_upstox_batch_quotes(payload, key_to_sym, today)
+        self.assertEqual(len(snaps), 1)
+        self.assertEqual(snaps[0]["sym"], "RELIANCE.NS")
+        self.assertAlmostEqual(snaps[0]["atp"], 1518.2)
+
+        prov = up_mod.UpstoxProvider("tok_fast", use_live_ws=False, eq_map={"RELIANCE": "NSE_EQ|1", "TCS": "NSE_EQ|2"})
+        with (
+            patch.object(up_mod, "is_market_open", return_value=True),
+            patch.object(prov, "_fetch_batch_quotes_sync", return_value=(snaps, True)) as mock_bq,
+        ):
+            summaries, meta = prov.fetch_today_summaries(["RELIANCE.NS", "TCS.NS"], today, time(10, 20), "1m")
+        self.assertEqual(mock_bq.call_count, 1)
+        self.assertEqual(meta["mode"], "batch_quote")
+        self.assertIn("RELIANCE.NS", summaries)
+        self.assertEqual(summaries["RELIANCE.NS"][0], 90000.0)
+        self.assertAlmostEqual(summaries["RELIANCE.NS"][6], 1518.2)
+
+        # Closed market + empty batch quotes -> enters 30s cooldown so second click makes 0 network calls
+        prov_closed = up_mod.UpstoxProvider("tok_closed", use_live_ws=False, eq_map={"RELIANCE": "NSE_EQ|1"})
+        with (
+            patch.object(up_mod, "is_market_open", return_value=False),
+            patch.object(prov_closed, "_fetch_batch_quotes_sync", return_value=([], True)) as mock_closed_bq,
+        ):
+            s1, m1 = prov_closed.fetch_today_summaries(["RELIANCE.NS"], today, time(10, 20), "1m")
+            s2, m2 = prov_closed.fetch_today_summaries(["RELIANCE.NS"], today, time(10, 21), "1m")
+        self.assertEqual(mock_closed_bq.call_count, 1)
+        self.assertEqual(s1, {})
+        self.assertEqual(s2, {})
+        self.assertEqual(m1["mode"], "closed_cached")
+        self.assertEqual(m2["mode"], "closed_cached")
+
+    def test_sliding_rate_limiter_and_shared_fetch_urls_retry(self):
+        limiter = hr_mod.AsyncSlidingRateLimiter(max_per_sec=10, max_per_min=100)
+        asyncio.run(limiter.acquire())
+
+        calls = {"n": 0}
+
+        class _FakeResp:
+            def __init__(self, code, payload):
+                self.status_code = code
+                self._payload = payload
+                self.content = json.dumps(payload).encode("utf-8")
+
+            def json(self):
+                return self._payload
+
+        class _FakeSess:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def get(self, url, headers=None, timeout=10):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    return _FakeResp(429, {})
+                return _FakeResp(
+                    200,
+                    {"status": "success", "data": {"candles": [["2026-11-27T09:15:00+05:30", 10, 11, 9, 10.5, 500, 0]]}},
+                )
+
+        rl_hits = []
+        with patch("curl_cffi.requests.AsyncSession", return_value=_FakeSess()):
+            out, failed = asyncio.run(
+                hr_mod.fetch_json_urls_async(
+                    sym_urls=[("RELIANCE.NS", "https://api.upstox.com/test")],
+                    headers={"Authorization": "Bearer x"},
+                    parser_fn=up_mod._parse_upstox_candles,
+                    max_concurrency=4,
+                    max_per_sec=20,
+                    max_per_min=100,
+                    limiter_key="test_k",
+                    on_auth_error=lambda: None,
+                    on_rate_limit=lambda: rl_hits.append(1),
+                    should_abort=lambda: False,
+                )
+            )
+        self.assertEqual(len(rl_hits), 1)
+        self.assertEqual(failed, set())
+        self.assertIn("RELIANCE.NS", out)
 
 
 if __name__ == "__main__":

@@ -31,9 +31,15 @@ class FivePaisaProviderTest(unittest.TestCase):
         with fi_mod._LOCK:
             fi_mod._MEM_CACHE = None
             fi_mod._MEM_CACHE_DATE = None
+        with fp_mod._SEED_LOCK:
+            fp_mod._INFLIGHT_SEEDS.clear()
+            fp_mod._EMPTY_TODAY_UNTIL.clear()
         fs_mod.stop_fivepaisa_stream()
 
     def tearDown(self):
+        with fp_mod._SEED_LOCK:
+            fp_mod._INFLIGHT_SEEDS.clear()
+            fp_mod._EMPTY_TODAY_UNTIL.clear()
         fs_mod.stop_fivepaisa_stream()
 
     def test_scripmaster_csv_parser_prefers_eq_and_legacy_aliases(self):
@@ -281,6 +287,26 @@ class FivePaisaProviderTest(unittest.TestCase):
         self.assertEqual(df.attrs["provider_meta"]["provider"], "fivepaisa")
         self.assertEqual(df.attrs["provider_meta"]["mode"], "wss")
         self.assertTrue(df.attrs["provider_meta"]["ws_connected"])
+
+    def test_closed_market_empty_intraday_caches_cooldown_without_duplicate_fallback(self):
+        today = date(2026, 11, 28)
+        tok = _make_fake_jwt({"ClientCode": "50011110", "RedirectServer": "C"})
+        prov = fp_mod.FivePaisaProvider(tok, use_live_ws=True, eq_map={"RELIANCE": "2885"})
+        fake_stream = fs_mod.FivePaisaMarketStream(tok, "50011110", {"2885": "RELIANCE.NS"})
+
+        with (
+            patch.object(fp_mod, "is_market_open", return_value=False),
+            patch.object(fp_mod, "get_or_start_fivepaisa_stream", return_value=fake_stream),
+            patch.object(prov, "fetch_bars", return_value=({}, set())) as mock_bars,
+        ):
+            s1, m1 = prov.fetch_today_summaries(["RELIANCE.NS"], today, time(10, 30), "1m")
+            s2, m2 = prov.fetch_today_summaries(["RELIANCE.NS"], today, time(10, 31), "1m")
+
+        self.assertEqual(mock_bars.call_count, 1)
+        self.assertEqual(s1, {})
+        self.assertEqual(s2, {})
+        self.assertEqual(m1["mode"], "closed_cached")
+        self.assertEqual(m2["mode"], "closed_cached")
 
 
 if __name__ == "__main__":

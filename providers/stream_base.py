@@ -162,6 +162,33 @@ class BaseMarketStream:
         with self._state_lock:
             return self._seeded_date != today
 
+    def mark_seeded_date(self, today: date) -> None:
+        """Mark intraday 1-minute seeding complete/unneeded for today under lock."""
+        with self._state_lock:
+            self._seeded_date = today
+
+    def ingest_quote_snapshots(self, snapshots: Iterable[Dict[str, Any]]) -> int:
+        """Merge REST batch quote snapshots into symbol state without altering WebSocket tick counts."""
+        applied = 0
+        with self._state_lock:
+            for snap in snapshots:
+                sym = snap.get("sym")
+                if not sym:
+                    continue
+                self._apply_quote_tick_locked(
+                    sym=sym,
+                    feed_date=snap.get("feed_date"),
+                    tick_sec=snap.get("tick_sec"),
+                    ltp=snap.get("ltp"),
+                    day_open=snap.get("day_open"),
+                    day_high=snap.get("day_high"),
+                    day_low=snap.get("day_low"),
+                    atp=snap.get("atp"),
+                    vtt=snap.get("vtt"),
+                )
+                applied += 1
+        return applied
+
     def seed_from_intraday_bundles(self, today: date, bundles: Dict[str, ArrayBundle]) -> None:
         """Seed today's 1-minute volume buckets, open/high/low, and running VWAP from REST intraday bars."""
         day_start_sec = ist_epoch_sec(today, time(0, 0))

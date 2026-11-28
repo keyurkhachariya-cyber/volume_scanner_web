@@ -1,13 +1,14 @@
 """
 Upstox API v3 MarketDataProvider:
-- Historical & intraday v3 candles over rate-limited HTTP/2 async sessions (with requests fallback).
-- Live WebSocket streaming (UpstoxMarketStream) with zero-REST intraday scanning once seeded.
+- Historical & intraday v3 candles over a shared persistent HTTP/2 AsyncSession + sliding rate limiter.
+- Fast 1-call Batch Full Market Quotes (/v2/market-quote/quotes, up to 500 keys per GET) for instant
+  REST snapshots and immediate pre-tick WSS hydration.
+- Live WebSocket streaming (UpstoxMarketStream) with non-blocking background 1m Vol_Burst_15m seeding.
 - OAuth dialog URL + auth_code -> access_token exchange helper.
 """
 
 from __future__ import annotations
 
-import asyncio
 from datetime import date, datetime, time
 import threading
 import time as pytime
@@ -16,19 +17,30 @@ from urllib.parse import quote as _url_quote, urlencode
 
 import numpy as np
 
+from holidays import is_market_open
 from providers.base import ArrayBundle, TodaySummary
+from providers.http_runtime import fetch_json_urls_async
+from providers.stream_base import secret_fingerprint, to_float
 from providers.upstox_instruments import resolve_instrument_keys
 from providers.upstox_stream import (
     get_or_start_upstox_stream,
     stop_upstox_stream,
 )
-from utils import decode_json_response
+from utils import IST, decode_json_response, localize_ist, time_to_sec
 import yahoo_client
 
 _UPSTOX_API_BASE = "https://api.upstox.com"
-_UPSTOX_MAX_CONCURRENCY = 12
-_UPSTOX_REQUEST_INTERVAL = 0.032  # ~31 req/s max average, comfortably under 50 req/s & 500 req/min
-_SEED_STABLE_WAIT_SECONDS = 1.5
+_UPSTOX_MAX_CONCURRENCY = 24
+_UPSTOX_MAX_PER_SEC = 42   # Upstox v3 limit: 50 req/sec
+_UPSTOX_MAX_PER_MIN = 460  # Upstox v3 limit: 500 req/min
+_UPSTOX_BATCH_QUOTE_MAX = 500
+_MARKET_OPEN_WALL = time(9, 15)
+_PRE_SEED_SKIP_CUTOFF = time(9, 20)
+_EMPTY_TODAY_COOLDOWN_SEC = 30.0
+
+_SEED_LOCK = threading.Lock()
+_INFLIGHT_SEEDS: Set[Tuple[str, date]] = set()
+_EMPTY_TODAY_UNTIL: Dict[Tuple[str, date], float] = {}
 
 
 def build_upstox_login_url(client_id: str, redirect_uri: str) -> str:
@@ -109,7 +121,10 @@ def _parse_upstox_candles(payload: Any) -> Tuple[Optional[ArrayBundle], bool]:
         if raw_ts is None:
             continue
         try:
-            ts_sec = int(datetime.fromisoformat(str(raw_ts)).timestamp())
+            dt = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = localize_ist(dt)
+            ts_sec = int(dt.timestamp())
             o = float("nan") if c[1] is None else float(c[1])
             h = float("nan") if c[2] is None else float(c[2])
             l = float("nan") if c[3] is None else float(c[3])
@@ -122,7 +137,6 @@ def _parse_upstox_candles(payload: Any) -> Tuple[Optional[ArrayBundle], bool]:
     if not rows:
         return None, True
 
-    # Upstox returns descending newest-first candles; normalize chronologically once
     if len(rows) > 1 and rows[0][0] > rows[-1][0]:
         rows.reverse()
     if len(rows) > 1 and any(rows[i][0] > rows[i + 1][0] for i in range(len(rows) - 1)):
@@ -138,8 +152,123 @@ def _parse_upstox_candles(payload: Any) -> Tuple[Optional[ArrayBundle], bool]:
     }, True
 
 
+def _parse_quote_ts_sec(raw_ts: Any) -> Optional[int]:
+    if raw_ts is None or raw_ts == "":
+        return None
+    num = to_float(raw_ts)
+    if num is not None and num > 1e8:
+        return int(num // 1000) if num > 1e11 else int(num)
+    try:
+        dt = datetime.fromisoformat(str(raw_ts).strip().replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = localize_ist(dt)
+        return int(dt.timestamp())
+    except ValueError:
+        return None
+
+
+def _parse_upstox_batch_quotes(
+    payload: Any,
+    key_to_sym: Dict[str, str],
+    today: date,
+) -> List[Dict[str, Any]]:
+    """
+    Parse GET /v2/market-quote/quotes payload into normalized quote snapshots for `today`,
+    preferring last_trade_time over query timestamp so stale prior-day trades never leak into today.
+    """
+    if not isinstance(payload, dict) or payload.get("status") != "success":
+        return []
+    data = payload.get("data")
+    if not isinstance(data, dict) or not data:
+        return []
+
+    sym_by_base = {
+        sym.removesuffix(".NS").removesuffix(".BO").strip().upper(): sym
+        for sym in key_to_sym.values()
+    }
+    snapshots: List[Dict[str, Any]] = []
+
+    for entry_key, entry in data.items():
+        if not isinstance(entry, dict):
+            continue
+        ikey = str(entry.get("instrument_token") or "").strip()
+        sym = key_to_sym.get(ikey) if ikey else None
+        if sym is None:
+            tsym = str(entry.get("symbol") or "").strip().upper()
+            if not tsym and ":" in str(entry_key):
+                tsym = str(entry_key).split(":", 1)[1].strip().upper()
+            sym = sym_by_base.get(tsym)
+        if sym is None:
+            continue
+
+        # Prefer actual exchange last_trade_time over wrapper server timestamp
+        tick_sec = _parse_quote_ts_sec(entry.get("last_trade_time"))
+        if tick_sec is None:
+            tick_sec = _parse_quote_ts_sec(entry.get("timestamp"))
+        if tick_sec is None:
+            continue
+
+        tick_dt = datetime.fromtimestamp(tick_sec, IST)
+        if tick_dt.date() != today or tick_dt.time() < _MARKET_OPEN_WALL:
+            continue
+
+        vtt = to_float(entry.get("volume"))
+        if vtt is None or vtt <= 0.0:
+            continue
+
+        ltp = to_float(entry.get("last_price"))
+        atp = to_float(entry.get("average_price"))
+        ohlc = entry.get("ohlc") if isinstance(entry.get("ohlc"), dict) else {}
+        day_open = to_float(ohlc.get("open")) or ltp
+        day_high = to_float(ohlc.get("high")) or ltp
+        day_low = to_float(ohlc.get("low")) or ltp
+
+        snapshots.append(
+            {
+                "sym": sym,
+                "feed_date": today,
+                "tick_sec": tick_sec,
+                "ltp": ltp,
+                "day_open": day_open,
+                "day_high": day_high,
+                "day_low": day_low,
+                "atp": atp,
+                "vtt": vtt,
+            }
+        )
+
+    return snapshots
+
+
+def _snapshots_to_summaries(
+    snapshots: List[Dict[str, Any]], cutoff: time
+) -> Dict[str, TodaySummary]:
+    """Convert normalized quote snapshots into TodaySummary 8-tuples bounded by cutoff."""
+    out: Dict[str, TodaySummary] = {}
+    cutoff_sec = time_to_sec(cutoff)
+    for snap in snapshots:
+        sym = snap.get("sym")
+        vtt = snap.get("vtt")
+        tick_sec = snap.get("tick_sec")
+        if not sym or vtt is None or vtt <= 0.0 or tick_sec is None:
+            continue
+        t_ist = datetime.fromtimestamp(tick_sec, IST).time()
+        last_bar_time = t_ist if time_to_sec(t_ist) <= cutoff_sec else cutoff
+        out[sym] = (
+            float(vtt),
+            snap.get("ltp"),
+            snap.get("day_open"),
+            snap.get("day_high"),
+            snap.get("day_low"),
+            last_bar_time,
+            snap.get("atp"),
+            None,
+        )
+    return out
+
+
 class UpstoxProvider:
-    """Upstox v3 Historical/Intraday REST + live MarketDataStreamerV3 provider."""
+    """Upstox v3 Historical/Intraday REST + 1-call Batch Quote + live MarketDataStreamerV3 provider."""
 
     provider_id: str = "upstox"
     display_name: str = "Upstox API v3"
@@ -169,6 +298,10 @@ class UpstoxProvider:
             if auth_failed:
                 self._auth_failed = True
 
+    def _is_auth_failed(self) -> bool:
+        with self._lock:
+            return self._auth_failed
+
     def _build_candle_url(
         self,
         instrument_key: str,
@@ -179,7 +312,6 @@ class UpstoxProvider:
         iv_num = "5" if interval == "5m" else "1"
         enc_key = _url_quote(instrument_key, safe="")
         if from_date and to_date:
-            # Upstox to_date is inclusive: clamp end if range used exclusive tomorrow date
             to_dt = date.fromisoformat(to_date)
             from_dt = date.fromisoformat(from_date)
             if (to_dt - from_dt).days == 1:
@@ -189,40 +321,36 @@ class UpstoxProvider:
             return f"{_UPSTOX_API_BASE}/v3/historical-candle/{enc_key}/minutes/{iv_num}/{to_str}/{from_str}"
         return f"{_UPSTOX_API_BASE}/v3/historical-candle/intraday/{enc_key}/minutes/{iv_num}"
 
-    async def _fetch_candles_async(
+    def _fetch_batch_quotes_sync(
         self,
-        sym_tasks: List[Tuple[str, str, Optional[str], Optional[str]]],
-        interval: str,
+        sym_to_key: Dict[str, str],
+        key_to_sym: Dict[str, str],
+        today: date,
         timeout: int = 10,
-    ) -> Tuple[Dict[str, ArrayBundle], Set[str]]:
-        from curl_cffi.requests import AsyncSession
+    ) -> Tuple[List[Dict[str, Any]], bool]:
+        """Fetch /v2/market-quote/quotes in 500-key batches (1 single HTTP GET for <=500 F&O stocks)."""
+        keys = list(sym_to_key.values())
+        if not keys:
+            return [], True
+
+        from providers.http_runtime import _acquire_session
 
         headers = {
             "Accept": "application/json",
             "Authorization": f"Bearer {self.access_token}",
         }
-        sem = asyncio.Semaphore(_UPSTOX_MAX_CONCURRENCY)
-        pace_lock = asyncio.Lock()
-        last_req_mono = [0.0]
+        chunks = [
+            ",".join(keys[i : i + _UPSTOX_BATCH_QUOTE_MAX])
+            for i in range(0, len(keys), _UPSTOX_BATCH_QUOTE_MAX)
+        ]
 
-        async def _pace() -> None:
-            async with pace_lock:
-                now_m = pytime.monotonic()
-                wait_s = (last_req_mono[0] + _UPSTOX_REQUEST_INTERVAL) - now_m
-                if wait_s > 0:
-                    await asyncio.sleep(wait_s)
-                last_req_mono[0] = pytime.monotonic()
-
-        async def _fetch_one(
-            sess: Any, sym: str, ikey: str, s_str: Optional[str], e_str: Optional[str]
-        ) -> Tuple[str, Optional[ArrayBundle], bool, Optional[int]]:
-            url = self._build_candle_url(ikey, interval, s_str, e_str)
-            async with sem:
-                with self._lock:
-                    if self._auth_failed:
-                        return sym, None, True, 401
-                await _pace()
-                try:
+        async def _run() -> Tuple[List[Dict[str, Any]], bool]:
+            sess, close_ephemeral = await _acquire_session()
+            snapshots: List[Dict[str, Any]] = []
+            ok_all = True
+            try:
+                for chunk_keys in chunks:
+                    url = f"{_UPSTOX_API_BASE}/v2/market-quote/quotes?instrument_key={_url_quote(chunk_keys, safe=',|')}"
                     resp = await sess.get(url, headers=headers, timeout=timeout)
                     code = int(resp.status_code)
                     if code in (401, 403):
@@ -230,44 +358,52 @@ class UpstoxProvider:
                             "Upstox access token expired or invalid (HTTP 401/403). Generate a fresh daily token.",
                             auth_failed=True,
                         )
-                        return sym, None, True, code
+                        return [], False
                     if code == 429:
                         self._set_error("Upstox API rate limit hit (HTTP 429); retrying briefly.")
-                        return sym, None, False, 429
+                        ok_all = False
+                        continue
                     if code != 200:
-                        return sym, None, False, code
-                    bundle, ok = _parse_upstox_candles(decode_json_response(resp))
-                    return sym, bundle, ok, 200
-                except Exception:
-                    return sym, None, False, None
+                        ok_all = False
+                        continue
+                    snapshots.extend(_parse_upstox_batch_quotes(decode_json_response(resp), key_to_sym, today))
+                return snapshots, ok_all
+            finally:
+                if close_ephemeral:
+                    await sess.__aexit__(None, None, None)
 
-        results: Dict[str, ArrayBundle] = {}
-        failed: Set[str] = set()
-        task_map = {sym: (ikey, s_str, e_str) for sym, ikey, s_str, e_str in sym_tasks}
+        try:
+            return yahoo_client._run_coro_sync(_run)
+        except Exception:
+            return [], False
 
-        async with AsyncSession(impersonate="chrome") as sess:
-            wave1 = await asyncio.gather(
-                *(_fetch_one(sess, sym, ikey, s_str, e_str) for sym, ikey, s_str, e_str in sym_tasks)
-            )
-            for sym, bundle, ok, code in wave1:
-                if bundle is not None:
-                    results[sym] = bundle
-                elif not ok:
-                    failed.add(sym)
+    def _start_background_intraday_seed(
+        self,
+        stream: Any,
+        symbols: List[str],
+        today: date,
+    ) -> None:
+        """Backfill 1-minute rolling volume buckets once in background without blocking initial scan render."""
+        seed_key = (secret_fingerprint(self.access_token), today)
+        with _SEED_LOCK:
+            if seed_key in _INFLIGHT_SEEDS or not stream.needs_intraday_seed(today):
+                return
+            _INFLIGHT_SEEDS.add(seed_key)
 
-            if failed and not self._auth_failed:
-                await asyncio.sleep(1.0)
-                wave2 = await asyncio.gather(
-                    *(_fetch_one(sess, sym, *task_map[sym]) for sym in sorted(failed))
-                )
-                for sym, bundle, ok, _ in wave2:
-                    if bundle is not None:
-                        results[sym] = bundle
-                        failed.discard(sym)
-                    elif ok:
-                        failed.discard(sym)
+        def _worker() -> None:
+            try:
+                seed_bundles, failed = self.fetch_bars(((sym, "1d") for sym in symbols), interval="1m")
+                if seed_bundles:
+                    stream.seed_from_intraday_bundles(today, seed_bundles)
+                elif not failed and not self._is_auth_failed():
+                    stream.mark_seeded_date(today)
+            except Exception:
+                pass
+            finally:
+                with _SEED_LOCK:
+                    _INFLIGHT_SEEDS.discard(seed_key)
 
-        return results, failed
+        threading.Thread(target=_worker, name="upstox_1m_seed", daemon=True).start()
 
     def fetch_bars(
         self,
@@ -279,7 +415,7 @@ class UpstoxProvider:
         chunk_size: Optional[int] = None,
         symbol_ranges: Optional[Dict[str, Tuple[Optional[str], Optional[str]]]] = None,
     ) -> Tuple[Dict[str, ArrayBundle], Set[str]]:
-        """Fetch historical or intraday v3 candles from Upstox for resolved NSE_EQ symbols."""
+        """Fetch historical or intraday v3 candles concurrently over persistent HTTP/2 AsyncSession."""
         tasks = list(symbol_periods)
         if not tasks:
             return {}, set()
@@ -293,22 +429,46 @@ class UpstoxProvider:
             self._set_error(f"Failed loading Upstox NSE instruments: {exc}")
             return {}, {sym for sym, _ in tasks}
 
-        sym_tasks: List[Tuple[str, str, Optional[str], Optional[str]]] = []
+        sym_urls: List[Tuple[str, str]] = []
         for sym, _ in tasks:
             ikey = sym_to_key.get(sym)
             if not ikey:
                 continue
             s_str, e_str = symbol_ranges.get(sym, (start, end)) if symbol_ranges else (start, end)
-            sym_tasks.append((sym, ikey, s_str, e_str))
+            sym_urls.append((sym, self._build_candle_url(ikey, interval, s_str, e_str)))
 
-        if not sym_tasks:
+        if not sym_urls:
             return {}, set()
 
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {self.access_token}",
+        }
+        limiter_key = f"upstox:{secret_fingerprint(self.access_token)}"
+
         try:
-            return yahoo_client._run_coro_sync(lambda: self._fetch_candles_async(sym_tasks, interval=interval))
+            return yahoo_client._run_coro_sync(
+                lambda: fetch_json_urls_async(
+                    sym_urls=sym_urls,
+                    headers=headers,
+                    parser_fn=_parse_upstox_candles,
+                    max_concurrency=_UPSTOX_MAX_CONCURRENCY,
+                    max_per_sec=_UPSTOX_MAX_PER_SEC,
+                    max_per_min=_UPSTOX_MAX_PER_MIN,
+                    limiter_key=limiter_key,
+                    on_auth_error=lambda: self._set_error(
+                        "Upstox access token expired or invalid (HTTP 401/403). Generate a fresh daily token.",
+                        auth_failed=True,
+                    ),
+                    on_rate_limit=lambda: self._set_error(
+                        "Upstox API rate limit hit (HTTP 429); retrying briefly."
+                    ),
+                    should_abort=self._is_auth_failed,
+                )
+            )
         except Exception as exc:
             self._set_error(f"Upstox candle fetch error: {exc}")
-            return {}, {sym for sym, _, _, _ in sym_tasks}
+            return {}, {sym for sym, _ in sym_urls}
 
     def fetch_today_summaries(
         self,
@@ -319,21 +479,18 @@ class UpstoxProvider:
         max_workers: int = 8,
     ) -> Tuple[Optional[Dict[str, TodaySummary]], Dict[str, Any]]:
         """
-        When Live WSS is enabled:
-        1. Ensure singleton MarketDataStreamerV3 is connected for all mapped F&O instruments.
-        2. Seed 1m rolling volume buckets once per day from /v3/historical-candle/intraday.
-        3. Serve real-time in-memory TodaySummary snapshots cleanly; fall back to REST if WS has 0 ticks yet.
+        Serve live TodaySummary records cleanly without redundant 218-call REST loops:
+        - Live WSS mode: serves in-memory ticks immediately; uses 1-call Batch Quote (~0.2s) if
+          WS has 0 ticks yet, and seeds 1m Vol_Burst_15m history non-blockingly in the background.
+        - REST mode: uses 1-call Batch Quote (/v2/market-quote/quotes) instead of 218 intraday calls.
+        - Off-hours / weekends: avoids duplicate empty intraday bursts via short empty-day cooldown.
         """
-        meta: Dict[str, Any] = {"provider": self.provider_id, "mode": "wss" if self.use_live_ws else "rest"}
+        meta: Dict[str, Any] = {"provider": self.provider_id, "mode": "wss" if self.use_live_ws else "batch_quote"}
         if not self.access_token:
             msg = "Upstox access token is missing — paste today's token in the sidebar."
             self._set_error(msg, auth_failed=True)
             meta["error"] = msg
             return {}, meta
-
-        if not self.use_live_ws:
-            stop_upstox_stream(self.access_token)
-            return None, meta
 
         try:
             sym_to_key, key_to_sym = resolve_instrument_keys(symbols, eq_map=self._eq_map_override)
@@ -346,29 +503,76 @@ class UpstoxProvider:
         meta["mapped"] = len(sym_to_key)
         meta["unmapped"] = len(symbols) - len(sym_to_key)
 
+        tok_fp = secret_fingerprint(self.access_token)
+        now_ist = datetime.combine(today, cutoff, tzinfo=IST)
+        market_open_now = is_market_open(now_ist, background_refresh=True)
+
+        # Pure REST mode: single 500-key Batch Quote request (~0.2s vs 218 candle GETs)
+        if not self.use_live_ws:
+            stop_upstox_stream(self.access_token)
+            cooldown_key = (tok_fp, today)
+            with _SEED_LOCK:
+                if pytime.monotonic() < _EMPTY_TODAY_UNTIL.get(cooldown_key, 0.0):
+                    meta["mode"] = "closed_cached"
+                    return {}, meta
+            snapshots, ok = self._fetch_batch_quotes_sync(sym_to_key, key_to_sym, today)
+            if self._is_auth_failed():
+                meta["error"] = self.get_last_error()
+                return {}, meta
+            if snapshots:
+                return _snapshots_to_summaries(snapshots, cutoff), meta
+            if ok and not market_open_now:
+                with _SEED_LOCK:
+                    _EMPTY_TODAY_UNTIL[cooldown_key] = pytime.monotonic() + _EMPTY_TODAY_COOLDOWN_SEC
+                meta["mode"] = "closed_cached"
+                return {}, meta
+            meta["mode"] = "rest_fallback"
+            return None, meta
+
         stream = get_or_start_upstox_stream(self.access_token, key_to_sym, auto_start=True)
         if stream is None:
             return None, meta
 
-        # Seed 15m rolling volume history once on cold start / mid-day launch
-        if stream.needs_intraday_seed(today):
-            seed_bundles, _ = self.fetch_bars(((sym, "1d") for sym in sym_to_key.keys()), interval="1m")
-            if self._auth_failed:
-                meta["error"] = self.get_last_error()
-                return {}, meta
-            if seed_bundles:
-                stream.seed_from_intraday_bundles(today, seed_bundles)
-
-        # Wait briefly on initial connect so first live snapshot arrives before falling back
-        if stream.get_status().get("ticks", 0) == 0:
-            deadline = pytime.monotonic() + _SEED_STABLE_WAIT_SECONDS
-            while pytime.monotonic() < deadline and stream.get_status().get("ticks", 0) == 0:
-                if stream.get_status().get("error"):
-                    break
-                pytime.sleep(0.1)
+        # Background 1m seed (skipped right near open < 09:20 or when market has 0 today data yet)
+        if market_open_now and stream.needs_intraday_seed(today):
+            if cutoff < _PRE_SEED_SKIP_CUTOFF:
+                stream.mark_seeded_date(today)
+            else:
+                self._start_background_intraday_seed(stream, list(sym_to_key.keys()), today)
 
         bar_interval_sec = 300 if interval == "5m" else 60
         summaries = stream.get_today_summaries(symbols, today, cutoff, bar_interval_sec=bar_interval_sec)
+
+        # If WS has 0 today summaries yet (cold connect, weekend, or post-close), use 1-call Batch Quote (~0.2s)
+        if not summaries:
+            cooldown_key = (tok_fp, today)
+            in_cooldown = False
+            if not market_open_now:
+                with _SEED_LOCK:
+                    in_cooldown = pytime.monotonic() < _EMPTY_TODAY_UNTIL.get(cooldown_key, 0.0)
+            if in_cooldown:
+                meta.update(stream.get_status())
+                meta["mode"] = "closed_cached"
+                return {}, meta
+
+            snapshots, ok = self._fetch_batch_quotes_sync(sym_to_key, key_to_sym, today)
+            if self._is_auth_failed():
+                meta["error"] = self.get_last_error()
+                return {}, meta
+            if snapshots:
+                stream.ingest_quote_snapshots(snapshots)
+                summaries = stream.get_today_summaries(symbols, today, cutoff, bar_interval_sec=bar_interval_sec)
+                if not market_open_now and stream.needs_intraday_seed(today):
+                    # Post-close review on a trading day: backfill 1m burst quietly in background too
+                    self._start_background_intraday_seed(stream, list(sym_to_key.keys()), today)
+                meta["mode"] = "batch_quote"
+            elif ok and not market_open_now:
+                with _SEED_LOCK:
+                    _EMPTY_TODAY_UNTIL[cooldown_key] = pytime.monotonic() + _EMPTY_TODAY_COOLDOWN_SEC
+                meta.update(stream.get_status())
+                meta["mode"] = "closed_cached"
+                return {}, meta
+
         status = stream.get_status()
         meta.update(status)
         if status.get("error"):
@@ -377,7 +581,5 @@ class UpstoxProvider:
         if summaries:
             return summaries, meta
 
-        # If WS has not emitted today's data yet (e.g. post-close historical review or initial handshake),
-        # fall back gracefully to REST intraday candles so Scan Now still populates results.
         meta["mode"] = "rest_fallback"
         return None, meta

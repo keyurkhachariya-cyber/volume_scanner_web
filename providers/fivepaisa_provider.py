@@ -1,13 +1,12 @@
 """
 5paisa Xstream Open API MarketDataProvider:
-- Historical & intraday V2 OHLCV candles over rate-limited HTTP/2 async sessions.
-- Live WebSocket streaming (FivePaisaMarketStream / MarketFeedV3) with zero-REST scanning once seeded.
+- Historical & intraday V2 OHLCV candles over a shared persistent HTTP/2 AsyncSession + sliding rate limiter.
+- Live WebSocket streaming (FivePaisaMarketStream / MarketFeedV3) with non-blocking / deduped 1m seeding.
 - Headless TOTP+PIN session login (TOTPLogin -> GetAccessToken) & OAuth login URL helpers.
 """
 
 from __future__ import annotations
 
-import asyncio
 import base64
 from datetime import date, datetime, time
 import hashlib
@@ -21,6 +20,7 @@ from urllib.parse import urlencode
 
 import numpy as np
 
+from holidays import is_market_open
 from providers.base import ArrayBundle, TodaySummary
 from providers.fivepaisa_instruments import resolve_scrip_codes
 from providers.fivepaisa_stream import (
@@ -28,6 +28,8 @@ from providers.fivepaisa_stream import (
     get_or_start_fivepaisa_stream,
     stop_fivepaisa_stream,
 )
+from providers.http_runtime import fetch_json_urls_async
+from providers.stream_base import secret_fingerprint
 from utils import IST, decode_json_response, localize_ist
 import yahoo_client
 
@@ -35,9 +37,16 @@ _FIVEPAISA_VENDOR_BASE = "https://Openapi.5paisa.com/VendorsAPI/Service1.svc"
 _FIVEPAISA_OAUTH_URL = "https://dev-openapi.5paisa.com/WebVendorLogin/VLogin/Index"
 _FIVEPAISA_HISTORICAL_BASE = "https://openapi.5paisa.com/V2/historical"
 _FIVEPAISA_SUBSCRIPTION_KEY = "c89fab8d895a426d9e00db380b433027"
-_FIVEPAISA_MAX_CONCURRENCY = 8
-_FIVEPAISA_REQUEST_INTERVAL = 0.05  # ~20 req/s max average, comfortably under 25 req/s & 1,500 req/min
-_SEED_STABLE_WAIT_SECONDS = 1.5
+_FIVEPAISA_MAX_CONCURRENCY = 16
+_FIVEPAISA_MAX_PER_SEC = 22    # 5paisa limit: 25 req/sec
+_FIVEPAISA_MAX_PER_MIN = 1200  # 5paisa limit: 1,500 req/min
+_SEED_STABLE_WAIT_SECONDS = 1.0
+_PRE_SEED_SKIP_CUTOFF = time(9, 20)
+_EMPTY_TODAY_COOLDOWN_SEC = 30.0
+
+_SEED_LOCK = threading.Lock()
+_INFLIGHT_SEEDS: Set[Tuple[str, date]] = set()
+_EMPTY_TODAY_UNTIL: Dict[Tuple[str, date], float] = {}
 
 
 def generate_totp_code(totp_or_secret: str, for_time: Optional[float] = None) -> str:
@@ -270,6 +279,10 @@ class FivePaisaProvider:
             if auth_failed:
                 self._auth_failed = True
 
+    def _is_auth_failed(self) -> bool:
+        with self._lock:
+            return self._auth_failed
+
     def _build_candle_url(
         self,
         scrip_code: str,
@@ -281,7 +294,6 @@ class FivePaisaProvider:
         if from_date and to_date:
             from_dt = date.fromisoformat(from_date)
             to_dt = date.fromisoformat(to_date)
-            # 5paisa end query parameter is an inclusive calendar date: avoid requesting tomorrow for single-day calls
             if (to_dt - from_dt).days == 1:
                 from_str = to_str = from_dt.isoformat()
             else:
@@ -292,87 +304,28 @@ class FivePaisaProvider:
             from_str = to_str = datetime.now(IST).date().isoformat()
         return f"{_FIVEPAISA_HISTORICAL_BASE}/N/C/{scrip_code}/{iv}?from={from_str}&end={to_str}"
 
-    async def _fetch_candles_async(
-        self,
-        sym_tasks: List[Tuple[str, str, Optional[str], Optional[str]]],
-        interval: str,
-        timeout: int = 10,
-    ) -> Tuple[Dict[str, ArrayBundle], Set[str]]:
-        from curl_cffi.requests import AsyncSession
+    def _start_background_intraday_seed(self, stream: Any, symbols: List[str], today: date) -> None:
+        """Backfill 1-minute rolling volume buckets once in background without blocking initial scan."""
+        seed_key = (secret_fingerprint(self.client_code, self.access_token), today)
+        with _SEED_LOCK:
+            if seed_key in _INFLIGHT_SEEDS or not stream.needs_intraday_seed(today):
+                return
+            _INFLIGHT_SEEDS.add(seed_key)
 
-        headers = {
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.access_token}",
-            "Ocp-Apim-Subscription-Key": _FIVEPAISA_SUBSCRIPTION_KEY,
-        }
-        sem = asyncio.Semaphore(_FIVEPAISA_MAX_CONCURRENCY)
-        pace_lock = asyncio.Lock()
-        last_req_mono = [0.0]
+        def _worker() -> None:
+            try:
+                seed_bundles, failed = self.fetch_bars(((sym, "1d") for sym in symbols), interval="1m")
+                if seed_bundles:
+                    stream.seed_from_intraday_bundles(today, seed_bundles)
+                elif not failed and not self._is_auth_failed():
+                    stream.mark_seeded_date(today)
+            except Exception:
+                pass
+            finally:
+                with _SEED_LOCK:
+                    _INFLIGHT_SEEDS.discard(seed_key)
 
-        async def _pace() -> None:
-            async with pace_lock:
-                now_m = pytime.monotonic()
-                wait_s = (last_req_mono[0] + _FIVEPAISA_REQUEST_INTERVAL) - now_m
-                if wait_s > 0:
-                    await asyncio.sleep(wait_s)
-                last_req_mono[0] = pytime.monotonic()
-
-        async def _fetch_one(
-            sess: Any, sym: str, scrip_code: str, s_str: Optional[str], e_str: Optional[str]
-        ) -> Tuple[str, Optional[ArrayBundle], bool, Optional[int]]:
-            url = self._build_candle_url(scrip_code, interval, s_str, e_str)
-            async with sem:
-                with self._lock:
-                    if self._auth_failed:
-                        return sym, None, True, 401
-                await _pace()
-                try:
-                    resp = await sess.get(url, headers=headers, timeout=timeout)
-                    code = int(resp.status_code)
-                    if code in (401, 403):
-                        self._set_error(
-                            "5paisa access token expired or invalid (HTTP 401/403). Run TOTP/OAuth login again.",
-                            auth_failed=True,
-                        )
-                        return sym, None, True, code
-                    if code == 429:
-                        self._set_error("5paisa API rate limit hit (HTTP 429); retrying briefly.")
-                        return sym, None, False, 429
-                    if code != 200:
-                        return sym, None, False, code
-                    bundle, ok = _parse_fivepaisa_candles(decode_json_response(resp))
-                    return sym, bundle, ok, 200
-                except Exception:
-                    return sym, None, False, None
-
-        results: Dict[str, ArrayBundle] = {}
-        failed: Set[str] = set()
-        task_map = {sym: (code, s_str, e_str) for sym, code, s_str, e_str in sym_tasks}
-
-        async with AsyncSession(impersonate="chrome") as sess:
-            wave1 = await asyncio.gather(
-                *(_fetch_one(sess, sym, code, s_str, e_str) for sym, code, s_str, e_str in sym_tasks)
-            )
-            for sym, bundle, ok, _ in wave1:
-                if bundle is not None:
-                    results[sym] = bundle
-                elif not ok:
-                    failed.add(sym)
-
-            if failed and not self._auth_failed:
-                await asyncio.sleep(1.0)
-                wave2 = await asyncio.gather(
-                    *(_fetch_one(sess, sym, *task_map[sym]) for sym in sorted(failed))
-                )
-                for sym, bundle, ok, _ in wave2:
-                    if bundle is not None:
-                        results[sym] = bundle
-                        failed.discard(sym)
-                    elif ok:
-                        failed.discard(sym)
-
-        return results, failed
+        threading.Thread(target=_worker, name="fivepaisa_1m_seed", daemon=True).start()
 
     def fetch_bars(
         self,
@@ -384,7 +337,7 @@ class FivePaisaProvider:
         chunk_size: Optional[int] = None,
         symbol_ranges: Optional[Dict[str, Tuple[Optional[str], Optional[str]]]] = None,
     ) -> Tuple[Dict[str, ArrayBundle], Set[str]]:
-        """Fetch historical or today's V2 candles from 5paisa for resolved NSE cash equities."""
+        """Fetch historical or today's V2 candles concurrently over persistent HTTP/2 AsyncSession."""
         tasks = list(symbol_periods)
         if not tasks:
             return {}, set()
@@ -398,22 +351,48 @@ class FivePaisaProvider:
             self._set_error(f"Failed loading 5paisa ScripMaster: {exc}")
             return {}, {sym for sym, _ in tasks}
 
-        sym_tasks: List[Tuple[str, str, Optional[str], Optional[str]]] = []
+        sym_urls: List[Tuple[str, str]] = []
         for sym, _ in tasks:
             code = sym_to_code.get(sym)
             if not code:
                 continue
             s_str, e_str = symbol_ranges.get(sym, (start, end)) if symbol_ranges else (start, end)
-            sym_tasks.append((sym, code, s_str, e_str))
+            sym_urls.append((sym, self._build_candle_url(code, interval, s_str, e_str)))
 
-        if not sym_tasks:
+        if not sym_urls:
             return {}, set()
 
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.access_token}",
+            "Ocp-Apim-Subscription-Key": _FIVEPAISA_SUBSCRIPTION_KEY,
+        }
+        limiter_key = f"fivepaisa:{secret_fingerprint(self.client_code, self.access_token)}"
+
         try:
-            return yahoo_client._run_coro_sync(lambda: self._fetch_candles_async(sym_tasks, interval=interval))
+            return yahoo_client._run_coro_sync(
+                lambda: fetch_json_urls_async(
+                    sym_urls=sym_urls,
+                    headers=headers,
+                    parser_fn=_parse_fivepaisa_candles,
+                    max_concurrency=_FIVEPAISA_MAX_CONCURRENCY,
+                    max_per_sec=_FIVEPAISA_MAX_PER_SEC,
+                    max_per_min=_FIVEPAISA_MAX_PER_MIN,
+                    limiter_key=limiter_key,
+                    on_auth_error=lambda: self._set_error(
+                        "5paisa access token expired or invalid (HTTP 401/403). Run TOTP/OAuth login again.",
+                        auth_failed=True,
+                    ),
+                    on_rate_limit=lambda: self._set_error(
+                        "5paisa API rate limit hit (HTTP 429); retrying briefly."
+                    ),
+                    should_abort=self._is_auth_failed,
+                )
+            )
         except Exception as exc:
             self._set_error(f"5paisa candle fetch error: {exc}")
-            return {}, {sym for sym, _, _, _ in sym_tasks}
+            return {}, {sym for sym, _ in sym_urls}
 
     def fetch_today_summaries(
         self,
@@ -424,10 +403,10 @@ class FivePaisaProvider:
         max_workers: int = 8,
     ) -> Tuple[Optional[Dict[str, TodaySummary]], Dict[str, Any]]:
         """
-        When Live WSS is enabled:
-        1. Ensure singleton FivePaisaMarketStream (MarketFeedV3) is running for mapped F&O scrips.
-        2. Seed 1m rolling volume buckets & running VWAP once per day from V2/historical.
-        3. Serve live in-memory TodaySummary records, falling back gracefully to REST if WS has 0 ticks yet.
+        Serve live TodaySummary records cleanly without duplicate 218-call fallback loops:
+        - Live WSS: starts MarketFeedV3, seeds 1m Vol_Burst_15m in background when WS ticks exist,
+          or fetches once and serves directly from seeded state if WS has 0 ticks yet.
+        - Off-hours / weekends: avoids sleep delays and caches empty today checks cleanly.
         """
         meta: Dict[str, Any] = {"provider": self.provider_id, "mode": "wss" if self.use_live_ws else "rest"}
         if not self.access_token:
@@ -436,8 +415,17 @@ class FivePaisaProvider:
             meta["error"] = msg
             return {}, meta
 
+        now_ist = datetime.combine(today, cutoff, tzinfo=IST)
+        market_open_now = is_market_open(now_ist, background_refresh=True)
+        cooldown_key = (secret_fingerprint(self.client_code, self.access_token), today)
+
         if not self.use_live_ws:
             stop_fivepaisa_stream(self.access_token, self.client_code)
+            if not market_open_now:
+                with _SEED_LOCK:
+                    if pytime.monotonic() < _EMPTY_TODAY_UNTIL.get(cooldown_key, 0.0):
+                        meta["mode"] = "closed_cached"
+                        return {}, meta
             return None, meta
 
         if not self.client_code:
@@ -464,22 +452,56 @@ class FivePaisaProvider:
         if stream is None:
             return None, meta
 
-        if stream.needs_intraday_seed(today):
-            seed_bundles, _ = self.fetch_bars(((sym, "1d") for sym in sym_to_code.keys()), interval="1m")
-            if self._auth_failed:
-                meta["error"] = self.get_last_error()
-                return {}, meta
-            if seed_bundles:
-                stream.seed_from_intraday_bundles(today, seed_bundles)
-
-        if stream.get_status().get("ticks", 0) == 0:
-            deadline = pytime.monotonic() + _SEED_STABLE_WAIT_SECONDS
-            while pytime.monotonic() < deadline and stream.get_status().get("ticks", 0) == 0:
-                if stream.get_status().get("error"):
-                    break
-                pytime.sleep(0.1)
-
         bar_interval_sec = 300 if interval == "5m" else 60
+        seeded_bundles: Dict[str, ArrayBundle] = {}
+
+        if market_open_now:
+            if stream.get_status().get("ticks", 0) == 0:
+                deadline = pytime.monotonic() + _SEED_STABLE_WAIT_SECONDS
+                while pytime.monotonic() < deadline and stream.get_status().get("ticks", 0) == 0:
+                    if stream.get_status().get("error"):
+                        break
+                    pytime.sleep(0.1)
+
+            if stream.needs_intraday_seed(today):
+                if cutoff < _PRE_SEED_SKIP_CUTOFF:
+                    stream.mark_seeded_date(today)
+                elif stream.get_status().get("ticks", 0) > 0:
+                    self._start_background_intraday_seed(stream, list(sym_to_code.keys()), today)
+                else:
+                    seeded_bundles, failed = self.fetch_bars(((sym, "1d") for sym in sym_to_code.keys()), interval="1m")
+                    if self._is_auth_failed():
+                        meta["error"] = self.get_last_error()
+                        return {}, meta
+                    if seeded_bundles:
+                        stream.seed_from_intraday_bundles(today, seeded_bundles)
+                        meta["mode"] = "rest_seed"
+                    elif not failed:
+                        stream.mark_seeded_date(today)
+        else:
+            # Closed market: avoid 1s WS wait and duplicate empty fallback burst
+            with _SEED_LOCK:
+                in_cooldown = pytime.monotonic() < _EMPTY_TODAY_UNTIL.get(cooldown_key, 0.0)
+            if in_cooldown:
+                meta.update(stream.get_status())
+                meta["mode"] = "closed_cached"
+                return {}, meta
+
+            if stream.needs_intraday_seed(today):
+                seeded_bundles, failed = self.fetch_bars(((sym, "1d") for sym in sym_to_code.keys()), interval="1m")
+                if self._is_auth_failed():
+                    meta["error"] = self.get_last_error()
+                    return {}, meta
+                if seeded_bundles:
+                    stream.seed_from_intraday_bundles(today, seeded_bundles)
+                    meta["mode"] = "rest_seed"
+                elif not failed:
+                    with _SEED_LOCK:
+                        _EMPTY_TODAY_UNTIL[cooldown_key] = pytime.monotonic() + _EMPTY_TODAY_COOLDOWN_SEC
+                    meta.update(stream.get_status())
+                    meta["mode"] = "closed_cached"
+                    return {}, meta
+
         summaries = stream.get_today_summaries(symbols, today, cutoff, bar_interval_sec=bar_interval_sec)
         status = stream.get_status()
         meta.update(status)
@@ -488,6 +510,10 @@ class FivePaisaProvider:
 
         if summaries:
             return summaries, meta
+
+        # If we already fetched today's bars cleanly and got nothing valid for today, skip duplicate fetch_bars
+        if seeded_bundles or not market_open_now:
+            return {}, meta
 
         meta["mode"] = "rest_fallback"
         return None, meta
