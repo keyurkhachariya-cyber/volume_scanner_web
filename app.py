@@ -4,16 +4,16 @@ Today's cumulative volume till now vs Previous day's volume till same time.
 """
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, time
 import html
 import os
 from typing import Any
 import streamlit as st
 import pandas as pd
 
-from core.holidays import get_holidays, is_market_open, is_wss_active_window, get_previous_trading_day, IST
+from core.holidays import get_holidays, is_market_open, is_wss_active_window, IST
 from core.oi import OI_BUILDUP_OPTIONS, SIGNAL_BEARISH, SIGNAL_BULLISH
-from core.scanner import prune_cache, run_scan
+from core.scanner import prune_cache, resolve_scan_session, run_scan
 from core.universe import get_fno_universe
 from providers import (
     FivePaisaProvider,
@@ -1273,18 +1273,32 @@ def render_scanner(
     attempt_rec = st.session_state._post_close_attempts_by_interval.get(snapshot_key)
     post_close_attempts = attempt_rec[1] if (attempt_rec and attempt_rec[0] == now.date()) else 0
 
+    is_trading_day = market_open or (now.date().weekday() < 5 and now.date() not in holidays_set)
+    expected_replay = not (market_open or (is_trading_day and now.time() >= time(9, 15)))
+    cached_raw_df = st.session_state.results_by_interval.get(snapshot_key)
+    cached_session_meta = (
+        cached_raw_df.attrs.get("session_meta")
+        if cached_raw_df is not None and not cached_raw_df.empty
+        else None
+    )
+    cadence_last_dt = last_scan_dt
+    cadence_started_dt = last_scan_started_dt
+    if market_open and isinstance(cached_session_meta, dict) and cached_session_meta.get("is_replay"):
+        cadence_last_dt = None
+        cadence_started_dt = None
+
     should_scan = False
     if auto_refresh:
         # Checked before widgets below; manual button click also forces a scan once rendered.
         should_scan = _should_auto_scan(
             now=now,
-            last_scan_dt=last_scan_dt,
+            last_scan_dt=cadence_last_dt,
             refresh_seconds=refresh_seconds,
             market_open=market_open,
             holidays_set=holidays_set,
             skip_auto_scan=skip_once,
             post_close_attempts=post_close_attempts,
-            last_scan_started_dt=last_scan_started_dt,
+            last_scan_started_dt=cadence_started_dt,
         )
 
     col1, col2, col3, col_btn = st.columns([1.4, 1.05, 0.95, 1.05], vertical_alignment="bottom")
@@ -1297,12 +1311,34 @@ def render_scanner(
         should_scan = True
 
     cached_prev = st.session_state._cached_prev_day
-    if should_scan or cached_prev is None or cached_prev[0] != now.date():
-        prev_day = get_previous_trading_day(now.date())
-        st.session_state._cached_prev_day = (now.date(), prev_day)
+    if (
+        should_scan
+        or cached_prev is None
+        or len(cached_prev) != 4
+        or cached_prev[0] != now.date()
+        or cached_prev[1] != expected_replay
+    ):
+        target_day, prev_day, replay_cutoff, is_replay = resolve_scan_session(
+            now=now,
+            holidays_set=holidays_set,
+            market_open=market_open,
+        )
+        st.session_state._cached_prev_day = (now.date(), is_replay, target_day, prev_day)
     else:
-        prev_day = cached_prev[1]
-    prev_day_slot.metric("Previous Trading Day", prev_day.strftime("%Y-%m-%d"))
+        _, is_replay, target_day, prev_day = cached_prev
+        replay_cutoff = time(15, 30) if is_replay else now.time()
+
+    if is_replay:
+        prev_day_slot.metric(
+            "Last Session (vs Baseline)",
+            f"{target_day.strftime('%d-%b')} vs {prev_day.strftime('%d-%b')}",
+            help=(
+                f"Today is a trading holiday, weekend, or pre-open — auto-scanning {target_day} "
+                f"(09:15–15:30 IST) vs {prev_day}."
+            ),
+        )
+    else:
+        prev_day_slot.metric("Previous Trading Day", prev_day.strftime("%Y-%m-%d"))
 
     info_slot = st.empty()
     if auto_refresh and should_scan and not market_open and not scan_clicked:
@@ -1314,7 +1350,12 @@ def render_scanner(
 
     if should_scan:
         with status_slot:
-            with st.spinner(f"Scanning {len(symbols)} F&O stocks ({data_source}, {interval} bars)..."):
+            spinner_scope = (
+                f"{data_source}, {interval} bars · {target_day.strftime('%d-%b')} vs {prev_day.strftime('%d-%b')}"
+                if is_replay
+                else f"{data_source}, {interval} bars"
+            )
+            with st.spinner(f"Scanning {len(symbols)} F&O stocks ({spinner_scope})..."):
                 scan_started_dt = datetime.now(IST)
                 scan_kwargs = {
                     "symbols": symbols,
@@ -1323,6 +1364,8 @@ def render_scanner(
                     "interval": interval,
                     "max_workers": max_workers,
                     "prev_day": prev_day,
+                    "target_day": target_day,
+                    "cutoff_time": replay_cutoff if is_replay else None,
                     "include_oi": include_oi,
                 }
                 if data_source == "Upstox v3":
@@ -1372,12 +1415,24 @@ def render_scanner(
                 (data_source == "Upstox v3" and upstox_live_ws)
                 or (data_source == "5paisa Xstream" and fivepaisa_live_ws)
             )
+            replay_hint = (
+                f" Auto-scanning last session (**{target_day.strftime('%d-%b')}** vs **{prev_day.strftime('%d-%b')}**)."
+                if is_replay
+                else ""
+            )
             if broker_ws_selected and wss_off_hours:
                 info_slot.caption(
-                    "⏸️ **Auto-refresh & Live WSS paused** (market closed). Manual **Scan Now** still works via REST/Batch Quote."
+                    f"⏸️ **Auto-refresh & Live WSS paused** (market closed).{replay_hint} Manual **Scan Now** still works."
                 )
             else:
-                info_slot.caption("⏸️ **Auto-refresh paused** (market closed). Manual **Scan Now** still works anytime.")
+                info_slot.caption(
+                    f"⏸️ **Auto-refresh paused** (market closed).{replay_hint} Manual **Scan Now** still works anytime."
+                )
+    elif is_replay:
+        info_slot.caption(
+            f"📅 **Holiday / weekend / pre-open** — **Scan Now** automatically replays last trading session "
+            f"(**{target_day.strftime('%Y-%m-%d')}** vs **{prev_day.strftime('%Y-%m-%d')}**, `09:15–15:30 IST`)."
+        )
 
     # Client-side filtering & sorting on the cached scan snapshot for the active source & interval
     raw_df = st.session_state.results_by_interval.get(snapshot_key, pd.DataFrame())
@@ -1558,6 +1613,8 @@ def render_scanner(
                 nse_ts = oi_meta.get("nse_timestamp")
                 if nse_ts:
                     oi_note = f" | NSE OI @ {nse_ts.split(' ')[-1]}"
+            session_meta = raw_df.attrs.get("session_meta")
+            replay_done = isinstance(session_meta, dict) and bool(session_meta.get("is_replay"))
             prov_meta = raw_df.attrs.get("provider_meta")
             prov_note = ""
             prov_labels = {"upstox": "Upstox", "fivepaisa": "5paisa"}
@@ -1574,8 +1631,18 @@ def render_scanner(
                     prov_note = f" | {p_name} Post-Close Cached"
                 elif mode == "rest_seed":
                     prov_note = f" | {p_name} Seeded REST"
+                elif mode == "replay":
+                    prov_note = f" | {p_name} 📅 Last Session"
                 else:
                     prov_note = f" | {p_name} REST"
+            elif replay_done:
+                prov_note = " | Yahoo 📅 Last Session"
+
+            session_note = (
+                f"{interval} bars · {session_meta.get('target_day')} vs {session_meta.get('prev_day')}"
+                if replay_done
+                else f"{interval} bars"
+            )
             if sig_choice in (SIGNAL_BULLISH, SIGNAL_BEARISH):
                 count_summary = (
                     f"Showing **{len(table_df)}** {sig_choice} of **{len(df)}** matching "
@@ -1585,7 +1652,7 @@ def render_scanner(
                 count_summary = f"Showing **{len(df)}** of **{len(raw_df)}** scanned stocks"
             st.success(
                 f"Last scan: {last_scan_dt.strftime('%H:%M:%S IST')} "
-                f"({interval} bars) | "
+                f"({session_note}) | "
                 f"{count_summary}{gap_note}{oi_filter_note}{mom_filter_note}{oi_note}{prov_note}"
             )
             if isinstance(prov_meta, dict) and prov_meta.get("error"):

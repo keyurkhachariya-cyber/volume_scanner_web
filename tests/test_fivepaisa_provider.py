@@ -382,11 +382,15 @@ class FivePaisaProviderTest(unittest.TestCase):
         self.assertFalse(prov.supports_coalesced_range)
         self.assertEqual(
             prov._build_candle_url("2885", "1m", "2026-11-26", "2026-11-27"),
-            "https://openapi.5paisa.com/V2/historical/N/C/2885/1m?from=2026-11-26&end=2026-11-26",
+            "https://openapi.5paisa.com/V2/historical/N/C/2885/1m?from=2026-11-26&end=2026-11-27",
         )
         self.assertEqual(
             prov._build_candle_url("2885", "1m", "2026-11-26", "2026-11-28"),
-            "https://openapi.5paisa.com/V2/historical/N/C/2885/1m?from=2026-11-26&end=2026-11-27",
+            "https://openapi.5paisa.com/V2/historical/N/C/2885/1m?from=2026-11-26&end=2026-11-28",
+        )
+        self.assertEqual(
+            prov._build_candle_url("2885", "5m", "2026-11-27", "2026-11-28"),
+            "https://openapi.5paisa.com/V2/historical/N/C/2885/5m?from=2026-11-27&end=2026-11-28",
         )
         self.assertEqual(
             prov._build_candle_url("2885", "5m", "2026-11-26", "2026-11-26"),

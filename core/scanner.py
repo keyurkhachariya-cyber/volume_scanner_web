@@ -14,7 +14,7 @@ import pandas as pd
 
 import core.baseline_cache as baseline_cache
 from core.baseline_cache import BASELINE_FORMAT_VERSION, get_previous_day_data, prune_cache
-from core.holidays import get_previous_trading_day
+from core.holidays import get_holidays, get_previous_trading_day, is_market_open
 from core.oi import classify_oi_buildup, classify_trade_signal, get_oi_snapshot
 from providers import MarketDataProvider, YahooProvider
 from core.utils import IST, ist_epoch_sec as _ist_epoch_sec, time_to_sec as _time_to_sec
@@ -172,6 +172,33 @@ def _summarize_today_arrays(
     return vol_today, last_price, day_open, day_high, day_low, last_bar_time, vwap, vol_burst_15m
 
 
+def resolve_scan_session(
+    now: Optional[datetime] = None,
+    holidays_set: Optional[Set[date]] = None,
+    market_open: Optional[bool] = None,
+) -> Tuple[date, date, time, bool]:
+    """
+    Resolve (target_day, prev_day, cutoff, is_last_session_replay).
+    - Open market (09:15-15:30) or post-close on a trading day (>15:30): scans today vs previous trading day.
+    - Holidays, weekends, or pre-open (<09:15 IST): replays the last completed trading session
+      against the trading day before it through 15:30 IST.
+    """
+    ref_now = datetime.now(IST) if now is None else now
+    hols = get_holidays(background_refresh=True) if holidays_set is None else holidays_set
+    is_open = is_market_open(ref_now, background_refresh=True) if market_open is None else bool(market_open)
+    today_d = ref_now.date()
+    is_trading_day = is_open or (today_d.weekday() < 5 and today_d not in hols)
+
+    if is_open or (is_trading_day and ref_now.time() >= time(9, 15)):
+        target_day = today_d
+        prev_day = get_previous_trading_day(target_day)
+        return target_day, prev_day, min(ref_now.time(), time(15, 30)), False
+
+    target_day = get_previous_trading_day(today_d)
+    prev_day = get_previous_trading_day(target_day)
+    return target_day, prev_day, time(15, 30), True
+
+
 def _prepare_fetch_plan(
     symbols: List[str],
     today: date,
@@ -180,6 +207,7 @@ def _prepare_fetch_plan(
     max_workers: int,
     chunk_size: Optional[int],
     provider: Optional[MarketDataProvider] = None,
+    is_replay: bool = False,
 ) -> Tuple[
     Dict[str, Any],
     List[str],
@@ -187,7 +215,7 @@ def _prepare_fetch_plan(
     List[Tuple[str, Optional[str]]],
     Dict[str, Tuple[Optional[str], Optional[str]]],
 ]:
-    """Load cached baselines and build coalesced fetch tasks for today (+ cold prev_day where supported)."""
+    """Load cached baselines and build coalesced fetch tasks for target_day (+ cold prev_day where supported)."""
     cache_namespace = getattr(provider, "cache_namespace", "") if provider is not None else ""
     cache_key = baseline_cache.make_cache_key(prev_day, interval, cache_namespace)
     store = baseline_cache._get_or_load_store(cache_key, prev_day, interval)
@@ -215,6 +243,7 @@ def _prepare_fetch_plan(
 
     skip_today_set = neg_set - set(store["symbol_to_idx"].keys())
     prev_day_str = prev_day.strftime("%Y-%m-%d")
+    today_str = today.strftime("%Y-%m-%d")
     tomorrow_str = (today + timedelta(days=1)).strftime("%Y-%m-%d")
     symbol_ranges: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
     symbol_periods: List[Tuple[str, Optional[str]]] = []
@@ -225,6 +254,9 @@ def _prepare_fetch_plan(
         if sym in missing_set and can_coalesce_range:
             symbol_periods.append((sym, None))
             symbol_ranges[sym] = (prev_day_str, tomorrow_str)
+        elif is_replay:
+            symbol_periods.append((sym, None))
+            symbol_ranges[sym] = (today_str, tomorrow_str)
         else:
             symbol_periods.append((sym, "1d"))
 
@@ -417,6 +449,8 @@ def run_scan(
     prev_day: Optional[date] = None,
     include_oi: bool = False,
     provider: Optional[MarketDataProvider] = None,
+    target_day: Optional[date] = None,
+    cutoff_time: Optional[time] = None,
 ) -> pd.DataFrame:
     """
     Run relative volume scan across symbols with bar-aligned baseline comparisons and optional NSE OI.
@@ -427,9 +461,14 @@ def run_scan(
 
     active_provider: MarketDataProvider = provider if provider is not None else YahooProvider()
     now = datetime.now(IST)
-    cutoff = now.time()
+    if target_day is None and prev_day is None:
+        today, prev_day, default_cutoff, is_replay = resolve_scan_session(now)
+        cutoff = cutoff_time if cutoff_time is not None else default_cutoff
+    else:
+        today = target_day if target_day is not None else now.date()
+        is_replay = today < now.date()
+        cutoff = cutoff_time if cutoff_time is not None else (time(15, 30) if is_replay else now.time())
     cutoff_sec = _time_to_sec(cutoff)
-    today = now.date()
 
     oi_executor: Optional[ThreadPoolExecutor] = None
     oi_future = None
@@ -438,7 +477,10 @@ def run_scan(
         oi_future = oi_executor.submit(get_oi_snapshot)
 
     live_summaries: Optional[Dict[str, Any]] = None
-    provider_meta: Dict[str, Any] = {"provider": active_provider.provider_id, "mode": "rest"}
+    provider_meta: Dict[str, Any] = {
+        "provider": active_provider.provider_id,
+        "mode": "replay" if is_replay else "rest",
+    }
     fetched_arrays: Dict[str, Dict[str, Optional[np.ndarray]]] = {}
     failed_syms: Set[str] = set()
 
@@ -446,11 +488,18 @@ def run_scan(
         if prev_day is None:
             prev_day = get_previous_trading_day(today)
         store, missing, missing_set, symbol_periods, symbol_ranges = _prepare_fetch_plan(
-            symbols, today, prev_day, interval, max_workers, chunk_size, provider=active_provider
+            symbols,
+            today,
+            prev_day,
+            interval,
+            max_workers,
+            chunk_size,
+            provider=active_provider,
+            is_replay=is_replay,
         )
 
-        # If provider serves live summaries (e.g. WebSocket feed), skip redundant full-bar downloads
-        if not missing_set:
+        # If provider serves live summaries (e.g. WebSocket feed), skip redundant full-bar downloads for today's live session
+        if not is_replay and not missing_set:
             live_summaries, live_meta = active_provider.fetch_today_summaries(
                 symbols=symbols,
                 today=today,
@@ -503,6 +552,12 @@ def run_scan(
 
     def _attach_meta(df_target: pd.DataFrame) -> pd.DataFrame:
         df_target.attrs["provider_meta"] = provider_meta
+        df_target.attrs["session_meta"] = {
+            "target_day": today.isoformat(),
+            "prev_day": prev_day.isoformat(),
+            "cutoff": cutoff.strftime("%H:%M"),
+            "is_replay": is_replay,
+        }
         if include_oi:
             df_target.attrs["oi_meta"] = {k: v for k, v in oi_snapshot.items() if k != "by_symbol"}
         return df_target

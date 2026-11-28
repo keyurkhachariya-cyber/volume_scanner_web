@@ -402,6 +402,166 @@ class OptimizationFixesTest(unittest.TestCase):
             with bc._CACHE_LOCK:
                 bc._PREV_DAY_MEMORY_CACHE.pop(cache_key, None)
 
+    def test_resolve_scan_session_and_auto_holiday_weekend_preopen_replay(self):
+        import glob
+        import core.baseline_cache as bc_mod
+        import core.holidays as holidays_mod
+        import core.scanner as scanner_mod
+
+        ist = holidays_mod.IST
+        # Weekend Saturday -> Friday 27th vs Thursday 26th, cutoff 15:30, replay=True
+        sat_dt = ist.localize(datetime(2026, 11, 28, 11, 0))
+        self.assertEqual(
+            scanner_mod.resolve_scan_session(now=sat_dt, holidays_set=set()),
+            (date(2026, 11, 27), date(2026, 11, 26), time(15, 30), True),
+        )
+        # Weekend Sunday -> Friday 27th vs Thursday 26th, cutoff 15:30, replay=True
+        sun_dt = ist.localize(datetime(2026, 11, 29, 11, 0))
+        self.assertEqual(
+            scanner_mod.resolve_scan_session(now=sun_dt, holidays_set=set()),
+            (date(2026, 11, 27), date(2026, 11, 26), time(15, 30), True),
+        )
+        # Weekday trading holiday (Tue 2026-11-24) -> Mon 23rd vs Fri 20th, replay=True
+        hol_dt = ist.localize(datetime(2026, 11, 24, 11, 0))
+        self.assertEqual(
+            scanner_mod.resolve_scan_session(now=hol_dt, holidays_set={date(2026, 11, 24)}),
+            (date(2026, 11, 23), date(2026, 11, 20), time(15, 30), True),
+        )
+        # Trading-day pre-open (09:00 IST) -> Thu 26th vs Wed 25th, replay=True
+        pre_dt = ist.localize(datetime(2026, 11, 27, 9, 0))
+        self.assertEqual(
+            scanner_mod.resolve_scan_session(now=pre_dt, holidays_set=set(), market_open=False),
+            (date(2026, 11, 26), date(2026, 11, 25), time(15, 30), True),
+        )
+        # Trading-day live open (10:30 IST) -> live mode, replay=False
+        open_dt = ist.localize(datetime(2026, 11, 27, 10, 30))
+        self.assertEqual(
+            scanner_mod.resolve_scan_session(now=open_dt, holidays_set=set(), market_open=True),
+            (date(2026, 11, 27), date(2026, 11, 26), time(10, 30), False),
+        )
+        # Trading-day post-close (16:00 IST) -> same day at 15:30, replay=False
+        post_dt = ist.localize(datetime(2026, 11, 27, 16, 0))
+        self.assertEqual(
+            scanner_mod.resolve_scan_session(now=post_dt, holidays_set=set(), market_open=False),
+            (date(2026, 11, 27), date(2026, 11, 26), time(15, 30), False),
+        )
+
+        # End-to-end run_scan auto-replay verification (skip live summary, pass target_day range, apply 15:30 cutoff)
+        ns = f"replay_test_{os.getpid()}"
+        fetch_calls = []
+        np_mod = scanner_mod.np
+
+        def _ts(d_obj, h_val, m_val):
+            return int(ist.localize(datetime.combine(d_obj, time(h_val, m_val))).timestamp())
+
+        def _fake_fetch_bars(symbol_periods, interval="1m", max_workers=8, start=None, end=None, chunk_size=None, symbol_ranges=None):
+            pairs = list(symbol_periods)
+            fetch_calls.append({"pairs": pairs, "start": start, "end": end, "symbol_ranges": symbol_ranges})
+            if start == "2026-11-26" and end == "2026-11-27":
+                # Baseline previous day (Thu 2026-11-26)
+                ts_arr = np_mod.array([_ts(date(2026, 11, 26), 9, 15), _ts(date(2026, 11, 26), 15, 29)], dtype=np_mod.int64)
+                return (
+                    {
+                        "REPLAY.NS": {
+                            "ts_sec": ts_arr,
+                            "open": np_mod.array([100.0, 102.0], dtype=np_mod.float64),
+                            "high": np_mod.array([101.0, 103.0], dtype=np_mod.float64),
+                            "low": np_mod.array([99.0, 101.0], dtype=np_mod.float64),
+                            "close": np_mod.array([100.5, 102.5], dtype=np_mod.float64),
+                            "volume": np_mod.array([1000.0, 1000.0], dtype=np_mod.float64),
+                        }
+                    },
+                    set(),
+                )
+            # Replay target day (Fri 2026-11-27), including a 15:58 post-close auction bar that cutoff=15:30 must drop
+            ts_arr = np_mod.array(
+                [
+                    _ts(date(2026, 11, 27), 9, 15),
+                    _ts(date(2026, 11, 27), 15, 29),
+                    _ts(date(2026, 11, 27), 15, 58),
+                ],
+                dtype=np_mod.int64,
+            )
+            return (
+                {
+                    "REPLAY.NS": {
+                        "ts_sec": ts_arr,
+                        "open": np_mod.array([103.0, 106.0, 107.0], dtype=np_mod.float64),
+                        "high": np_mod.array([105.0, 108.0, 108.0], dtype=np_mod.float64),
+                        "low": np_mod.array([102.0, 105.0, 106.0], dtype=np_mod.float64),
+                        "close": np_mod.array([104.0, 107.0, 107.5], dtype=np_mod.float64),
+                        "volume": np_mod.array([2500.0, 2500.0, 999999.0], dtype=np_mod.float64),
+                    }
+                },
+                set(),
+            )
+
+        mock_prov = MagicMock()
+        mock_prov.provider_id = "mock_replay"
+        mock_prov.display_name = "Mock Replay"
+        mock_prov.cache_namespace = ns
+        mock_prov.supports_coalesced_range = False
+        mock_prov.fetch_today_summaries.side_effect = AssertionError("fetch_today_summaries must be skipped in replay mode")
+        mock_prov.fetch_bars.side_effect = _fake_fetch_bars
+        mock_prov.get_last_error.return_value = None
+
+        class _FakeSatDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return sat_dt
+
+        cache_key = bc_mod.make_cache_key(date(2026, 11, 26), "1m", ns)
+        try:
+            with (
+                patch.object(scanner_mod, "datetime", _FakeSatDatetime),
+                patch.object(scanner_mod, "get_holidays", return_value=set()),
+                patch.object(holidays_mod, "get_holidays", return_value=set()),
+                patch.object(scanner_mod, "is_market_open", return_value=False),
+            ):
+                df = scanner_mod.run_scan(
+                    ["REPLAY.NS"],
+                    min_ratio=1.0,
+                    min_volume=0,
+                    interval="1m",
+                    include_oi=False,
+                    provider=mock_prov,
+                )
+
+            mock_prov.fetch_today_summaries.assert_not_called()
+            self.assertEqual(len(fetch_calls), 2)
+            self.assertEqual(fetch_calls[1]["pairs"], [("REPLAY.NS", None)])
+            self.assertEqual(
+                fetch_calls[1]["symbol_ranges"],
+                {"REPLAY.NS": ("2026-11-27", "2026-11-28")},
+            )
+            self.assertEqual(len(df), 1)
+            row = df.iloc[0]
+            self.assertEqual(row["Symbol"], "REPLAY")
+            self.assertEqual(row["Vol_Today"], 5000)
+            self.assertEqual(row["Vol_Prev_Same_Time"], 2000)
+            self.assertAlmostEqual(row["Ratio"], 2.5)
+            self.assertEqual(row["Last_Bar_Time"], "15:29")
+            self.assertAlmostEqual(row["LTP"], 107.0)
+            self.assertEqual(
+                df.attrs.get("session_meta"),
+                {
+                    "target_day": "2026-11-27",
+                    "prev_day": "2026-11-26",
+                    "cutoff": "15:30",
+                    "is_replay": True,
+                },
+            )
+            self.assertEqual(df.attrs.get("provider_meta", {}).get("mode"), "replay")
+        finally:
+            with bc_mod._CACHE_LOCK:
+                bc_mod._PREV_DAY_MEMORY_CACHE.pop(cache_key, None)
+                bc_mod._NEG_CACHE.pop(cache_key, None)
+            for p in glob.glob(str(bc_mod.CACHE_DIR / f"prev_baseline_{ns}_*.pkl")):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

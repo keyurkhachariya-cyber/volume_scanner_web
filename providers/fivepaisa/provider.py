@@ -433,11 +433,8 @@ class FivePaisaProvider:
     ) -> str:
         iv = "5m" if interval == "5m" else "1m"
         if from_date and to_date:
-            from_dt = date.fromisoformat(from_date)
-            to_dt = date.fromisoformat(to_date)
-            # Callers pass exclusive end dates (day + 1); 5paisa V2 historical end= is inclusive.
-            inc_end = to_dt - timedelta(days=1) if to_dt > from_dt else from_dt
-            from_str, to_str = from_dt.isoformat(), inc_end.isoformat()
+            from_str = date.fromisoformat(from_date).isoformat()
+            to_str = date.fromisoformat(to_date).isoformat()
         elif from_date:
             from_str = to_str = date.fromisoformat(from_date).isoformat()
         else:

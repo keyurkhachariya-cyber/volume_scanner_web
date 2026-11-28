@@ -676,6 +676,56 @@ class AppOiUiTest(unittest.TestCase):
         self.assertEqual(prov.user_key, "UKEY_SECRET_5P")
         self.assertEqual(prov.client_code, "50011110")
 
+    def test_holiday_weekend_auto_replay_ui_banner_and_run_scan_args(self):
+        from datetime import time
+
+        sample_df = _build_sample_df(include_buildup=True)
+        captured = {}
+
+        def _fake_run_scan(*args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = dict(kwargs)
+            df = sample_df.copy()
+            df.attrs["session_meta"] = {
+                "target_day": "2026-11-27",
+                "prev_day": "2026-11-26",
+                "cutoff": "15:30",
+                "is_replay": True,
+            }
+            df.attrs["provider_meta"] = {"provider": "yahoo", "mode": "replay"}
+            return df
+
+        at = AppTest.from_file("app.py", default_timeout=20)
+        with (
+            patch.object(universe, "get_fno_universe", return_value=(["RELIANCE.NS", "HDFCBANK.NS"], "Mock")),
+            patch.object(
+                scanner,
+                "resolve_scan_session",
+                return_value=(date(2026, 11, 27), date(2026, 11, 26), time(15, 30), True),
+            ),
+            patch.object(scanner, "run_scan", side_effect=_fake_run_scan),
+        ):
+            at.run()
+            if "kwargs" not in captured:
+                [b for b in at.button if "Scan Now" in b.label][0].click().run()
+
+        self.assertEqual(list(at.exception), [])
+        kwargs = captured.get("kwargs", {})
+        self.assertEqual(kwargs.get("target_day"), date(2026, 11, 27))
+        self.assertEqual(kwargs.get("prev_day"), date(2026, 11, 26))
+        self.assertEqual(kwargs.get("cutoff_time"), time(15, 30))
+
+        metric_pairs = {m.label: m.value for m in at.metric}
+        self.assertIn("Last Session (vs Baseline)", metric_pairs)
+        self.assertEqual(metric_pairs["Last Session (vs Baseline)"], "27-Nov vs 26-Nov")
+
+        success_msgs = " ".join(s.value for s in at.success)
+        caption_msgs = " ".join(c.value for c in at.caption)
+        self.assertIn("Last Session", success_msgs)
+        self.assertIn("2026-11-27", success_msgs)
+        self.assertIn("2026-11-26", success_msgs)
+        self.assertTrue(len(caption_msgs) > 0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
