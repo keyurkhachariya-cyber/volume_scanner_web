@@ -44,16 +44,16 @@ _INFLIGHT_SEEDS: Set[Tuple[str, date]] = set()
 _EMPTY_TODAY_UNTIL: Dict[Tuple[str, date], float] = {}
 
 
-def build_upstox_login_url(client_id: str, redirect_uri: str) -> str:
+def build_upstox_login_url(client_id: str, redirect_uri: str, state: str = "") -> str:
     """Build the Upstox OAuth2 consent URL for daily token generation."""
-    params = urlencode(
-        {
-            "response_type": "code",
-            "client_id": client_id.strip(),
-            "redirect_uri": redirect_uri.strip(),
-        }
-    )
-    return f"{_UPSTOX_API_BASE}/v2/login/authorization/dialog?{params}"
+    params_dict = {
+        "response_type": "code",
+        "client_id": client_id.strip(),
+        "redirect_uri": redirect_uri.strip(),
+    }
+    if state.strip():
+        params_dict["state"] = state.strip()
+    return f"{_UPSTOX_API_BASE}/v2/login/authorization/dialog?{urlencode(params_dict)}"
 
 
 def exchange_upstox_auth_code(

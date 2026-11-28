@@ -1,7 +1,10 @@
 import base64
+from datetime import date
 import json
 import os
+from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -493,6 +496,68 @@ class AppOiUiTest(unittest.TestCase):
             "AUTO_CODE_77",
         )
         self.assertNotIn("code", at_qp.query_params)
+
+    def test_cross_tab_oauth_state_handoff_and_local_token_persistence(self):
+        from urllib.parse import parse_qs, urlparse
+        import providers
+        import ui.auth_helpers as auth_helpers
+
+        # 1. Cross-tab OAuth state handoff WITHOUT st.secrets or local disk store
+        at_a = AppTest.from_file(os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")), "app.py"), default_timeout=15)
+        with patch.object(universe, "get_fno_universe", return_value=(["RELIANCE.NS"], "Mock")):
+            at_a.run()
+            [c for c in at_a.segmented_control if c.label == "Data Source"][0].set_value("Upstox v3").run()
+            [t for t in at_a.text_input if t.label == "API Key (client_id)"][0].set_value("CID_TAB").run()
+            [t for t in at_a.text_input if t.label == "API Secret"][0].set_value("CSEC_TAB").run()
+
+            login_url = providers.build_upstox_login_url(
+                "CID_TAB",
+                "http://localhost:8501",
+                state=at_a.session_state._u_oauth_nonce,
+            )
+            state_nonce = parse_qs(urlparse(login_url).query)["state"][0]
+
+        at_b = AppTest.from_file(os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")), "app.py"), default_timeout=15)
+        at_b.query_params["code"] = "REDIR_CODE_55"
+        at_b.query_params["state"] = state_nonce
+        with (
+            patch.object(universe, "get_fno_universe", return_value=(["RELIANCE.NS"], "Mock")),
+            patch.object(providers, "exchange_upstox_auth_code", return_value=("TOK_CROSS_TAB", None)) as mock_exch,
+        ):
+            at_b.run()
+
+        mock_exch.assert_called_once_with("REDIR_CODE_55", "CID_TAB", "CSEC_TAB", "http://localhost:8501")
+        self.assertEqual(at_b.session_state.upstox_access_token, "TOK_CROSS_TAB")
+        self.assertIsNone(auth_helpers.pop_oauth_handoff(state_nonce))
+
+        # 2. Local token/key store preserves today's token, expires yesterday's token, and checks localhost host
+        self.assertTrue(auth_helpers.is_local_host_request({"Host": "localhost:8501"}))
+        self.assertTrue(auth_helpers.is_local_host_request({"Host": "127.0.0.1:8501"}))
+        self.assertFalse(auth_helpers.is_local_host_request({"Host": "myscanner.streamlit.app"}))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tok_file = Path(tmpdir) / "broker_tokens.json"
+            with patch.object(auth_helpers, "LOCAL_TOKENS_FILE", tok_file):
+                today_d = date(2026, 11, 28)
+                yesterday_d = date(2026, 11, 27)
+                auth_helpers.save_local_broker_auth(
+                    "upstox",
+                    {"access_token": "TOK_TODAY", "client_id": "CID_L", "client_secret": "CSEC_L"},
+                    today=today_d,
+                )
+                loaded_today = auth_helpers.load_local_broker_auth("upstox", today=today_d)
+                self.assertEqual(loaded_today["access_token"], "TOK_TODAY")
+                self.assertEqual(loaded_today["client_id"], "CID_L")
+
+                # Expired relative to next day -> access_token cleared while API keys stay saved
+                loaded_tomorrow = auth_helpers.load_local_broker_auth("upstox", today=date(2026, 11, 29))
+                self.assertEqual(loaded_tomorrow["access_token"], "")
+                self.assertEqual(loaded_tomorrow["client_id"], "CID_L")
+
+                auth_helpers.save_local_broker_auth("upstox", {}, clear_token=True, today=yesterday_d)
+                cleared = auth_helpers.load_local_broker_auth("upstox", today=today_d)
+                self.assertEqual(cleared["access_token"], "")
+                self.assertEqual(cleared["client_id"], "CID_L")
 
 
 if __name__ == "__main__":

@@ -1,16 +1,46 @@
 """
-Pure helpers for sidebar broker authentication: OAuth callback URL/param extraction and 5paisa JWT inspection.
+Sidebar broker auth helpers:
+- OAuth callback URL/parameter extraction
+- Short-lived single-use OAuth state handoff (preserves app credentials across browser redirects)
+- Local same-day disk persistence (.cache/broker_tokens.json) for localhost/LAN sessions
+- 5paisa JWT claim & expiry inspection
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
+import ipaddress
+import json
+import os
+from pathlib import Path
+import secrets
+import tempfile
+import threading
 import time as pytime
-from typing import Any, Dict, Sequence
+from typing import Any, Dict, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, urlparse
 
-from core.utils import IST
+from core.utils import CACHE_DIR, IST
 from providers.fivepaisa.stream import decode_jwt_claims, extract_client_code_from_jwt
+
+LOCAL_TOKENS_FILE: Path = CACHE_DIR / "broker_tokens.json"
+
+_HANDOFF_LOCK = threading.Lock()
+_PENDING_OAUTH_HANDOFFS: Dict[str, Tuple[float, Dict[str, str]]] = {}
+_MAX_PENDING_HANDOFFS = 64
+
+_LOCAL_STORE_LOCK = threading.Lock()
+_TOKEN_KEEP_FIELDS: Dict[str, Tuple[str, ...]] = {
+    "upstox": ("access_token", "client_id", "client_secret", "redirect_uri"),
+    "fivepaisa": (
+        "access_token",
+        "client_code",
+        "user_key",
+        "encryption_key",
+        "user_id",
+        "redirect_uri",
+    ),
+}
 
 
 def extract_oauth_param(raw_value: str, param_names: Sequence[str]) -> str:
@@ -36,6 +66,168 @@ def extract_oauth_param(raw_value: str, param_names: Sequence[str]) -> str:
             if vals and str(vals[0]).strip():
                 return str(vals[0]).strip()
     return text
+
+
+def is_local_host_request(headers: Any) -> bool:
+    """Return True only when request Host indicates localhost, loopback, or private LAN."""
+    if not headers or not hasattr(headers, "get"):
+        return False
+    try:
+        raw_host = headers.get("Host") or headers.get("host") or ""
+    except Exception:
+        return False
+    if not isinstance(raw_host, str) or not raw_host.strip():
+        return False
+
+    host = raw_host.strip().lower()
+    if host.startswith("["):
+        host = host[1:].split("]", 1)[0]
+    else:
+        host = host.split(":", 1)[0]
+
+    if host in ("localhost", "localhost.localdomain"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+        return ip.is_loopback or ip.is_private
+    except ValueError:
+        return False
+
+
+def _prune_handoffs_locked(now_mono: float) -> None:
+    expired = [k for k, (exp, _) in _PENDING_OAUTH_HANDOFFS.items() if exp <= now_mono]
+    for k in expired:
+        _PENDING_OAUTH_HANDOFFS.pop(k, None)
+    while len(_PENDING_OAUTH_HANDOFFS) >= _MAX_PENDING_HANDOFFS:
+        oldest_key = min(_PENDING_OAUTH_HANDOFFS, key=lambda k: _PENDING_OAUTH_HANDOFFS[k][0])
+        _PENDING_OAUTH_HANDOFFS.pop(oldest_key, None)
+
+
+def register_oauth_handoff(
+    payload: Dict[str, str],
+    nonce: str = "",
+    ttl_seconds: float = 600.0,
+) -> str:
+    """Register or refresh an opaque single-use OAuth state handoff mapping."""
+    clean_nonce = (nonce or "").strip() or secrets.token_urlsafe(18)
+    clean_payload = {str(k): str(v or "").strip() for k, v in payload.items()}
+    now_mono = pytime.monotonic()
+    with _HANDOFF_LOCK:
+        _prune_handoffs_locked(now_mono)
+        _PENDING_OAUTH_HANDOFFS[clean_nonce] = (now_mono + max(1.0, float(ttl_seconds)), clean_payload)
+    return clean_nonce
+
+
+def pop_oauth_handoff(nonce: str) -> Optional[Dict[str, str]]:
+    """Consume and return a pending OAuth state handoff payload if present and unexpired."""
+    clean_nonce = (nonce or "").strip()
+    if not clean_nonce:
+        return None
+    now_mono = pytime.monotonic()
+    with _HANDOFF_LOCK:
+        entry = _PENDING_OAUTH_HANDOFFS.pop(clean_nonce, None)
+        _prune_handoffs_locked(now_mono)
+    if entry is None:
+        return None
+    exp_mono, payload = entry
+    return dict(payload) if exp_mono > now_mono else None
+
+
+def _read_local_store_unlocked() -> Dict[str, Any]:
+    if not LOCAL_TOKENS_FILE.exists():
+        return {}
+    try:
+        raw = LOCAL_TOKENS_FILE.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_local_store_unlocked(data: Dict[str, Any]) -> None:
+    tmp_path: Optional[Path] = None
+    try:
+        LOCAL_TOKENS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        fd, raw_tmp = tempfile.mkstemp(
+            dir=str(LOCAL_TOKENS_FILE.parent),
+            prefix=".tmp_broker_tokens_",
+            suffix=".json",
+        )
+        tmp_path = Path(raw_tmp)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+        os.replace(tmp_path, LOCAL_TOKENS_FILE)
+    except Exception:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+def load_local_broker_auth(provider: str, today: Optional[date] = None) -> Dict[str, str]:
+    """Load locally persisted broker credentials and same-day access_token if dated today (IST)."""
+    ref_day = today or datetime.now(IST).date()
+    allowed = _TOKEN_KEEP_FIELDS.get(provider, ())
+    if not allowed:
+        return {}
+    with _LOCAL_STORE_LOCK:
+        store = _read_local_store_unlocked()
+    entry = store.get(provider)
+    if not isinstance(entry, dict):
+        return {}
+
+    out: Dict[str, str] = {}
+    same_day = str(entry.get("token_date") or "").strip() == ref_day.isoformat()
+    for field in allowed:
+        val = str(entry.get(field) or "").strip()
+        if field == "access_token":
+            out[field] = val if (same_day and val) else ""
+        elif val:
+            out[field] = val
+    return out
+
+
+def save_local_broker_auth(
+    provider: str,
+    updates: Dict[str, str],
+    clear_token: bool = False,
+    today: Optional[date] = None,
+) -> None:
+    """Persist non-empty broker fields and/or today's access_token atomically to LOCAL_TOKENS_FILE."""
+    ref_day = today or datetime.now(IST).date()
+    allowed = set(_TOKEN_KEEP_FIELDS.get(provider, ()))
+    if not allowed:
+        return
+    with _LOCAL_STORE_LOCK:
+        store = _read_local_store_unlocked()
+        entry = store.get(provider)
+        cur = dict(entry) if isinstance(entry, dict) else {}
+
+        if clear_token:
+            cur.pop("access_token", None)
+            cur.pop("token_date", None)
+
+        changed = clear_token
+        for field, raw_val in updates.items():
+            if field not in allowed:
+                continue
+            val = str(raw_val or "").strip()
+            if field == "access_token":
+                if val:
+                    if cur.get("access_token") != val or cur.get("token_date") != ref_day.isoformat():
+                        cur["access_token"] = val
+                        cur["token_date"] = ref_day.isoformat()
+                        changed = True
+            elif val:
+                if cur.get(field) != val:
+                    cur[field] = val
+                    changed = True
+
+        if changed:
+            store[provider] = cur
+            _write_local_store_unlocked(store)
 
 
 def inspect_fivepaisa_jwt(access_token: str, now_ts: float | None = None) -> Dict[str, Any]:
