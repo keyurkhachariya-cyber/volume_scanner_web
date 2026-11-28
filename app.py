@@ -47,8 +47,12 @@ st.set_page_config(
     layout="wide",
 )
 
+st.markdown(
+    "<style>.block-container {padding-top: 1.4rem; padding-bottom: 1rem;}</style>",
+    unsafe_allow_html=True,
+)
 st.title("📈 F&O Relative Volume Scanner")
-st.caption("Today's volume till now vs Previous trading day volume till same clock time (IST)")
+st.caption("Today's cumulative volume vs previous trading day till the same clock time (IST)")
 
 
 @st.cache_resource
@@ -123,7 +127,7 @@ if "fivepaisa_client_code" not in st.session_state:
 
 # Sidebar controls
 with st.sidebar:
-    st.header("Settings")
+    st.caption("**1. Data Source & Connection**")
     data_source_raw = st.segmented_control(
         "Data Source",
         options=["Yahoo Finance", "Upstox v3", "5paisa Xstream"],
@@ -135,6 +139,7 @@ with st.sidebar:
     data_source = data_source_raw if data_source_raw in ("Upstox v3", "5paisa Xstream") else "Yahoo Finance"
     use_upstox = data_source == "Upstox v3"
     use_fivepaisa = data_source == "5paisa Xstream"
+    wss_window_open = is_wss_active_window(background_refresh=True)
 
     upstox_token = ""
     upstox_live_ws = True
@@ -151,6 +156,8 @@ with st.sidebar:
         ).strip()
         if upstox_token != st.session_state.upstox_access_token:
             st.session_state.upstox_access_token = upstox_token
+        if upstox_token:
+            st.caption("✅ Access token loaded for today's session")
 
         upstox_live_ws = st.checkbox(
             "Stream Live WSS (MarketDataStreamerV3)",
@@ -159,6 +166,12 @@ with st.sidebar:
         )
         if not upstox_live_ws and upstox_token:
             stop_upstox_stream(upstox_token)
+        elif upstox_live_ws:
+            st.caption(
+                "🟢 WSS active window (09:05–15:35 IST)"
+                if wss_window_open
+                else "⏸️ Market closed — auto-uses 1-call Batch Quote / cache"
+            )
 
         with st.expander("🔑 Daily Login Helper (OAuth Code)", expanded=False):
             u_cid = st.text_input(
@@ -215,6 +228,8 @@ with st.sidebar:
         ).strip()
         if fivepaisa_client_code != st.session_state.fivepaisa_client_code:
             st.session_state.fivepaisa_client_code = fivepaisa_client_code
+        if fivepaisa_token:
+            st.caption("✅ JWT token loaded for today's session")
 
         fivepaisa_live_ws = st.checkbox(
             "Stream Live WSS (MarketFeedV3)",
@@ -223,6 +238,12 @@ with st.sidebar:
         )
         if not fivepaisa_live_ws and fivepaisa_token:
             stop_fivepaisa_stream(fivepaisa_token, fivepaisa_client_code)
+        elif fivepaisa_live_ws:
+            st.caption(
+                "🟢 WSS active window (09:05–15:35 IST)"
+                if wss_window_open
+                else "⏸️ Market closed — auto-uses cached / REST seed"
+            )
 
         with st.expander("🔑 Daily Login Helper (TOTP / OAuth)", expanded=False):
             fp_user_key = st.text_input(
@@ -306,6 +327,9 @@ with st.sidebar:
                             st.success("5paisa token saved for today's session.")
                         else:
                             st.error(err or "5paisa RequestToken exchange failed.")
+
+    st.divider()
+    st.caption("**2. Volume, Gap & Interval**")
     min_ratio = st.number_input(
         "Minimum Ratio (Today / Prev)",
         min_value=0.5,
@@ -350,16 +374,21 @@ with st.sidebar:
             "though a forming 5m bar compares against the full previous-day 5m bar until that 5-minute window completes."
         ),
     )
-    max_workers = st.slider(
-        "Parallel download threads",
-        4,
-        16,
-        8,
-        help=(
-            "Fallback yfinance thread count (default 8). The primary HTTP/2 async chart fetcher "
-            "automatically runs 3× this value concurrently, capped at 28 (default 8 → 24 async streams)."
-        ),
-    )
+    max_workers = 8
+    if data_source == "Yahoo Finance":
+        max_workers = st.slider(
+            "Parallel download threads",
+            4,
+            16,
+            8,
+            help=(
+                "Fallback yfinance thread count (default 8). The primary HTTP/2 async chart fetcher "
+                "automatically runs 3× this value concurrently, capped at 28 (default 8 → 24 async streams)."
+            ),
+        )
+
+    st.divider()
+    st.caption("**3. OI, Sorting & Momentum**")
     include_oi = st.checkbox(
         "Include NSE OI",
         value=True,
@@ -436,7 +465,8 @@ with st.sidebar:
             float(min_vol_burst_15m),
         )
 
-    st.markdown("---")
+    st.divider()
+    st.caption("**4. Auto-Refresh & Universe**")
     live_ws_active = (use_upstox and upstox_live_ws) or (use_fivepaisa and fivepaisa_live_ws)
     auto_refresh = st.checkbox("Auto-refresh", value=False)
     refresh_seconds = 10 if live_ws_active else 60
@@ -589,14 +619,10 @@ def render_scanner(
             last_scan_started_dt=last_scan_started_dt,
         )
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col_btn = st.columns([1.2, 1.0, 0.9, 1.1], vertical_alignment="bottom")
     col1.metric("Current IST", now.strftime("%Y-%m-%d %H:%M:%S"))
     prev_day_slot = col2.empty()
     col3.metric("Market Status", "🟢 OPEN" if market_open else "🔴 CLOSED")
-
-    st.markdown("---")
-
-    col_btn, col_info = st.columns([1, 2])
     with col_btn:
         scan_clicked = st.button("🔄 Scan Now", type="primary", width="stretch")
     if scan_clicked:
@@ -610,10 +636,9 @@ def render_scanner(
         prev_day = cached_prev[1]
     prev_day_slot.metric("Previous Trading Day", prev_day.strftime("%Y-%m-%d"))
 
-    with col_info:
-        info_slot = st.empty()
-        if auto_refresh and should_scan and not market_open and not scan_clicked:
-            info_slot.caption("⏱️ **Auto-refresh**: running final post-close snapshot before pausing.")
+    info_slot = st.empty()
+    if auto_refresh and should_scan and not market_open and not scan_clicked:
+        info_slot.caption("⏱️ **Auto-refresh**: running final post-close snapshot before pausing.")
 
     # Reserve layout slots before slow network calls to minimize stale greying & remounting
     status_slot = st.container()
@@ -710,15 +735,31 @@ def render_scanner(
     with results_slot:
         if df.empty:
             if last_scan_dt is None and empty_scan_dt is None:
-                st.info("Click **Scan Now** or enable **Auto-refresh** in the sidebar to run the scan.")
+                with st.container(border=True):
+                    st.markdown(f"**Ready to scan {len(symbols)} NSE F&O stocks**")
+                    oi_label = "On" if include_oi else "Off"
+                    st.caption(
+                        f"Source: **{data_source}** · Interval: **{interval}** · "
+                        f"Min Ratio: **{min_ratio:.1f}×** · Min Volume: **{min_volume:,}** · NSE OI: **{oi_label}**"
+                    )
+                    st.caption(
+                        "Click **🔄 Scan Now** above (or enable **Auto-refresh** in the sidebar). "
+                        f"Highlights: {SIGNAL_BULLISH} (Ratio > 1.0×, OI Chg > +10%, % Chg > +1.5%) · "
+                        f"{SIGNAL_BEARISH} (Ratio > 1.0×, OI Chg > +10%, % Chg < -1.5%)."
+                    )
             elif not raw_df.empty:
                 st.warning("No stocks matched the current filters. Try lowering the Minimum Ratio or Volume.")
         else:
+            st.session_state.selected_columns = [
+                c for c in st.session_state.selected_columns if c in ALL_COLUMNS
+            ]
             if has_signals:
                 bullish_count = int((df["Signal"] == SIGNAL_BULLISH).sum())
                 bearish_count = int((df["Signal"] == SIGNAL_BEARISH).sum())
                 total_count = len(df)
-                col_sig_summary, col_sig_pills = st.columns([3, 2], vertical_alignment="center")
+                col_sig_summary, col_sig_pills, col_cols_btn, col_csv_btn = st.columns(
+                    [2.4, 2.1, 1.3, 1.1], vertical_alignment="center"
+                )
                 with col_sig_summary:
                     st.markdown(
                         f"**Signals:** &nbsp;{SIGNAL_BULLISH}: **{bullish_count}** &nbsp;|&nbsp; "
@@ -740,14 +781,16 @@ def render_scanner(
                     )
                 if sig_choice in (SIGNAL_BULLISH, SIGNAL_BEARISH):
                     table_df = df[df["Signal"] == sig_choice].reset_index(drop=True)
-
-            if table_df.empty:
-                st.info(f"No **{sig_choice}** stocks matched the current scan and filters.")
             else:
-                st.session_state.selected_columns = [
-                    c for c in st.session_state.selected_columns if c in ALL_COLUMNS
-                ]
-                with st.popover("⚙️ Customize Columns"):
+                col_cols_btn, col_csv_btn, _ = st.columns([1.3, 1.1, 4.6], vertical_alignment="center")
+
+            if not table_df.empty and "Chart" in st.session_state.selected_columns and "Symbol" in table_df.columns:
+                table_df = table_df.assign(
+                    Chart="https://in.tradingview.com/chart/?symbol=NSE%3A" + table_df["Symbol"].astype(str)
+                )
+
+            with col_cols_btn:
+                with st.popover("⚙️ Customize Columns", width="stretch"):
                     st.multiselect(
                         "Visible columns (add, remove, or reorder)",
                         options=ALL_COLUMNS,
@@ -757,36 +800,45 @@ def render_scanner(
                     )
                     st.button("Reset to Default", on_click=_reset_default_columns)
 
-                visible_cols = [c for c in st.session_state.selected_columns if c in table_df.columns]
-                if not visible_cols:
-                    st.warning("Select at least one column in **Customize Columns** to display results.")
-                else:
-                    display_df = table_df[visible_cols]
-                    active_config = {c: COLUMN_CONFIG[c] for c in visible_cols if c in COLUMN_CONFIG}
-                    table_data = (
-                        _style_scanner_df(display_df, table_df["Signal"])
-                        if has_signals
-                        else display_df
-                    )
+            visible_cols = [c for c in st.session_state.selected_columns if c in table_df.columns]
+            csv_data = b""
+            csv_ts = (last_scan_dt or now).strftime("%Y%m%d_%H%M")
+            if not table_df.empty and visible_cols:
+                display_df = table_df[visible_cols]
+                csv_data = display_df.to_csv(index=False).encode("utf-8")
+            with col_csv_btn:
+                st.download_button(
+                    "⬇️ CSV",
+                    data=csv_data,
+                    file_name=f"relative_volume_{interval}_{csv_ts}.csv",
+                    mime="text/csv",
+                    key=f"download_csv_{interval}",
+                    width="stretch",
+                    disabled=(table_df.empty or not visible_cols),
+                    on_click="ignore",
+                )
 
-                    st.dataframe(
-                        table_data,
-                        width="stretch",
-                        hide_index=True,
-                        column_config=active_config,
-                        key="scanner_table",
-                    )
+            if table_df.empty:
+                st.info(f"No **{sig_choice}** stocks matched the current scan and filters.")
+            elif not visible_cols:
+                st.warning("Select at least one column in **Customize Columns** to display results.")
+            else:
+                active_config = {c: COLUMN_CONFIG[c] for c in visible_cols if c in COLUMN_CONFIG}
+                table_data = (
+                    _style_scanner_df(display_df, table_df["Signal"])
+                    if has_signals
+                    else display_df
+                )
+                table_height = min(620, max(240, 40 + 35 * len(display_df)))
 
-                    csv = display_df.to_csv(index=False).encode("utf-8")
-                    csv_ts = (last_scan_dt or now).strftime("%Y%m%d_%H%M")
-                    st.download_button(
-                        "⬇️ Download CSV",
-                        data=csv,
-                        file_name=f"relative_volume_{interval}_{csv_ts}.csv",
-                        mime="text/csv",
-                        key=f"download_csv_{interval}",
-                        on_click="ignore",
-                    )
+                st.dataframe(
+                    table_data,
+                    width="stretch",
+                    height=table_height,
+                    hide_index=True,
+                    column_config=active_config,
+                    key="scanner_table",
+                )
 
     with status_slot:
         if last_scan_dt is not None:

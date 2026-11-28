@@ -229,12 +229,12 @@ class AppOiUiTest(unittest.TestCase):
             )
             import ui.table_config as table_config
 
-            for hidden_col in ("Vol_Today", "Vol_Prev_Same_Time", "OI", "OI_Chg", "Last_Bar_Time"):
+            for hidden_col in ("Vol_Today", "Vol_Prev_Same_Time", "OI", "OI_Chg", "Last_Bar_Time", "Chart"):
                 self.assertNotIn(hidden_col, rendered_df.columns)
                 self.assertIn(hidden_col, table_config.ALL_COLUMNS)
             for removed_col in ("OI_Prev", "VWAP", "Prev_Close", "Day_Open", "Day_High", "Day_Low", "Vol_Diff", "Prev_Full_Vol"):
                 self.assertNotIn(removed_col, table_config.ALL_COLUMNS)
-            self.assertEqual(len(table_config.ALL_COLUMNS), 19)
+            self.assertEqual(len(table_config.ALL_COLUMNS), 20)
             self.assertEqual(list(rendered_df["Symbol"]), ["HDFCBANK", "NONFNO", "RELIANCE", "INFY", "TCS", "SBIN"])
             self.assertTrue(any("🟢 Bullish" in m.value and "**1**" in m.value for m in at.markdown))
 
@@ -363,6 +363,7 @@ class AppOiUiTest(unittest.TestCase):
             self.assertEqual(list(at.exception), [])
             self.assertTrue(any(t.label == "Upstox Access Token (Daily)" for t in at.text_input))
             self.assertTrue(any(c.label.startswith("Stream Live WSS") for c in at.checkbox))
+            self.assertFalse(any(s.label == "Parallel download threads" for s in at.slider))
 
             src_ctrl = [c for c in at.segmented_control if c.label == "Data Source"][0]
             src_ctrl.set_value("5paisa Xstream").run()
@@ -371,6 +372,23 @@ class AppOiUiTest(unittest.TestCase):
             self.assertTrue(any(t.label == "5paisa Client Code" for t in at.text_input))
             self.assertTrue(any(c.label == "Stream Live WSS (MarketFeedV3)" for c in at.checkbox))
             self.assertTrue(any(b.label == "Login via TOTP & Save Token" for b in at.button))
+
+    def test_empty_state_card_and_optional_chart_link_column(self):
+        sample_df = _build_sample_df(include_buildup=True)
+        at = AppTest.from_file(os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")), "app.py"), default_timeout=15)
+        with (
+            patch.object(scanner, "run_scan", return_value=sample_df),
+            patch.object(universe, "get_fno_universe", return_value=(["RELIANCE.NS"], "Mock")),
+        ):
+            at.run()
+            self.assertTrue(any("Ready to scan" in m.value for m in at.markdown))
+            [b for b in at.button if "Scan Now" in b.label][0].click().run()
+            col_ms = [m for m in at.multiselect if m.label.startswith("Visible columns")][0]
+            col_ms.set_value(["Symbol", "Chart", "Range_Pos_Pct"]).run()
+            self.assertEqual(list(at.exception), [])
+            rendered = at.dataframe[0].value
+            self.assertEqual(list(rendered.columns), ["Symbol", "Chart", "Range_Pos_Pct"])
+            self.assertTrue(all(str(u).startswith("https://in.tradingview.com/chart/?symbol=NSE%3A") for u in rendered["Chart"]))
 
 
 if __name__ == "__main__":

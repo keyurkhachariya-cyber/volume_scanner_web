@@ -13,18 +13,20 @@ _COLUMN_SPECS: Tuple[Tuple[str, str, bool, str, Dict[str, Any]], ...] = (
         True,
         "text",
         {
+            "width": "small",
             "pinned": True,
             "help": "🟢 Bullish: Ratio > 1.0×, OI Chg > +10%, % Chg > +1.5% | 🔴 Bearish: Ratio > 1.0×, OI Chg > +10%, % Chg < -1.5%",
         },
     ),
-    ("Symbol", "Symbol", True, "text", {"width": "medium", "pinned": True}),
-    ("LTP", "LTP", True, "number", {"format": "%.2f"}),
+    ("Symbol", "Symbol", True, "text", {"width": "small", "pinned": True}),
+    ("LTP", "LTP", True, "number", {"width": "small", "format": "%.2f"}),
     (
         "Ratio",
         "Ratio",
         True,
         "number",
         {
+            "width": "small",
             "format": "%.2f×",
             "help": "Today's cumulative volume till now divided by previous trading day's volume till the same IST clock time.",
         },
@@ -35,6 +37,7 @@ _COLUMN_SPECS: Tuple[Tuple[str, str, bool, str, Dict[str, Any]], ...] = (
         True,
         "number",
         {
+            "width": "small",
             "format": "%.2f×",
             "help": "Last 15m volume-per-minute pace vs today's average pace (>1.5× active right now; <0.5× faded morning spike).",
         },
@@ -45,6 +48,7 @@ _COLUMN_SPECS: Tuple[Tuple[str, str, bool, str, Dict[str, Any]], ...] = (
         True,
         "number",
         {
+            "width": "small",
             "format": "%+.2f%%",
             "help": "Price % change from Previous Close (includes opening gap; compare with From Open %).",
         },
@@ -55,6 +59,7 @@ _COLUMN_SPECS: Tuple[Tuple[str, str, bool, str, Dict[str, Any]], ...] = (
         True,
         "number",
         {
+            "width": "small",
             "format": "%+.2f%%",
             "help": "Intraday move since 09:15 Open ((LTP - Day Open) / Day Open). Positive = green intraday candle.",
         },
@@ -65,6 +70,7 @@ _COLUMN_SPECS: Tuple[Tuple[str, str, bool, str, Dict[str, Any]], ...] = (
         True,
         "number",
         {
+            "width": "small",
             "format": "%+.2f%%",
             "help": "Distance of LTP from today's VWAP (+ve = trading above VWAP, -ve = below VWAP).",
         },
@@ -73,8 +79,11 @@ _COLUMN_SPECS: Tuple[Tuple[str, str, bool, str, Dict[str, Any]], ...] = (
         "Range_Pos_Pct",
         "Range Pos %",
         True,
-        "number",
+        "progress",
         {
+            "width": "small",
+            "min_value": 0,
+            "max_value": 100,
             "format": "%.0f%%",
             "help": "Position of LTP within Day High–Low range: 100% = Day High, 0% = Day Low.",
         },
@@ -84,14 +93,25 @@ _COLUMN_SPECS: Tuple[Tuple[str, str, bool, str, Dict[str, Any]], ...] = (
         "OI Chg % (Day)",
         True,
         "number",
-        {"format": "%+.2f%%", "help": "Today's % change in Open Interest vs previous trading day close."},
+        {"width": "small", "format": "%+.2f%%", "help": "Today's % change in Open Interest vs previous trading day close."},
     ),
     (
         "OI_Buildup",
         "OI Buildup",
         True,
         "text",
-        {"help": "Price Δ vs Day OI Δ classification: Long Buildup, Short Buildup, Short Covering, Long Unwinding."},
+        {"width": "medium", "help": "Price Δ vs Day OI Δ classification: Long Buildup, Short Buildup, Short Covering, Long Unwinding."},
+    ),
+    (
+        "Chart",
+        "Chart",
+        False,
+        "link",
+        {
+            "width": "small",
+            "display_text": "📈 TV",
+            "help": "Open NSE ticker chart on TradingView in a new tab.",
+        },
     ),
     ("Vol_Today", "Vol Today (till now)", False, "number", {"format": "localized"}),
     ("Vol_Prev_Same_Time", "Vol Prev (same time)", False, "number", {"format": "localized"}),
@@ -137,6 +157,8 @@ def build_column_config() -> Dict[str, Any]:
     builders = {
         "text": st.column_config.TextColumn,
         "number": st.column_config.NumberColumn,
+        "progress": st.column_config.ProgressColumn,
+        "link": st.column_config.LinkColumn,
     }
     return {
         col: builders[kind](label, **kwargs)
