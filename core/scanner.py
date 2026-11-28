@@ -225,8 +225,11 @@ def _prepare_fetch_plan(
     missing_set = set(missing)
 
     gap_days = (today - prev_day).days
-    allow_coalesce = getattr(provider, "supports_coalesced_range", True) if provider is not None else True
-    can_coalesce_range = allow_coalesce and 0 < gap_days <= (6 if interval == "1m" else 55)
+    allow_coalesce = bool(getattr(provider, "supports_coalesced_range", True)) if provider is not None else True
+    allow_replay_coalesce = allow_coalesce or (
+        is_replay and provider is not None and getattr(provider, "supports_replay_coalesced_range", False) is True
+    )
+    can_coalesce_range = allow_replay_coalesce and 0 < gap_days <= (6 if interval == "1m" else 55)
 
     if missing and not can_coalesce_range:
         store = baseline_cache.get_previous_day_data(

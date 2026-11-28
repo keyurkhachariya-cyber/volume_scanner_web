@@ -490,6 +490,10 @@ async def _fetch_charts_async(
                 pass
             return _ASYNC_CRUMB if persistent else local_crumb_state["value"]
 
+    saw_429 = False
+    retry_after_sec = 1.5
+    host_cooldown_until = 0.0
+
     async def _fetch_one(
         sym: str,
         period: Optional[str],
@@ -497,10 +501,14 @@ async def _fetch_charts_async(
         host_idx: int = 0,
         allow_auth_retry: bool = True,
     ) -> Tuple[str, Optional[Dict[str, Optional[np.ndarray]]], bool]:
+        nonlocal saw_429, retry_after_sec, host_cooldown_until
         host = _CHART_HOSTS[host_idx % len(_CHART_HOSTS)]
         url = f"https://{host}/v8/finance/chart/{_url_quote(sym, safe='')}"
         async with sem:
             try:
+                now_mono = pytime.monotonic()
+                if host_cooldown_until > now_mono:
+                    await asyncio.sleep(min(2.0, host_cooldown_until - now_mono))
                 used_crumb = _ASYNC_CRUMB if persistent else local_crumb_state["value"]
                 resp = await session.get(
                     url,
@@ -521,6 +529,19 @@ async def _fetch_charts_async(
                     except Exception:
                         ok = False
                     return sym, None, ok
+                if resp.status_code == 429:
+                    saw_429 = True
+                    hdrs = getattr(resp, "headers", None)
+                    raw_ra = hdrs.get("Retry-After") if hdrs is not None else None
+                    ra_val = 1.5
+                    if raw_ra is not None:
+                        try:
+                            ra_val = min(15.0, max(1.0, float(str(raw_ra).strip())))
+                        except (TypeError, ValueError):
+                            ra_val = 1.5
+                    retry_after_sec = max(retry_after_sec, ra_val)
+                    host_cooldown_until = max(host_cooldown_until, pytime.monotonic() + ra_val)
+                    return sym, None, False
                 if resp.status_code != 200:
                     return sym, None, False
                 bundle, ok = _parse_yahoo_chart_payload(decode_json_response(resp))
@@ -544,8 +565,10 @@ async def _fetch_charts_async(
 
         if failed:
             retry_syms = sorted(failed)
-            await asyncio.sleep(0.5)
-            retry_sem = asyncio.Semaphore(min(4, max(1, int(max_concurrency) // 4)))
+            backoff = max(retry_after_sec, host_cooldown_until - pytime.monotonic()) if saw_429 else 0.5
+            await asyncio.sleep(backoff)
+            retry_cap = 2 if saw_429 else 4
+            retry_sem = asyncio.Semaphore(min(retry_cap, max(1, int(max_concurrency) // 4)))
             wave2 = await asyncio.gather(
                 *(
                     _fetch_one(
@@ -603,7 +626,7 @@ def _fetch_market_data(
         has_async = False
 
     if has_async:
-        async_concurrency = min(28, max(8, int(max_workers) * 3))
+        async_concurrency = min(18, max(8, int(max_workers) * 3))
         try:
             arrays_by_sym, fallback_syms = _run_coro_sync(
                 lambda: _fetch_charts_async(

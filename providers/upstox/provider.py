@@ -35,9 +35,10 @@ from providers.upstox.stream import (
 import providers.yahoo.client as yahoo_client
 
 _UPSTOX_API_BASE = "https://api.upstox.com"
-_UPSTOX_MAX_CONCURRENCY = 24
-_UPSTOX_MAX_PER_SEC = 42   # Upstox v3 limit: 50 req/sec
-_UPSTOX_MAX_PER_MIN = 460  # Upstox v3 limit: 500 req/min
+_UPSTOX_MAX_CONCURRENCY = 16
+_UPSTOX_MAX_PER_SEC = 35     # Upstox v3 limit: 50 req/sec (leave burst margin)
+_UPSTOX_MAX_PER_MIN = 380    # Upstox v3 limit: 500 req/min
+_UPSTOX_MAX_PER_30MIN = 1800 # Upstox v3 limit: 2,000 req/30 min
 _UPSTOX_BATCH_QUOTE_MAX = 500
 _MARKET_OPEN_WALL = time(9, 15)
 _MARKET_CLOSE_WALL = time(15, 30)
@@ -238,6 +239,7 @@ class UpstoxProvider:
     display_name: str = "Upstox API v3"
     cache_namespace: str = "upstox"
     supports_coalesced_range: bool = False
+    supports_replay_coalesced_range: bool = True
 
     def __init__(
         self,
@@ -308,29 +310,46 @@ class UpstoxProvider:
             for i in range(0, len(keys), _UPSTOX_BATCH_QUOTE_MAX)
         ]
 
+        if not self._is_auth_failed():
+            self._set_error(None)
+
         async def _run() -> Tuple[List[Dict[str, Any]], bool]:
+            import asyncio
+
             sess, close_ephemeral = await _acquire_session()
             snapshots: List[Dict[str, Any]] = []
             ok_all = True
             try:
                 for chunk_keys in chunks:
                     url = f"{_UPSTOX_API_BASE}/v2/market-quote/quotes?instrument_key={_url_quote(chunk_keys, safe=',|')}"
-                    resp = await sess.get(url, headers=headers, timeout=timeout)
-                    code = int(resp.status_code)
-                    if code in (401, 403):
-                        self._set_error(
-                            "Upstox access token expired or invalid (HTTP 401/403). Generate a fresh daily token.",
-                            auth_failed=True,
-                        )
-                        return [], False
-                    if code == 429:
-                        self._set_error("Upstox API rate limit hit (HTTP 429); retrying briefly.")
+                    chunk_ok = False
+                    for attempt in range(2):
+                        resp = await sess.get(url, headers=headers, timeout=timeout)
+                        code = int(resp.status_code)
+                        if code in (401, 403):
+                            self._set_error(
+                                "Upstox access token expired or invalid (HTTP 401/403). Generate a fresh daily token.",
+                                auth_failed=True,
+                            )
+                            return [], False
+                        if code == 429:
+                            self._set_error("Upstox API rate limit hit (HTTP 429); retrying briefly.")
+                            if attempt == 0:
+                                await asyncio.sleep(1.25)
+                                continue
+                            break
+                        if code != 200:
+                            if attempt == 0 and code >= 500:
+                                await asyncio.sleep(0.5)
+                                continue
+                            break
+                        snapshots.extend(_parse_upstox_batch_quotes(decode_json_response(resp), key_to_sym, today))
+                        chunk_ok = True
+                        break
+                    if not chunk_ok:
                         ok_all = False
-                        continue
-                    if code != 200:
-                        ok_all = False
-                        continue
-                    snapshots.extend(_parse_upstox_batch_quotes(decode_json_response(resp), key_to_sym, today))
+                if ok_all and not self._is_auth_failed():
+                    self._set_error(None)
                 return snapshots, ok_all
             finally:
                 if close_ephemeral:
@@ -409,9 +428,11 @@ class UpstoxProvider:
             "Authorization": f"Bearer {self.access_token}",
         }
         limiter_key = f"upstox:{secret_fingerprint(self.access_token)}"
+        if not self._is_auth_failed():
+            self._set_error(None)
 
         try:
-            return yahoo_client._run_coro_sync(
+            results, failed = yahoo_client._run_coro_sync(
                 lambda: fetch_json_urls_async(
                     sym_urls=sym_urls,
                     headers=headers,
@@ -419,6 +440,7 @@ class UpstoxProvider:
                     max_concurrency=_UPSTOX_MAX_CONCURRENCY,
                     max_per_sec=_UPSTOX_MAX_PER_SEC,
                     max_per_min=_UPSTOX_MAX_PER_MIN,
+                    max_per_30min=_UPSTOX_MAX_PER_30MIN,
                     limiter_key=limiter_key,
                     on_auth_error=lambda: self._set_error(
                         "Upstox access token expired or invalid (HTTP 401/403). Generate a fresh daily token.",
@@ -430,6 +452,11 @@ class UpstoxProvider:
                     should_abort=self._is_auth_failed,
                 )
             )
+            if self._is_auth_failed():
+                failed |= {sym for sym, _ in sym_urls if sym not in results}
+            elif not failed:
+                self._set_error(None)
+            return results, failed
         except Exception as exc:
             self._set_error(f"Upstox candle fetch error: {exc}")
             return {}, {sym for sym, _ in sym_urls}

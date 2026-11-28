@@ -45,9 +45,9 @@ _FIVEPAISA_BATCH_FEED_URL = f"{_FIVEPAISA_VENDOR_BASE}/V1/MarketFeed"
 _FIVEPAISA_OAUTH_URL = "https://dev-openapi.5paisa.com/WebVendorLogin/VLogin/Index"
 _FIVEPAISA_HISTORICAL_BASE = "https://openapi.5paisa.com/V2/historical"
 _FIVEPAISA_SUBSCRIPTION_KEY = "c89fab8d895a426d9e00db380b433027"
-_FIVEPAISA_MAX_CONCURRENCY = 16
-_FIVEPAISA_MAX_PER_SEC = 22    # 5paisa historical limit: 25 req/sec
-_FIVEPAISA_MAX_PER_MIN = 1200  # 5paisa historical limit: 1,500 req/min
+_FIVEPAISA_MAX_CONCURRENCY = 14
+_FIVEPAISA_MAX_PER_SEC = 18    # 5paisa historical limit: 25 req/sec (leave burst margin)
+_FIVEPAISA_MAX_PER_MIN = 1000  # 5paisa historical limit: 1,500 req/min
 _FIVEPAISA_BATCH_FEED_MAX = 50         # 5paisa V1/MarketFeed safe chunk size (vs Upstox 500)
 _FIVEPAISA_BATCH_FEED_CONCURRENCY = 5  # ~218 F&O stocks fit into 5 concurrent POST calls
 _FIVEPAISA_BATCH_FEED_PER_SEC = 10
@@ -392,6 +392,7 @@ class FivePaisaProvider:
     display_name: str = "5paisa Xstream"
     cache_namespace: str = "fivepaisa"
     supports_coalesced_range: bool = False
+    supports_replay_coalesced_range: bool = True
 
     def __init__(
         self,
@@ -566,6 +567,8 @@ class FivePaisaProvider:
                     except Exception:
                         return chunk_idx, [], False, True
 
+            if not self._is_auth_failed():
+                self._set_error(None)
             snapshots: List[Dict[str, Any]] = []
             retry_indices: List[int] = []
             ok_all = True
@@ -582,7 +585,7 @@ class FivePaisaProvider:
                             retry_indices.append(idx)
 
                 if retry_indices and not self._is_auth_failed():
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(1.25 if "429" in (self.get_last_error() or "") else 0.5)
                     wave2 = await asyncio.gather(*(_post_chunk(i) for i in retry_indices))
                     retried_ok = True
                     for _, chunk_snaps, ok, _ in wave2:
@@ -593,6 +596,8 @@ class FivePaisaProvider:
                     # Only clear wave1 failure if every failed chunk was retried and succeeded cleanly
                     ok_all = retried_ok and (len(retry_indices) == sum(1 for _, _, ok, _ in wave1 if not ok))
 
+                if ok_all and not self._is_auth_failed():
+                    self._set_error(None)
                 return snapshots, (ok_all and not self._is_auth_failed())
             finally:
                 if close_ephemeral:
@@ -645,6 +650,8 @@ class FivePaisaProvider:
             "Ocp-Apim-Subscription-Key": _FIVEPAISA_SUBSCRIPTION_KEY,
         }
         limiter_key = f"fivepaisa:{secret_fingerprint(self.client_code, self.access_token)}"
+        if not self._is_auth_failed():
+            self._set_error(None)
 
         try:
             results, failed = yahoo_client._run_coro_sync(
@@ -668,6 +675,8 @@ class FivePaisaProvider:
             )
             if self._is_auth_failed():
                 failed |= {sym for sym, _ in sym_urls if sym not in results}
+            elif not failed:
+                self._set_error(None)
             return results, failed
         except Exception as exc:
             self._set_error(f"5paisa candle fetch error: {exc}")

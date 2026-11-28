@@ -285,6 +285,43 @@ class OptimizationFixesTest(unittest.TestCase):
         self.assertEqual(len(retry_urls), 2)
         self.assertNotEqual(retry_urls[0].split("/")[2], retry_urls[1].split("/")[2])
 
+        # Verify Retry-After backoff path on HTTP 429 with .headers
+        sleep_calls = []
+
+        class _RateLimitHdrSess(FakeAsyncSession):
+            async def get(self, url, params=None, timeout=10):
+                if "RETRYHDR.NS" in url:
+                    seen = [u for u, _ in calls if "RETRYHDR.NS" in u]
+                    calls.append((url, params))
+                    if len(seen) == 0:
+                        r = FakeAsyncResponse(429)
+                        r.headers = {"Retry-After": "2"}
+                        return r
+                    return FakeAsyncResponse(200, payload=valid_payload)
+                return await super().get(url, params=params, timeout=timeout)
+
+        async def _rec_sleep(secs):
+            sleep_calls.append(secs)
+
+        curl_hdr_mod = types.ModuleType("curl_cffi")
+        curl_hdr_req = types.ModuleType("curl_cffi.requests")
+        curl_hdr_req.AsyncSession = _RateLimitHdrSess
+        curl_hdr_mod.requests = curl_hdr_req
+
+        with (
+            patch.dict(sys.modules, {"curl_cffi": curl_hdr_mod, "curl_cffi.requests": curl_hdr_req}),
+            patch.object(asyncio, "Lock", return_value=DummyAsyncCtx()),
+            patch.object(asyncio, "Semaphore", side_effect=lambda *a: DummyAsyncCtx()),
+            patch.object(asyncio, "gather", side_effect=dummy_gather),
+            patch.object(asyncio, "sleep", side_effect=_rec_sleep),
+        ):
+            res_hdr, fail_hdr = run_coro_no_loop(
+                yc._fetch_charts_async(tasks=[("RETRYHDR.NS", "1d")], interval="1m", max_concurrency=8)
+            )
+        self.assertIn("RETRYHDR.NS", res_hdr)
+        self.assertEqual(fail_hdr, set())
+        self.assertTrue(any(s >= 1.5 for s in sleep_calls))
+
     def test_fetch_market_data_falls_back_to_yfinance_for_failed_symbols(self):
         fb_bundle = {"ts_sec": [1000], "open": [10.0], "high": [11.0], "low": [9.0], "close": [10.5], "volume": [100]}
         fb_df = MagicMock()

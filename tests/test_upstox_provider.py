@@ -406,6 +406,140 @@ class UpstoxProviderTest(unittest.TestCase):
             self.assertTrue(sb_mod.enforce_market_hours_shutdown())
         self.assertEqual(stopped, ["yes"])
 
+    def test_replay_coalesced_range_for_upstox_and_fivepaisa_plus_429_recovery_clears_error(self):
+        import glob
+        import providers.fivepaisa.provider as fp_mod
+
+        self.assertTrue(up_mod.UpstoxProvider.supports_replay_coalesced_range)
+        self.assertTrue(fp_mod.FivePaisaProvider.supports_replay_coalesced_range)
+        self.assertFalse(up_mod.UpstoxProvider.supports_coalesced_range)
+        self.assertFalse(fp_mod.FivePaisaProvider.supports_coalesced_range)
+
+        # 1. Shared rate limiter tracks 30m cap & shared penalize cooldown
+        limiter = hr_mod.AsyncSlidingRateLimiter(max_per_sec=10, max_per_min=100, max_per_30min=500)
+        self.assertGreater(asyncio.run(limiter.penalize(0.6)), 0.0)
+        self.assertGreater(limiter.remaining_cooldown(), 0.0)
+
+        # 2. HTTP 429 with Retry-After recovers in Wave 2/3 and clears provider error; persistent 429 retains it
+        class _FakeResp:
+            def __init__(self, code, payload, headers=None):
+                self.status_code = code
+                self._payload = payload
+                self.headers = headers or {}
+                self.content = json.dumps(payload).encode("utf-8")
+
+            def json(self):
+                return self._payload
+
+        def _run_fetch_with_codes(codes):
+            idx = {"i": 0}
+
+            class _FakeSess:
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *args):
+                    return False
+
+                async def get(self, url, headers=None, timeout=10):
+                    pos = min(idx["i"], len(codes) - 1)
+                    idx["i"] += 1
+                    c = codes[pos]
+                    if c == 429:
+                        return _FakeResp(429, {}, headers={"Retry-After": "0.5"})
+                    return _FakeResp(
+                        200,
+                        {"status": "success", "data": {"candles": [["2026-11-27T09:15:00+05:30", 10, 11, 9, 10.5, 500, 0]]}},
+                    )
+
+            prov_rl = up_mod.UpstoxProvider("tok_rl", use_live_ws=False, eq_map={"RELIANCE": "NSE_EQ|1"})
+
+            async def _noop_sleep(_s):
+                return None
+
+            def _direct_coro(coro_fn):
+                return asyncio.run(coro_fn())
+
+            with (
+                patch("curl_cffi.requests.AsyncSession", return_value=_FakeSess()),
+                patch("providers.common.http_runtime.yahoo_client._ASYNC_LOOP", new=None),
+                patch.object(up_mod.yahoo_client, "_run_coro_sync", side_effect=_direct_coro),
+                patch("asyncio.sleep", side_effect=_noop_sleep),
+            ):
+                return prov_rl, prov_rl.fetch_bars([("RELIANCE.NS", "1d")], interval="1m")
+
+        prov_ok, (res_ok, fail_ok) = _run_fetch_with_codes([429, 429, 200])  # recovers on Wave 3!
+        self.assertIn("RELIANCE.NS", res_ok)
+        self.assertEqual(fail_ok, set())
+        self.assertIsNone(prov_ok.get_last_error())
+
+        prov_bad, (res_bad, fail_bad) = _run_fetch_with_codes([429, 429, 429])  # fails all waves -> retains error
+        self.assertEqual(res_bad, {})
+        self.assertEqual(fail_bad, {"RELIANCE.NS"})
+        self.assertIn("429", prov_bad.get_last_error() or "")
+
+        # 3. Cold replay scan coalesces (prev_day -> tomorrow) into ONE fetch_bars call on Upstox & 5paisa
+        sat_dt = h.IST.localize(datetime(2026, 11, 28, 11, 0))
+        prev_day = date(2026, 11, 26)
+        ts_26_1 = int(h.IST.localize(datetime(2026, 11, 26, 9, 15)).timestamp())
+        ts_26_2 = int(h.IST.localize(datetime(2026, 11, 26, 15, 29)).timestamp())
+        ts_27_1 = int(h.IST.localize(datetime(2026, 11, 27, 9, 15)).timestamp())
+        ts_27_2 = int(h.IST.localize(datetime(2026, 11, 27, 15, 29)).timestamp())
+        combined_bundle = {
+            "ts_sec": np.array([ts_26_1, ts_26_2, ts_27_1, ts_27_2], dtype=np.int64),
+            "open": np.array([100.0, 101.0, 102.0, 105.0], dtype=np.float64),
+            "high": np.array([101.0, 102.0, 104.0, 106.0], dtype=np.float64),
+            "low": np.array([99.0, 100.0, 101.0, 104.0], dtype=np.float64),
+            "close": np.array([100.5, 101.5, 103.0, 105.5], dtype=np.float64),
+            "volume": np.array([1000.0, 1000.0, 2000.0, 3000.0], dtype=np.float64),
+        }
+
+        class _FakeSatDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return sat_dt
+
+        for idx, prov_cls in enumerate((up_mod.UpstoxProvider, fp_mod.FivePaisaProvider)):
+            ns = f"coalesce_replay_{idx}_{os.getpid()}"
+            prov_obj = (
+                prov_cls("tok_c", use_live_ws=False, eq_map={"RELIANCE": "NSE_EQ|1"})
+                if prov_cls is up_mod.UpstoxProvider
+                else prov_cls("tok_c", use_live_ws=False, eq_map={"RELIANCE": "2885"}, user_key="UKEY")
+            )
+            prov_obj.cache_namespace = ns
+            fetch_calls = []
+
+            def _fake_bars(symbol_periods, interval="1m", max_workers=8, start=None, end=None, chunk_size=None, symbol_ranges=None):
+                fetch_calls.append((list(symbol_periods), start, end, symbol_ranges))
+                return {"RELIANCE.NS": combined_bundle}, set()
+
+            cache_key = bc.make_cache_key(prev_day, "1m", ns)
+            try:
+                with (
+                    patch.object(scanner, "datetime", _FakeSatDatetime),
+                    patch.object(scanner, "get_holidays", return_value=set()),
+                    patch.object(h, "get_holidays", return_value=set()),
+                    patch.object(scanner, "is_market_open", return_value=False),
+                    patch.object(prov_obj, "fetch_bars", side_effect=_fake_bars),
+                ):
+                    df = scanner.run_scan(["RELIANCE.NS"], min_ratio=0.0, min_volume=0, interval="1m", provider=prov_obj)
+
+                self.assertEqual(len(fetch_calls), 1, f"{prov_cls.__name__} should coalesce cold replay into 1 fetch_bars call")
+                self.assertEqual(fetch_calls[0][3], {"RELIANCE.NS": ("2026-11-26", "2026-11-28")})
+                self.assertEqual(len(df), 1)
+                self.assertEqual(df.iloc[0]["Vol_Today"], 5000)
+                self.assertEqual(df.iloc[0]["Vol_Prev_Same_Time"], 2000)
+                self.assertAlmostEqual(df.iloc[0]["Ratio"], 2.5)
+            finally:
+                with bc._CACHE_LOCK:
+                    bc._PREV_DAY_MEMORY_CACHE.pop(cache_key, None)
+                    bc._NEG_CACHE.pop(cache_key, None)
+                for p in glob.glob(str(bc.CACHE_DIR / f"prev_baseline_{ns}_*.pkl")):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
