@@ -20,7 +20,7 @@ from urllib.parse import urlencode
 
 import numpy as np
 
-from core.holidays import is_market_open
+from core.holidays import is_market_open, is_wss_active_window
 from core.utils import IST, decode_json_response, localize_ist
 from providers.base import ArrayBundle, TodaySummary
 from providers.common.http_runtime import fetch_json_urls_async
@@ -41,6 +41,8 @@ _FIVEPAISA_MAX_CONCURRENCY = 16
 _FIVEPAISA_MAX_PER_SEC = 22    # 5paisa limit: 25 req/sec
 _FIVEPAISA_MAX_PER_MIN = 1200  # 5paisa limit: 1,500 req/min
 _SEED_STABLE_WAIT_SECONDS = 1.0
+_MARKET_OPEN_WALL = time(9, 15)
+_MARKET_CLOSE_WALL = time(15, 30)
 _PRE_SEED_SKIP_CUTOFF = time(9, 20)
 _EMPTY_TODAY_COOLDOWN_SEC = 30.0
 
@@ -417,6 +419,10 @@ class FivePaisaProvider:
 
         now_ist = datetime.combine(today, cutoff, tzinfo=IST)
         market_open_now = is_market_open(now_ist, background_refresh=True)
+        if _MARKET_OPEN_WALL <= cutoff <= _MARKET_CLOSE_WALL:
+            wss_active_now = market_open_now
+        else:
+            wss_active_now = is_wss_active_window(now_ist, background_refresh=True)
         cooldown_key = (secret_fingerprint(self.client_code, self.access_token), today)
 
         if not self.use_live_ws:
@@ -446,8 +452,9 @@ class FivePaisaProvider:
         meta["mapped"] = len(sym_to_code)
         meta["unmapped"] = len(symbols) - len(sym_to_code)
 
+        # Only connect MarketFeedV3 WebSocket inside 09:05-15:35 IST on trading days; auto-stop off-hours
         stream = get_or_start_fivepaisa_stream(
-            self.access_token, self.client_code, code_to_sym, auto_start=True
+            self.access_token, self.client_code, code_to_sym, auto_start=wss_active_now
         )
         if stream is None:
             return None, meta
@@ -509,6 +516,8 @@ class FivePaisaProvider:
             self._set_error(status["error"])
 
         if summaries:
+            if not wss_active_now and meta.get("mode") == "wss":
+                meta["mode"] = "post_close_cached"
             return summaries, meta
 
         # If we already fetched today's bars cleanly and got nothing valid for today, skip duplicate fetch_bars

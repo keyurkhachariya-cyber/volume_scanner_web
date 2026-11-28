@@ -5,19 +5,26 @@ intraday REST seeding, and TodaySummary builder used by broker stream adapters.
 
 from __future__ import annotations
 
+import atexit
 from datetime import date, time
 import hashlib
 import math
 import threading
 import time as pytime
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
+from core.holidays import is_wss_active_window
 from core.utils import ist_epoch_sec, time_to_sec
 from providers.base import ArrayBundle, TodaySummary
 
 MARKET_OPEN_SEC = 9 * 3600 + 15 * 60
+_GUARD_INTERVAL_SEC = 30.0
+_GUARD_LOCK = threading.Lock()
+_GUARD_STOPPERS: Dict[str, Callable[[], None]] = {}
+_GUARD_STOP_EVENT = threading.Event()
+_GUARD_THREAD: Optional[threading.Thread] = None
 
 
 def to_float(val: Any) -> Optional[float]:
@@ -335,3 +342,60 @@ class BaseMarketStream:
                     vol_burst_15m,
                 )
         return out
+
+
+def enforce_market_hours_shutdown() -> bool:
+    """Stop all registered live WebSocket streams if outside the NSE WSS window; returns True if stopped."""
+    if is_wss_active_window(background_refresh=True):
+        return False
+    with _GUARD_LOCK:
+        stoppers = list(_GUARD_STOPPERS.values())
+        _GUARD_STOPPERS.clear()
+    for stop_fn in stoppers:
+        try:
+            stop_fn()
+        except Exception:
+            pass
+    return bool(stoppers)
+
+
+def _stream_guard_loop() -> None:
+    while not _GUARD_STOP_EVENT.wait(_GUARD_INTERVAL_SEC):
+        with _GUARD_LOCK:
+            has_streams = bool(_GUARD_STOPPERS)
+        if not has_streams:
+            break
+        if enforce_market_hours_shutdown():
+            break
+
+
+def register_stream_stopper(name: str, stop_fn: Callable[[], None]) -> None:
+    """Register a live WebSocket stream to be auto-disconnected once market closes (> 15:35 IST)."""
+    global _GUARD_THREAD
+    with _GUARD_LOCK:
+        _GUARD_STOPPERS[name] = stop_fn
+        if _GUARD_THREAD is None or not _GUARD_THREAD.is_alive():
+            _GUARD_STOP_EVENT.clear()
+            _GUARD_THREAD = threading.Thread(
+                target=_stream_guard_loop,
+                name="wss_market_close_guard",
+                daemon=True,
+            )
+            _GUARD_THREAD.start()
+
+
+def unregister_stream_stopper(name: str) -> None:
+    """Unregister a WebSocket stream stopper after manual or scheduled disconnect."""
+    with _GUARD_LOCK:
+        _GUARD_STOPPERS.pop(name, None)
+        if not _GUARD_STOPPERS:
+            _GUARD_STOP_EVENT.set()
+
+
+def _shutdown_stream_guard() -> None:
+    _GUARD_STOP_EVENT.set()
+    with _GUARD_LOCK:
+        _GUARD_STOPPERS.clear()
+
+
+atexit.register(_shutdown_stream_guard)

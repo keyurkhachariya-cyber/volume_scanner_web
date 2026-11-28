@@ -236,6 +236,18 @@ class HolidaysFixesTest(unittest.TestCase):
         self.assertEqual(dates, {date(2026, 11, 24), date(2026, 11, 25)})
         h._NSEI_SESSION = None
 
+    def test_is_wss_active_window_boundaries(self):
+        # Friday 2026-11-27 (trading day)
+        with patch.object(h, "get_holidays", return_value={date(2026, 11, 24)}):
+            self.assertFalse(h.is_wss_active_window(datetime(2026, 11, 27, 9, 4, tzinfo=h.IST)))
+            self.assertTrue(h.is_wss_active_window(datetime(2026, 11, 27, 9, 5, tzinfo=h.IST)))
+            self.assertTrue(h.is_wss_active_window(datetime(2026, 11, 27, 15, 30, tzinfo=h.IST)))
+            self.assertTrue(h.is_wss_active_window(datetime(2026, 11, 27, 15, 35, tzinfo=h.IST)))
+            self.assertFalse(h.is_wss_active_window(datetime(2026, 11, 27, 15, 36, tzinfo=h.IST)))
+            # Weekend & NSE holiday stay False even at 10:00 AM
+            self.assertFalse(h.is_wss_active_window(datetime(2026, 11, 28, 10, 0, tzinfo=h.IST)))
+            self.assertFalse(h.is_wss_active_window(datetime(2026, 11, 24, 10, 0, tzinfo=h.IST)))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

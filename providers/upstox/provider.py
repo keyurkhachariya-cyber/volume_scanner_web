@@ -17,7 +17,7 @@ from urllib.parse import quote as _url_quote, urlencode
 
 import numpy as np
 
-from core.holidays import is_market_open
+from core.holidays import is_market_open, is_wss_active_window
 from core.utils import IST, decode_json_response, localize_ist, time_to_sec
 from providers.base import ArrayBundle, TodaySummary
 from providers.common.http_runtime import fetch_json_urls_async
@@ -35,6 +35,7 @@ _UPSTOX_MAX_PER_SEC = 42   # Upstox v3 limit: 50 req/sec
 _UPSTOX_MAX_PER_MIN = 460  # Upstox v3 limit: 500 req/min
 _UPSTOX_BATCH_QUOTE_MAX = 500
 _MARKET_OPEN_WALL = time(9, 15)
+_MARKET_CLOSE_WALL = time(15, 30)
 _PRE_SEED_SKIP_CUTOFF = time(9, 20)
 _EMPTY_TODAY_COOLDOWN_SEC = 30.0
 
@@ -506,6 +507,10 @@ class UpstoxProvider:
         tok_fp = secret_fingerprint(self.access_token)
         now_ist = datetime.combine(today, cutoff, tzinfo=IST)
         market_open_now = is_market_open(now_ist, background_refresh=True)
+        if _MARKET_OPEN_WALL <= cutoff <= _MARKET_CLOSE_WALL:
+            wss_active_now = market_open_now
+        else:
+            wss_active_now = is_wss_active_window(now_ist, background_refresh=True)
 
         # Pure REST mode: single 500-key Batch Quote request (~0.2s vs 218 candle GETs)
         if not self.use_live_ws:
@@ -529,7 +534,8 @@ class UpstoxProvider:
             meta["mode"] = "rest_fallback"
             return None, meta
 
-        stream = get_or_start_upstox_stream(self.access_token, key_to_sym, auto_start=True)
+        # Only start/keep WebSocket connected inside 09:05-15:35 IST on trading days; auto-stop off-hours
+        stream = get_or_start_upstox_stream(self.access_token, key_to_sym, auto_start=wss_active_now)
         if stream is None:
             return None, meta
 
@@ -579,6 +585,8 @@ class UpstoxProvider:
             self._set_error(status["error"])
 
         if summaries:
+            if not wss_active_now and meta.get("mode") == "wss":
+                meta["mode"] = "post_close_cached"
             return summaries, meta
 
         meta["mode"] = "rest_fallback"

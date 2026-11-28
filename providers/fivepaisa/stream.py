@@ -15,11 +15,14 @@ import threading
 import time as pytime
 from typing import Any, Dict, List, Optional, Sequence
 
+from core.holidays import is_wss_active_window
 from core.utils import IST, ist_epoch_sec, localize_ist
 from providers.common.stream_base import (
     BaseMarketStream,
+    register_stream_stopper,
     secret_fingerprint,
     to_float,
+    unregister_stream_stopper,
 )
 
 try:
@@ -279,7 +282,9 @@ class FivePaisaMarketStream(BaseMarketStream):
                         self._ws_app = None
                     should_stop = self._stop_requested
 
-            if should_stop:
+            if should_stop or not is_wss_active_window(background_refresh=True):
+                with self._state_lock:
+                    self._started = False
                 break
 
             attempts += 1
@@ -426,6 +431,13 @@ def get_or_start_fivepaisa_stream(
     stream.ensure_instruments(key_to_sym)
     if auto_start:
         stream.start()
+        register_stream_stopper("fivepaisa", stop_fivepaisa_stream)
+    else:
+        stream.stop()
+        with _STREAM_LOCK:
+            has_started = any(getattr(s, "_started", False) for s in _ACTIVE_STREAMS.values())
+        if not has_started:
+            unregister_stream_stopper("fivepaisa")
     return stream
 
 
@@ -447,8 +459,11 @@ def stop_fivepaisa_stream(access_token: Optional[str] = None, client_code: Optio
         else:
             to_stop.extend(_ACTIVE_STREAMS.values())
             _ACTIVE_STREAMS.clear()
+        empty = not _ACTIVE_STREAMS
     for stream in to_stop:
         stream.stop()
+    if empty:
+        unregister_stream_stopper("fivepaisa")
 
 
 atexit.register(stop_fivepaisa_stream)

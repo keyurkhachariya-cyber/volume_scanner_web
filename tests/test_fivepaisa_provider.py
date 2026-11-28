@@ -308,6 +308,45 @@ class FivePaisaProviderTest(unittest.TestCase):
         self.assertEqual(m1["mode"], "closed_cached")
         self.assertEqual(m2["mode"], "closed_cached")
 
+    def test_after_market_disables_ws_autostart_and_serves_cached_closing_state(self):
+        today = date(2026, 11, 27)
+        tok = _make_fake_jwt({"ClientCode": "50011110", "RedirectServer": "C"})
+        close_sec = int(h.IST.localize(datetime(2026, 11, 27, 15, 29)).timestamp())
+        stream = fs_mod.FivePaisaMarketStream(tok, "50011110", {"2885": "RELIANCE.NS"})
+        stream._started = True
+        stream._connected = True
+        stream._quotes_by_sym["RELIANCE.NS"] = {
+            "feed_date": today,
+            "ltp": 1540.0,
+            "day_open": 1505.0,
+            "day_high": 1545.0,
+            "day_low": 1500.0,
+            "atp": None,
+            "vtt": 88000.0,
+            "last_vtt": 88000.0,
+            "last_ts_sec": close_sec,
+            "minute_vols": {},
+            "pv_sum": 88000.0 * 1525.0,
+            "pv_vol": 88000.0,
+        }
+        fp_key = fs_mod.secret_fingerprint("50011110", tok)
+        with fs_mod._STREAM_LOCK:
+            fs_mod._ACTIVE_STREAMS[fp_key] = stream
+
+        prov = fp_mod.FivePaisaProvider(tok, use_live_ws=True, eq_map={"RELIANCE": "2885"})
+        with (
+            patch.object(fp_mod, "is_market_open", return_value=False),
+            patch.object(fp_mod, "is_wss_active_window", return_value=False),
+            patch.object(stream, "stop", wraps=stream.stop) as mock_stop,
+        ):
+            summaries, meta = prov.fetch_today_summaries(["RELIANCE.NS"], today, time(16, 15), "1m")
+
+        self.assertEqual(mock_stop.call_count, 1)
+        self.assertFalse(stream._started)
+        self.assertEqual(meta["mode"], "post_close_cached")
+        self.assertIn("RELIANCE.NS", summaries)
+        self.assertEqual(summaries["RELIANCE.NS"][0], 88000.0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

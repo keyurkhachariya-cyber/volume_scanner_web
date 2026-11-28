@@ -16,8 +16,10 @@ from core.utils import IST
 from providers.common.stream_base import (
     BaseMarketStream,
     compute_burst_from_minute_buckets as _compute_burst_from_minute_buckets,
+    register_stream_stopper,
     secret_fingerprint as _token_fingerprint,
     to_float as _to_float,
+    unregister_stream_stopper,
 )
 
 _STREAM_LOCK = threading.Lock()
@@ -247,6 +249,13 @@ def get_or_start_upstox_stream(
     stream.ensure_instruments(key_to_sym)
     if auto_start:
         stream.start()
+        register_stream_stopper("upstox", stop_upstox_stream)
+    else:
+        stream.stop()
+        with _STREAM_LOCK:
+            has_started = any(getattr(s, "_started", False) for s in _ACTIVE_STREAMS.values())
+        if not has_started:
+            unregister_stream_stopper("upstox")
     return stream
 
 
@@ -262,8 +271,11 @@ def stop_upstox_stream(access_token: Optional[str] = None) -> None:
         else:
             to_stop.extend(_ACTIVE_STREAMS.values())
             _ACTIVE_STREAMS.clear()
+        empty = not _ACTIVE_STREAMS
     for stream in to_stop:
         stream.stop()
+    if empty:
+        unregister_stream_stopper("upstox")
 
 
 atexit.register(stop_upstox_stream)

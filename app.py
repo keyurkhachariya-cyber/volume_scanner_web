@@ -9,7 +9,7 @@ import os
 import streamlit as st
 import pandas as pd
 
-from core.holidays import get_holidays, is_market_open, get_previous_trading_day, IST
+from core.holidays import get_holidays, is_market_open, is_wss_active_window, get_previous_trading_day, IST
 from core.oi import OI_BUILDUP_OPTIONS, SIGNAL_BEARISH, SIGNAL_BULLISH
 from core.scanner import prune_cache, run_scan
 from core.universe import get_fno_universe
@@ -25,6 +25,7 @@ from providers import (
     stop_fivepaisa_stream,
     stop_upstox_stream,
 )
+from providers.common.stream_base import enforce_market_hours_shutdown
 from ui.screener_filters import (
     MARKET_CLOSE_TIME,
     filter_and_sort_results,
@@ -48,9 +49,6 @@ st.set_page_config(
 
 st.title("📈 F&O Relative Volume Scanner")
 st.caption("Today's volume till now vs Previous trading day volume till same clock time (IST)")
-
-with st.expander("📘 Column & Momentum Guide — How to Use", expanded=False):
-    st.markdown(COLUMN_GUIDE_MARKDOWN)
 
 
 @st.cache_resource
@@ -673,7 +671,19 @@ def render_scanner(
                 "Updating in the background without full-page reloads."
             )
         else:
-            info_slot.caption("⏸️ **Auto-refresh paused** (market closed). Manual **Scan Now** still works anytime.")
+            wss_off_hours = not is_wss_active_window(now_after, background_refresh=True)
+            if wss_off_hours:
+                enforce_market_hours_shutdown()
+            broker_ws_selected = (
+                (data_source == "Upstox v3" and upstox_live_ws)
+                or (data_source == "5paisa Xstream" and fivepaisa_live_ws)
+            )
+            if broker_ws_selected and wss_off_hours:
+                info_slot.caption(
+                    "⏸️ **Auto-refresh & Live WSS paused** (market closed). Manual **Scan Now** still works via REST/Batch Quote."
+                )
+            else:
+                info_slot.caption("⏸️ **Auto-refresh paused** (market closed). Manual **Scan Now** still works anytime.")
 
     # Client-side filtering & sorting on the cached scan snapshot for the active source & interval
     raw_df = st.session_state.results_by_interval.get(snapshot_key, pd.DataFrame())
@@ -807,6 +817,8 @@ def render_scanner(
                     prov_note = f" | {p_name} {ws_badge} ({prov_meta.get('ticks', 0)} ticks)"
                 elif mode == "batch_quote":
                     prov_note = f" | {p_name} ⚡ Batch Quote"
+                elif mode == "post_close_cached":
+                    prov_note = f" | {p_name} Post-Close Cached"
                 elif mode == "rest_seed":
                     prov_note = f" | {p_name} Seeded REST"
                 else:
@@ -893,6 +905,8 @@ scanner_fragment(
 )
 
 st.markdown("---")
+with st.expander("📘 Column & Momentum Guide — How to Use", expanded=False):
+    st.markdown(COLUMN_GUIDE_MARKDOWN)
 st.caption(
     "Data sources: Yahoo Finance, Upstox v3, or 5paisa Xstream (intraday OHLCV / live WSS) & NSE India (F&O OI & holidays). "
     "For educational / research purposes only — not investment advice."

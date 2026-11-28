@@ -359,6 +359,53 @@ class UpstoxProviderTest(unittest.TestCase):
         self.assertEqual(failed, set())
         self.assertIn("RELIANCE.NS", out)
 
+    def test_after_market_auto_stops_ws_and_market_guard_shutdown(self):
+        import providers.common.stream_base as sb_mod
+
+        today = date(2026, 11, 27)
+        close_sec = int(h.IST.localize(datetime(2026, 11, 27, 15, 29)).timestamp())
+        stream = us_mod.UpstoxMarketStream("tok_evening", {"NSE_EQ|1": "RELIANCE.NS"})
+        stream._started = True
+        stream._connected = True
+        stream._quotes_by_sym["RELIANCE.NS"] = {
+            "feed_date": today,
+            "ltp": 1525.0,
+            "day_open": 1500.0,
+            "day_high": 1530.0,
+            "day_low": 1495.0,
+            "atp": 1515.0,
+            "vtt": 95000.0,
+            "last_vtt": 95000.0,
+            "last_ts_sec": close_sec,
+            "minute_vols": {},
+            "pv_sum": 0.0,
+            "pv_vol": 0.0,
+        }
+        with us_mod._STREAM_LOCK:
+            us_mod._ACTIVE_STREAMS[us_mod._token_fingerprint("tok_evening")] = stream
+
+        prov = up_mod.UpstoxProvider("tok_evening", use_live_ws=True, eq_map={"RELIANCE": "NSE_EQ|1"})
+        with (
+            patch.object(up_mod, "is_market_open", return_value=False),
+            patch.object(up_mod, "is_wss_active_window", return_value=False),
+            patch.object(stream, "stop", wraps=stream.stop) as mock_stop,
+        ):
+            summaries, meta = prov.fetch_today_summaries(["RELIANCE.NS"], today, time(16, 10), "1m")
+
+        self.assertEqual(mock_stop.call_count, 1)
+        self.assertFalse(stream._started)
+        self.assertEqual(meta["mode"], "post_close_cached")
+        self.assertIn("RELIANCE.NS", summaries)
+        self.assertEqual(summaries["RELIANCE.NS"][0], 95000.0)
+
+        # Guard helper stops all registered streams once outside NSE WSS window
+        stopped = []
+        with sb_mod._GUARD_LOCK:
+            sb_mod._GUARD_STOPPERS["test_after_close"] = lambda: stopped.append("yes")
+        with patch.object(sb_mod, "is_wss_active_window", return_value=False):
+            self.assertTrue(sb_mod.enforce_market_hours_shutdown())
+        self.assertEqual(stopped, ["yes"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

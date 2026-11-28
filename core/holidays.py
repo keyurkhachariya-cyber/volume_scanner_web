@@ -393,3 +393,18 @@ def is_market_open(now: datetime | None = None, background_refresh: bool = False
     t = now.time()
     return (t >= datetime.strptime("09:15", "%H:%M").time() and
             t <= datetime.strptime("15:30", "%H:%M").time())
+
+
+def is_wss_active_window(now: datetime | None = None, background_refresh: bool = False) -> bool:
+    """
+    Check whether live WebSocket streams should stay connected:
+    Mon-Fri (excluding NSE holidays), 09:05 - 15:35 IST (5m grace after 15:30 close).
+    """
+    if now is None:
+        now = datetime.now(IST)
+    holidays = get_holidays(background_refresh=background_refresh)
+    if now.weekday() >= 5 or now.date() in holidays:
+        return False
+    t = now.time()
+    return (t >= datetime.strptime("09:05", "%H:%M").time() and
+            t <= datetime.strptime("15:35", "%H:%M").time())
