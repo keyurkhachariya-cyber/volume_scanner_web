@@ -67,7 +67,7 @@ python -m unittest discover -s tests -v
 ## Project Structure
 - `app.py` — Streamlit web entrypoint (`streamlit run app.py`)
 - `core/` — Core scanner engine (`scanner.py`, `baseline_cache.py`, `holidays.py`, `oi.py`, `universe.py`, `utils.py`)
-- `ui/` — UI column schemas, filters, sorting, and row styling (`table_config.py`, `screener_filters.py`)
+- `ui/` — UI column schemas, filters, sorting, row styling, and broker auth helpers (`table_config.py`, `screener_filters.py`, `auth_helpers.py`)
 - `providers/` — Pluggable `MarketDataProvider` adapters organized by vendor:
   - `base.py` — `MarketDataProvider` protocol & shared type aliases
   - `common/` — Shared persistent HTTP/2 runtime (`http_runtime.py`) & live stream state (`stream_base.py`)

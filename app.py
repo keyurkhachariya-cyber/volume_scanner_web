@@ -414,16 +414,6 @@ def _clear_fivepaisa_token() -> None:
         save_local_broker_auth("fivepaisa", {}, clear_token=True)
 
 
-def _oauth_tab_sync_poller(provider: str, nonce: str) -> None:
-    """Poll silently every 2s inside origin tab until the OAuth redirect tab completes login."""
-    if _consume_origin_tab_oauth(provider, nonce):
-        st.rerun()
-    st.caption("⏳ Waiting for login tab to complete (auto-syncs when ready)...")
-
-
-_sync_oauth_tab_fragment = st.fragment(_oauth_tab_sync_poller, run_every=2)
-
-
 def _render_same_tab_login_link(label: str, url: str, link_id: str) -> None:
     """Render a full-width button-styled link targeting _top so OAuth login stays in one tab."""
     safe_id = html.escape(link_id, quote=True)
@@ -545,6 +535,353 @@ def _render_redirect_uri_with_apply(
     return val
 
 
+def _render_upstox_sidebar_auth(wss_window_open: bool, detected_redirect_uri: str) -> tuple[str, bool]:
+    """Render Upstox v3 token input, WSS toggle, and OAuth daily login helper in sidebar."""
+    upstox_token = _render_token_input_with_clear(
+        label="Upstox Access Token (Daily)",
+        state_key="upstox_access_token",
+        widget_key="_w_upstox_token",
+        placeholder="Paste today's Upstox access_token",
+        help_text="Upstox tokens expire daily. Paste today's token or use the OAuth Login Helper below.",
+        clear_callback=_clear_upstox_token,
+        clear_key="clear_upstox_token_btn",
+        clear_help="Clear saved Upstox token",
+    )
+    if upstox_token:
+        st.session_state._upstox_cleared_explicitly = False
+    upstox_notice = st.session_state.pop("_upstox_login_notice", None)
+    if upstox_notice:
+        st.success(upstox_notice)
+    elif upstox_token:
+        st.caption("✅ Access token loaded for today's session")
+    else:
+        st.caption("⚠️ Access token required — paste above or sign in below")
+
+    upstox_live_ws = st.checkbox(
+        "Stream Live WSS (MarketDataStreamerV3)",
+        value=True,
+        help="Stream live full-quote ticks over WebSocket (zero REST polling once initialized).",
+    )
+    if not upstox_live_ws and upstox_token:
+        stop_upstox_stream(upstox_token)
+    elif upstox_live_ws:
+        st.caption(
+            "🟢 WSS active window (09:05–15:35 IST)"
+            if wss_window_open
+            else "⏸️ Market closed — auto-uses 1-call Batch Quote / cache"
+        )
+
+    with st.expander("🔑 Daily Login Helper (OAuth Code)", expanded=not bool(upstox_token)):
+        creds_ready = all(
+            bool(st.session_state.get(k, "").strip())
+            for k in ("_u_client_id", "_u_client_secret", "_u_redirect_uri")
+        )
+        edit_u_creds = not creds_ready or st.checkbox(
+            "Edit API credentials",
+            value=False,
+            key="_w_edit_upstox_creds",
+            help="API Key, Secret, and Redirect URI are loaded — check to view or modify them.",
+        )
+        if edit_u_creds:
+            u_cid = _sync_text_field("API Key (client_id)", "_u_client_id", "_w_u_client_id")
+            u_csec = _sync_text_field(
+                "API Secret", "_u_client_secret", "_w_u_client_secret", type="password"
+            )
+            u_redir = _render_redirect_uri_with_apply(
+                "Redirect URI", "_u_redirect_uri", "_w_u_redirect_uri", "_apply_u_redir_btn"
+            )
+        else:
+            u_cid = st.session_state.get("_u_client_id", "").strip()
+            u_csec = st.session_state.get("_u_client_secret", "").strip()
+            u_redir = st.session_state.get("_u_redirect_uri", detected_redirect_uri).strip()
+            st.caption("✅ API Key, Secret & Redirect URI loaded")
+
+        remember_local = _render_local_persist_toggle()
+        if remember_local:
+            save_local_broker_auth(
+                "upstox",
+                {
+                    "access_token": upstox_token,
+                    "client_id": u_cid,
+                    "client_secret": u_csec,
+                    "redirect_uri": u_redir,
+                },
+            )
+
+        if u_cid and u_redir:
+            u_state = register_oauth_handoff(
+                {"client_id": u_cid, "client_secret": u_csec, "redirect_uri": u_redir},
+                nonce=st.session_state.get("_u_oauth_nonce", ""),
+            )
+            st.session_state._u_oauth_nonce = u_state
+            login_url = build_upstox_login_url(u_cid, u_redir, state=u_state)
+            st.caption(f"Callback URL: `{u_redir}`")
+            _render_same_tab_login_link(
+                "1️⃣ Open Upstox Daily Login", login_url, "upstox_same_tab_login"
+            )
+        else:
+            st.caption("Fill API Key and Redirect URI to generate login link.")
+
+        u_code_raw = _sync_text_field(
+            "2️⃣ Auth Code or Full Redirect URL",
+            "_u_auth_code",
+            "_w_u_auth_code",
+            placeholder="Paste code or full ?code=... callback URL",
+            help="Accepts either the bare authorization code or the full callback URL after login.",
+        )
+        auto_up_exchange = bool(st.session_state.pop("_auto_exchange_upstox", False))
+        if auto_up_exchange and not (u_code_raw and u_cid and u_csec and u_redir):
+            st.info("Auth code captured from redirect URL — enter API credentials and click **Exchange Code for Token**.")
+
+        if st.button("Exchange Code for Token", width="stretch") or (
+            auto_up_exchange and u_code_raw and u_cid and u_csec and u_redir
+        ):
+            u_code = extract_oauth_param(u_code_raw, ("code",))
+            if not (u_code and u_cid and u_csec and u_redir):
+                st.warning("Fill API Key, API Secret, Redirect URI, and Auth Code.")
+            else:
+                with st.spinner("Exchanging Upstox authorization code..."):
+                    tok, err = exchange_upstox_auth_code(u_code, u_cid, u_csec, u_redir)
+                if tok:
+                    active_state = st.session_state.pop("_active_up_oauth_state", "")
+                    if active_state:
+                        store_completed_oauth_token(active_state, {"access_token": tok})
+                    if remember_local:
+                        save_local_broker_auth(
+                            "upstox",
+                            {
+                                "access_token": tok,
+                                "client_id": u_cid,
+                                "client_secret": u_csec,
+                                "redirect_uri": u_redir,
+                            },
+                        )
+                    st.session_state._pending_upstox_token = tok
+                    st.session_state._upstox_login_notice = "Upstox token saved for today's session — ready to scan."
+                    st.rerun()
+                else:
+                    st.error(err or "Upstox token exchange failed.")
+
+    return upstox_token, upstox_live_ws
+
+
+def _render_fivepaisa_sidebar_auth(wss_window_open: bool) -> tuple[str, str, bool]:
+    """Render 5paisa Xstream JWT input, WSS toggle, and TOTP/OAuth daily login helper in sidebar."""
+    fivepaisa_token = _render_token_input_with_clear(
+        label="5paisa Access Token (Daily)",
+        state_key="fivepaisa_access_token",
+        widget_key="_w_fivepaisa_token",
+        placeholder="Paste today's JWT access_token or use TOTP Login below",
+        help_text="5paisa JWT access tokens expire daily. Generate one via TOTP/PIN or OAuth below.",
+        clear_callback=_clear_fivepaisa_token,
+        clear_key="clear_fivepaisa_token_btn",
+        clear_help="Clear saved 5paisa token",
+    )
+    if fivepaisa_token:
+        st.session_state._fivepaisa_cleared_explicitly = False
+    jwt_info = inspect_fivepaisa_jwt(fivepaisa_token) if fivepaisa_token else {
+        "is_jwt": False,
+        "client_code": "",
+        "exp_ts": None,
+        "is_expired": False,
+        "exp_label": "",
+    }
+    if jwt_info["client_code"] and not st.session_state.get("fivepaisa_client_code", "").strip():
+        st.session_state.fivepaisa_client_code = jwt_info["client_code"]
+        st.session_state._w_fivepaisa_client_code = jwt_info["client_code"]
+
+    fivepaisa_client_code = _sync_text_field(
+        "5paisa Client Code",
+        "fivepaisa_client_code",
+        "_w_fivepaisa_client_code",
+        placeholder="e.g. 50011110 (auto-read from JWT)",
+        help="Required for MarketFeedV3 WebSocket subscriptions (auto-inferred from JWT if omitted).",
+    )
+    fivepaisa_notice = st.session_state.pop("_fivepaisa_login_notice", None)
+    if fivepaisa_notice:
+        st.success(fivepaisa_notice)
+    elif fivepaisa_token and jwt_info["is_expired"]:
+        st.warning(f"⚠️ 5paisa JWT expired ({jwt_info['exp_label']}) — generate a fresh token below.")
+    elif fivepaisa_token and jwt_info["exp_label"]:
+        st.caption(f"✅ JWT loaded · valid until {jwt_info['exp_label']}")
+    elif fivepaisa_token:
+        st.caption("✅ JWT token loaded for today's session")
+    else:
+        st.caption("⚠️ JWT token required — paste above or sign in below")
+
+    fivepaisa_live_ws = st.checkbox(
+        "Stream Live WSS (MarketFeedV3)",
+        value=True,
+        help="Stream live NSE MarketFeedV3 ticks over WebSocket (up to 3,000 scrips, 50/batch).",
+    )
+    if not fivepaisa_live_ws and fivepaisa_token:
+        stop_fivepaisa_stream(fivepaisa_token, fivepaisa_client_code)
+    elif fivepaisa_live_ws:
+        st.caption(
+            "🟢 WSS active window (09:05–15:35 IST)"
+            if wss_window_open
+            else "⏸️ Market closed — auto-uses cached / REST seed"
+        )
+
+    helper_expanded = (not bool(fivepaisa_token)) or bool(jwt_info["is_expired"])
+    with st.expander("🔑 Daily Login Helper (TOTP / OAuth)", expanded=helper_expanded):
+        fp_keys_ready = all(
+            bool(st.session_state.get(k, "").strip())
+            for k in ("_fp_user_key", "_fp_enc_key", "_fp_user_id")
+        )
+        edit_fp_creds = not fp_keys_ready or st.checkbox(
+            "Edit API keys",
+            value=False,
+            key="_w_edit_fp_creds",
+            help="User Key, Encryption Key, and User ID are loaded — check to view or modify them.",
+        )
+        if edit_fp_creds:
+            fp_user_key = _sync_text_field("User Key (VendorKey)", "_fp_user_key", "_w_fp_user_key")
+            fp_enc_key = _sync_text_field(
+                "Encryption Key", "_fp_enc_key", "_w_fp_enc_key", type="password"
+            )
+            fp_user_id = _sync_text_field("User ID", "_fp_user_id", "_w_fp_user_id")
+        else:
+            fp_user_key = st.session_state.get("_fp_user_key", "").strip()
+            fp_enc_key = st.session_state.get("_fp_enc_key", "").strip()
+            fp_user_id = st.session_state.get("_fp_user_id", "").strip()
+            st.caption("✅ User Key, Encryption Key & User ID loaded")
+
+        remember_local = _render_local_persist_toggle()
+        if remember_local:
+            save_local_broker_auth(
+                "fivepaisa",
+                {
+                    "access_token": fivepaisa_token,
+                    "client_code": fivepaisa_client_code,
+                    "user_key": fp_user_key,
+                    "encryption_key": fp_enc_key,
+                    "user_id": fp_user_id,
+                },
+            )
+
+        tab_totp, tab_oauth = st.tabs(["TOTP + PIN", "OAuth Redirect"])
+        with tab_totp:
+            if "_w_fp_totp_cc" not in st.session_state:
+                st.session_state._w_fp_totp_cc = (
+                    fivepaisa_client_code or _get_broker_secret("fivepaisa", "client_code")
+                )
+            fp_cc = st.text_input("Client Code", key="_w_fp_totp_cc").strip()
+            fp_pin = _sync_text_field("Trading PIN", "_fp_totp_pin", "_w_fp_totp_pin", type="password")
+            fp_totp_val = _sync_text_field(
+                "TOTP (6-digit code or Base32 Secret)",
+                "_fp_totp_secret",
+                "_w_fp_totp_secret",
+                type="password",
+            )
+            if fp_cc and fp_pin and fp_totp_val and fp_keys_ready:
+                st.caption("✅ TOTP/PIN ready — click below to generate today's token")
+            if st.button("Login via TOTP & Save Token", width="stretch"):
+                if not (fp_cc and fp_pin and fp_totp_val and fp_user_key and fp_enc_key and fp_user_id):
+                    st.warning("Fill User Key, Encryption Key, User ID, Client Code, PIN, and TOTP.")
+                else:
+                    with st.spinner("Logging in to 5paisa via TOTP..."):
+                        tok, ccode, err = login_fivepaisa_totp(
+                            fp_cc, fp_totp_val, fp_pin, fp_user_key, fp_enc_key, fp_user_id
+                        )
+                    if tok:
+                        resolved_cc = ccode or fp_cc
+                        if remember_local:
+                            save_local_broker_auth(
+                                "fivepaisa",
+                                {
+                                    "access_token": tok,
+                                    "client_code": resolved_cc,
+                                    "user_key": fp_user_key,
+                                    "encryption_key": fp_enc_key,
+                                    "user_id": fp_user_id,
+                                },
+                            )
+                        st.session_state._pending_fivepaisa_auth = (tok, resolved_cc)
+                        st.session_state._fivepaisa_login_notice = (
+                            "5paisa token generated via TOTP for today's session."
+                        )
+                        st.rerun()
+                    else:
+                        st.error(err or "5paisa TOTP login failed.")
+        with tab_oauth:
+            fp_redir = _render_redirect_uri_with_apply(
+                "Response URL", "_fp_redirect_uri", "_w_fp_redirect_uri", "_apply_fp_redir_btn"
+            )
+            if remember_local:
+                save_local_broker_auth("fivepaisa", {"redirect_uri": fp_redir})
+            if fp_user_key and fp_redir:
+                fp_state = register_oauth_handoff(
+                    {
+                        "user_key": fp_user_key,
+                        "encryption_key": fp_enc_key,
+                        "user_id": fp_user_id,
+                        "redirect_uri": fp_redir,
+                    },
+                    nonce=st.session_state.get("_fp_oauth_nonce", ""),
+                )
+                st.session_state._fp_oauth_nonce = fp_state
+                fp_login_url = build_fivepaisa_login_url(fp_user_key, fp_redir, state=fp_state)
+                st.caption(f"Callback URL: `{fp_redir}`")
+                _render_same_tab_login_link(
+                    "1️⃣ Open 5paisa Daily Login", fp_login_url, "fivepaisa_same_tab_login"
+                )
+            else:
+                st.caption("Fill User Key and Response URL to generate login link.")
+
+            fp_req_raw = _sync_text_field(
+                "2️⃣ RequestToken or Full Redirect URL",
+                "_fp_req_token",
+                "_w_fp_req_token",
+                placeholder="Paste token or full ?RequestToken=... callback URL",
+                help="Accepts either the bare RequestToken or the full callback URL after login.",
+            )
+            auto_fp_exchange = bool(st.session_state.pop("_auto_exchange_fivepaisa", False))
+            if auto_fp_exchange and not (fp_req_raw and fp_user_key and fp_enc_key and fp_user_id):
+                st.info("RequestToken captured from redirect URL — enter API keys and click **Exchange RequestToken**.")
+
+            if st.button("Exchange RequestToken", width="stretch") or (
+                auto_fp_exchange and fp_req_raw and fp_user_key and fp_enc_key and fp_user_id
+            ):
+                fp_req_tok = extract_oauth_param(
+                    fp_req_raw, ("RequestToken", "requesttoken", "request_token")
+                )
+                if not (fp_req_tok and fp_user_key and fp_enc_key and fp_user_id):
+                    st.warning("Fill User Key, Encryption Key, User ID, and RequestToken.")
+                else:
+                    with st.spinner("Exchanging 5paisa RequestToken..."):
+                        tok, ccode, err = exchange_fivepaisa_request_token(
+                            fp_req_tok, fp_user_key, fp_enc_key, fp_user_id
+                        )
+                    if tok:
+                        resolved_cc = ccode or fivepaisa_client_code
+                        active_state = st.session_state.pop("_active_fp_oauth_state", "")
+                        if active_state:
+                            store_completed_oauth_token(
+                                active_state,
+                                {"access_token": tok, "client_code": resolved_cc},
+                            )
+                        if remember_local:
+                            save_local_broker_auth(
+                                "fivepaisa",
+                                {
+                                    "access_token": tok,
+                                    "client_code": resolved_cc,
+                                    "user_key": fp_user_key,
+                                    "encryption_key": fp_enc_key,
+                                    "user_id": fp_user_id,
+                                    "redirect_uri": fp_redir,
+                                },
+                            )
+                        st.session_state._pending_fivepaisa_auth = (tok, ccode or "")
+                        st.session_state._fivepaisa_login_notice = "5paisa token saved for today's session — ready to scan."
+                        st.rerun()
+                    else:
+                        st.error(err or "5paisa RequestToken exchange failed.")
+
+    return fivepaisa_token, fivepaisa_client_code, fivepaisa_live_ws
+
+
 _apply_pending_auth_updates()
 _capture_oauth_redirect_params()
 
@@ -573,348 +910,13 @@ with st.sidebar:
     fivepaisa_client_code = ""
     fivepaisa_live_ws = True
     if use_upstox:
-        upstox_token = _render_token_input_with_clear(
-            label="Upstox Access Token (Daily)",
-            state_key="upstox_access_token",
-            widget_key="_w_upstox_token",
-            placeholder="Paste today's Upstox access_token",
-            help_text="Upstox tokens expire daily. Paste today's token or use the OAuth Login Helper below.",
-            clear_callback=_clear_upstox_token,
-            clear_key="clear_upstox_token_btn",
-            clear_help="Clear saved Upstox token",
+        upstox_token, upstox_live_ws = _render_upstox_sidebar_auth(
+            wss_window_open, _detected_redirect_uri
         )
-        if upstox_token:
-            st.session_state._upstox_cleared_explicitly = False
-        upstox_notice = st.session_state.pop("_upstox_login_notice", None)
-        if upstox_notice:
-            st.success(upstox_notice)
-        elif upstox_token:
-            st.caption("✅ Access token loaded for today's session")
-        else:
-            st.caption("⚠️ Access token required — paste above or sign in below")
-
-        upstox_live_ws = st.checkbox(
-            "Stream Live WSS (MarketDataStreamerV3)",
-            value=True,
-            help="Stream live full-quote ticks over WebSocket (zero REST polling once initialized).",
-        )
-        if not upstox_live_ws and upstox_token:
-            stop_upstox_stream(upstox_token)
-        elif upstox_live_ws:
-            st.caption(
-                "🟢 WSS active window (09:05–15:35 IST)"
-                if wss_window_open
-                else "⏸️ Market closed — auto-uses 1-call Batch Quote / cache"
-            )
-
-        with st.expander("🔑 Daily Login Helper (OAuth Code)", expanded=not bool(upstox_token)):
-            creds_ready = all(
-                bool(st.session_state.get(k, "").strip())
-                for k in ("_u_client_id", "_u_client_secret", "_u_redirect_uri")
-            )
-            edit_u_creds = not creds_ready or st.checkbox(
-                "Edit API credentials",
-                value=False,
-                key="_w_edit_upstox_creds",
-                help="API Key, Secret, and Redirect URI are loaded — check to view or modify them.",
-            )
-            if edit_u_creds:
-                u_cid = _sync_text_field("API Key (client_id)", "_u_client_id", "_w_u_client_id")
-                u_csec = _sync_text_field(
-                    "API Secret", "_u_client_secret", "_w_u_client_secret", type="password"
-                )
-                u_redir = _render_redirect_uri_with_apply(
-                    "Redirect URI", "_u_redirect_uri", "_w_u_redirect_uri", "_apply_u_redir_btn"
-                )
-            else:
-                u_cid = st.session_state.get("_u_client_id", "").strip()
-                u_csec = st.session_state.get("_u_client_secret", "").strip()
-                u_redir = st.session_state.get("_u_redirect_uri", _detected_redirect_uri).strip()
-                st.caption("✅ API Key, Secret & Redirect URI loaded")
-
-            remember_local = _render_local_persist_toggle()
-            if remember_local:
-                save_local_broker_auth(
-                    "upstox",
-                    {
-                        "access_token": upstox_token,
-                        "client_id": u_cid,
-                        "client_secret": u_csec,
-                        "redirect_uri": u_redir,
-                    },
-                )
-
-            if u_cid and u_redir:
-                u_state = register_oauth_handoff(
-                    {"client_id": u_cid, "client_secret": u_csec, "redirect_uri": u_redir},
-                    nonce=st.session_state.get("_u_oauth_nonce", ""),
-                )
-                st.session_state._u_oauth_nonce = u_state
-                login_url = build_upstox_login_url(u_cid, u_redir, state=u_state)
-                st.caption(f"Callback URL: `{u_redir}`")
-                _render_same_tab_login_link(
-                    "1️⃣ Open Upstox Daily Login", login_url, "upstox_same_tab_login"
-                )
-                if not upstox_token:
-                    _sync_oauth_tab_fragment("upstox", u_state)
-            else:
-                st.caption("Fill API Key and Redirect URI to generate login link.")
-
-            u_code_raw = _sync_text_field(
-                "2️⃣ Auth Code or Full Redirect URL",
-                "_u_auth_code",
-                "_w_u_auth_code",
-                placeholder="Paste code or full ?code=... callback URL",
-                help="Accepts either the bare authorization code or the full callback URL after login.",
-            )
-            auto_up_exchange = bool(st.session_state.pop("_auto_exchange_upstox", False))
-            if auto_up_exchange and not (u_code_raw and u_cid and u_csec and u_redir):
-                st.info("Auth code captured from redirect URL — enter API credentials and click **Exchange Code for Token**.")
-
-            if st.button("Exchange Code for Token", width="stretch") or (
-                auto_up_exchange and u_code_raw and u_cid and u_csec and u_redir
-            ):
-                u_code = extract_oauth_param(u_code_raw, ("code",))
-                if not (u_code and u_cid and u_csec and u_redir):
-                    st.warning("Fill API Key, API Secret, Redirect URI, and Auth Code.")
-                else:
-                    with st.spinner("Exchanging Upstox authorization code..."):
-                        tok, err = exchange_upstox_auth_code(u_code, u_cid, u_csec, u_redir)
-                    if tok:
-                        active_state = st.session_state.pop("_active_up_oauth_state", "")
-                        if active_state:
-                            store_completed_oauth_token(active_state, {"access_token": tok})
-                        notice_msg = "Upstox token saved for today's session — ready to scan."
-                        if remember_local:
-                            save_local_broker_auth(
-                                "upstox",
-                                {
-                                    "access_token": tok,
-                                    "client_id": u_cid,
-                                    "client_secret": u_csec,
-                                    "redirect_uri": u_redir,
-                                },
-                            )
-                        st.session_state._pending_upstox_token = tok
-                        st.session_state._upstox_login_notice = notice_msg
-                        st.rerun()
-                    else:
-                        st.error(err or "Upstox token exchange failed.")
     elif use_fivepaisa:
-        fivepaisa_token = _render_token_input_with_clear(
-            label="5paisa Access Token (Daily)",
-            state_key="fivepaisa_access_token",
-            widget_key="_w_fivepaisa_token",
-            placeholder="Paste today's JWT access_token or use TOTP Login below",
-            help_text="5paisa JWT access tokens expire daily. Generate one via TOTP/PIN or OAuth below.",
-            clear_callback=_clear_fivepaisa_token,
-            clear_key="clear_fivepaisa_token_btn",
-            clear_help="Clear saved 5paisa token",
+        fivepaisa_token, fivepaisa_client_code, fivepaisa_live_ws = _render_fivepaisa_sidebar_auth(
+            wss_window_open
         )
-        if fivepaisa_token:
-            st.session_state._fivepaisa_cleared_explicitly = False
-        jwt_info = inspect_fivepaisa_jwt(fivepaisa_token) if fivepaisa_token else {
-            "is_jwt": False,
-            "client_code": "",
-            "exp_ts": None,
-            "is_expired": False,
-            "exp_label": "",
-        }
-        if jwt_info["client_code"] and not st.session_state.get("fivepaisa_client_code", "").strip():
-            st.session_state.fivepaisa_client_code = jwt_info["client_code"]
-            st.session_state._w_fivepaisa_client_code = jwt_info["client_code"]
-
-        fivepaisa_client_code = _sync_text_field(
-            "5paisa Client Code",
-            "fivepaisa_client_code",
-            "_w_fivepaisa_client_code",
-            placeholder="e.g. 50011110 (auto-read from JWT)",
-            help="Required for MarketFeedV3 WebSocket subscriptions (auto-inferred from JWT if omitted).",
-        )
-        fivepaisa_notice = st.session_state.pop("_fivepaisa_login_notice", None)
-        if fivepaisa_notice:
-            st.success(fivepaisa_notice)
-        elif fivepaisa_token and jwt_info["is_expired"]:
-            st.warning(f"⚠️ 5paisa JWT expired ({jwt_info['exp_label']}) — generate a fresh token below.")
-        elif fivepaisa_token and jwt_info["exp_label"]:
-            st.caption(f"✅ JWT loaded · valid until {jwt_info['exp_label']}")
-        elif fivepaisa_token:
-            st.caption("✅ JWT token loaded for today's session")
-        else:
-            st.caption("⚠️ JWT token required — paste above or sign in below")
-
-        fivepaisa_live_ws = st.checkbox(
-            "Stream Live WSS (MarketFeedV3)",
-            value=True,
-            help="Stream live NSE MarketFeedV3 ticks over WebSocket (up to 3,000 scrips, 50/batch).",
-        )
-        if not fivepaisa_live_ws and fivepaisa_token:
-            stop_fivepaisa_stream(fivepaisa_token, fivepaisa_client_code)
-        elif fivepaisa_live_ws:
-            st.caption(
-                "🟢 WSS active window (09:05–15:35 IST)"
-                if wss_window_open
-                else "⏸️ Market closed — auto-uses cached / REST seed"
-            )
-
-        helper_expanded = (not bool(fivepaisa_token)) or bool(jwt_info["is_expired"])
-        with st.expander("🔑 Daily Login Helper (TOTP / OAuth)", expanded=helper_expanded):
-            fp_keys_ready = all(
-                bool(st.session_state.get(k, "").strip())
-                for k in ("_fp_user_key", "_fp_enc_key", "_fp_user_id")
-            )
-            edit_fp_creds = not fp_keys_ready or st.checkbox(
-                "Edit API keys",
-                value=False,
-                key="_w_edit_fp_creds",
-                help="User Key, Encryption Key, and User ID are loaded — check to view or modify them.",
-            )
-            if edit_fp_creds:
-                fp_user_key = _sync_text_field("User Key (VendorKey)", "_fp_user_key", "_w_fp_user_key")
-                fp_enc_key = _sync_text_field(
-                    "Encryption Key", "_fp_enc_key", "_w_fp_enc_key", type="password"
-                )
-                fp_user_id = _sync_text_field("User ID", "_fp_user_id", "_w_fp_user_id")
-            else:
-                fp_user_key = st.session_state.get("_fp_user_key", "").strip()
-                fp_enc_key = st.session_state.get("_fp_enc_key", "").strip()
-                fp_user_id = st.session_state.get("_fp_user_id", "").strip()
-                st.caption("✅ User Key, Encryption Key & User ID loaded")
-
-            remember_local = _render_local_persist_toggle()
-            if remember_local:
-                save_local_broker_auth(
-                    "fivepaisa",
-                    {
-                        "access_token": fivepaisa_token,
-                        "client_code": fivepaisa_client_code,
-                        "user_key": fp_user_key,
-                        "encryption_key": fp_enc_key,
-                        "user_id": fp_user_id,
-                    },
-                )
-
-            tab_totp, tab_oauth = st.tabs(["TOTP + PIN", "OAuth Redirect"])
-            with tab_totp:
-                if "_w_fp_totp_cc" not in st.session_state:
-                    st.session_state._w_fp_totp_cc = (
-                        fivepaisa_client_code or _get_broker_secret("fivepaisa", "client_code")
-                    )
-                fp_cc = st.text_input("Client Code", key="_w_fp_totp_cc").strip()
-                fp_pin = _sync_text_field("Trading PIN", "_fp_totp_pin", "_w_fp_totp_pin", type="password")
-                fp_totp_val = _sync_text_field(
-                    "TOTP (6-digit code or Base32 Secret)",
-                    "_fp_totp_secret",
-                    "_w_fp_totp_secret",
-                    type="password",
-                )
-                if fp_cc and fp_pin and fp_totp_val and fp_keys_ready:
-                    st.caption("✅ TOTP/PIN ready — click below to generate today's token")
-                if st.button("Login via TOTP & Save Token", width="stretch"):
-                    if not (fp_cc and fp_pin and fp_totp_val and fp_user_key and fp_enc_key and fp_user_id):
-                        st.warning("Fill User Key, Encryption Key, User ID, Client Code, PIN, and TOTP.")
-                    else:
-                        with st.spinner("Logging in to 5paisa via TOTP..."):
-                            tok, ccode, err = login_fivepaisa_totp(
-                                fp_cc, fp_totp_val, fp_pin, fp_user_key, fp_enc_key, fp_user_id
-                            )
-                        if tok:
-                            resolved_cc = ccode or fp_cc
-                            if remember_local:
-                                save_local_broker_auth(
-                                    "fivepaisa",
-                                    {
-                                        "access_token": tok,
-                                        "client_code": resolved_cc,
-                                        "user_key": fp_user_key,
-                                        "encryption_key": fp_enc_key,
-                                        "user_id": fp_user_id,
-                                    },
-                                )
-                            st.session_state._pending_fivepaisa_auth = (tok, resolved_cc)
-                            st.session_state._fivepaisa_login_notice = (
-                                "5paisa token generated via TOTP for today's session."
-                            )
-                            st.rerun()
-                        else:
-                            st.error(err or "5paisa TOTP login failed.")
-            with tab_oauth:
-                fp_redir = _render_redirect_uri_with_apply(
-                    "Response URL", "_fp_redirect_uri", "_w_fp_redirect_uri", "_apply_fp_redir_btn"
-                )
-                if remember_local:
-                    save_local_broker_auth("fivepaisa", {"redirect_uri": fp_redir})
-                if fp_user_key and fp_redir:
-                    fp_state = register_oauth_handoff(
-                        {
-                            "user_key": fp_user_key,
-                            "encryption_key": fp_enc_key,
-                            "user_id": fp_user_id,
-                            "redirect_uri": fp_redir,
-                        },
-                        nonce=st.session_state.get("_fp_oauth_nonce", ""),
-                    )
-                    st.session_state._fp_oauth_nonce = fp_state
-                    fp_login_url = build_fivepaisa_login_url(fp_user_key, fp_redir, state=fp_state)
-                    st.caption(f"Callback URL: `{fp_redir}`")
-                    _render_same_tab_login_link(
-                        "1️⃣ Open 5paisa Daily Login", fp_login_url, "fivepaisa_same_tab_login"
-                    )
-                    if not fivepaisa_token:
-                        _sync_oauth_tab_fragment("fivepaisa", fp_state)
-                else:
-                    st.caption("Fill User Key and Response URL to generate login link.")
-
-                fp_req_raw = _sync_text_field(
-                    "2️⃣ RequestToken or Full Redirect URL",
-                    "_fp_req_token",
-                    "_w_fp_req_token",
-                    placeholder="Paste token or full ?RequestToken=... callback URL",
-                    help="Accepts either the bare RequestToken or the full callback URL after login.",
-                )
-                auto_fp_exchange = bool(st.session_state.pop("_auto_exchange_fivepaisa", False))
-                if auto_fp_exchange and not (fp_req_raw and fp_user_key and fp_enc_key and fp_user_id):
-                    st.info("RequestToken captured from redirect URL — enter API keys and click **Exchange RequestToken**.")
-
-                if st.button("Exchange RequestToken", width="stretch") or (
-                    auto_fp_exchange and fp_req_raw and fp_user_key and fp_enc_key and fp_user_id
-                ):
-                    fp_req_tok = extract_oauth_param(
-                        fp_req_raw, ("RequestToken", "requesttoken", "request_token")
-                    )
-                    if not (fp_req_tok and fp_user_key and fp_enc_key and fp_user_id):
-                        st.warning("Fill User Key, Encryption Key, User ID, and RequestToken.")
-                    else:
-                        with st.spinner("Exchanging 5paisa RequestToken..."):
-                            tok, ccode, err = exchange_fivepaisa_request_token(
-                                fp_req_tok, fp_user_key, fp_enc_key, fp_user_id
-                            )
-                        if tok:
-                            resolved_cc = ccode or fivepaisa_client_code
-                            active_state = st.session_state.pop("_active_fp_oauth_state", "")
-                            if active_state:
-                                store_completed_oauth_token(
-                                    active_state,
-                                    {"access_token": tok, "client_code": resolved_cc},
-                                )
-                            notice_msg = "5paisa token saved for today's session — ready to scan."
-                            if remember_local:
-                                save_local_broker_auth(
-                                    "fivepaisa",
-                                    {
-                                        "access_token": tok,
-                                        "client_code": resolved_cc,
-                                        "user_key": fp_user_key,
-                                        "encryption_key": fp_enc_key,
-                                        "user_id": fp_user_id,
-                                        "redirect_uri": fp_redir,
-                                    },
-                                )
-                            st.session_state._pending_fivepaisa_auth = (tok, ccode or "")
-                            st.session_state._fivepaisa_login_notice = notice_msg
-                            st.rerun()
-                        else:
-                            st.error(err or "5paisa RequestToken exchange failed.")
 
     st.divider()
     st.caption("**2. Volume, Gap & Interval**")
